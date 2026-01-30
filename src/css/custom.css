@@ -1,30 +1,75 @@
-/**
- * Any CSS included here will be global. The classic template
- * bundles Infima by default. Infima is a CSS framework designed to
- * work well for content-centric websites.
- */
-
-/* You can override the default Infima variables here. */
 :root {
-  --ifm-color-primary: #2e8555;
-  --ifm-color-primary-dark: #29784c;
-  --ifm-color-primary-darker: #277148;
-  --ifm-color-primary-darkest: #205d3b;
-  --ifm-color-primary-light: #33925d;
-  --ifm-color-primary-lighter: #359962;
-  --ifm-color-primary-lightest: #3cad6e;
-  --ifm-code-font-size: 95%;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+  /* Brand */
+  --ifm-color-primary: #7aa2ff;
+  --ifm-color-primary-dark: #5e8cff;
+  --ifm-color-primary-darker: #4f81ff;
+  --ifm-color-primary-darkest: #2f66ff;
+  --ifm-color-primary-light: #94b6ff;
+  --ifm-color-primary-lighter: #a3c0ff;
+  --ifm-color-primary-lightest: #c6d8ff;
+
+  /* Typography */
+  --ifm-font-family-base: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  --ifm-heading-font-family: var(--ifm-font-family-base);
+  --ifm-line-height-base: 1.75;
+
+  /* Layout density */
+  --ifm-spacing-horizontal: 1.25rem;
+  --ifm-container-width: 1140px;
+  --ifm-container-width-xl: 1200px;
+
+  /* Code */
+  --ifm-code-font-size: 90%;
+  --ifm-code-border-radius: 8px;
+  --docusaurus-highlighted-code-line-bg: rgba(122, 162, 255, 0.12);
 }
 
-/* For readability concerns, you should choose a lighter palette in dark mode. */
 [data-theme='dark'] {
-  --ifm-color-primary: #25c2a0;
-  --ifm-color-primary-dark: #21af90;
-  --ifm-color-primary-darker: #1fa588;
-  --ifm-color-primary-darkest: #1a8870;
-  --ifm-color-primary-light: #29d5b0;
-  --ifm-color-primary-lighter: #32d8b4;
-  --ifm-color-primary-lightest: #4fddbf;
-  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+  --ifm-background-color: #0b1020;
+  --ifm-background-surface-color: #0f1730;
+
+  --ifm-font-color-base: rgba(255, 255, 255, 0.92);
+  --ifm-font-color-secondary: rgba(255, 255, 255, 0.72);
+
+  --ifm-color-emphasis-200: rgba(255, 255, 255, 0.08);
+  --ifm-color-emphasis-300: rgba(255, 255, 255, 0.12);
+  --ifm-color-emphasis-400: rgba(255, 255, 255, 0.18);
+
+  --ifm-toc-border-color: rgba(255, 255, 255, 0.10);
+  --ifm-navbar-background-color: rgba(11, 16, 32, 0.85);
+}
+
+/* Reading experience */
+.markdown {
+  font-size: 1.02rem;
+}
+
+.markdown h1, .markdown h2, .markdown h3 {
+  letter-spacing: -0.01em;
+}
+
+.markdown p {
+  margin: 0.9rem 0;
+}
+
+/* Make code blocks easier to read */
+.theme-code-block {
+  border: 1px solid var(--ifm-color-emphasis-200);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+  overflow: hidden;
+}
+
+/* Cleaner navbar blur (enterprise feel) */
+.navbar {
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+}
+
+/* Callouts (admonitions) more “handbook”, less “toy” */
+.admonition {
+  border-radius: 14px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+}
+.admonition-heading {
+  font-weight: 650;
 }
