@@ -1,23 +1,194 @@
-/**
- * CSS files with the .module.css suffix will be treated as CSS modules
- * and scoped locally.
- */
-
-.heroBanner {
-  padding: 4rem 0;
-  text-align: center;
-  position: relative;
-  overflow: hidden;
+.page {
+  max-width: var(--ifm-container-width-xl);
+  margin: 0 auto;
+  padding: 2.25rem var(--ifm-spacing-horizontal) 3rem;
 }
 
-@media screen and (max-width: 996px) {
-  .heroBanner {
-    padding: 2rem;
+.hero {
+  display: grid;
+  grid-template-columns: 1.35fr 0.65fr;
+  gap: 1.25rem;
+  align-items: start;
+  margin-bottom: 1.25rem;
+}
+
+@media (max-width: 996px) {
+  .hero {
+    grid-template-columns: 1fr;
   }
 }
 
-.buttons {
+.heroLeft {
   display: flex;
-  align-items: center;
-  justify-content: center;
+  gap: 1.1rem;
+  padding: 1.25rem;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 18px;
+  background: var(--ifm-background-surface-color);
+}
+
+.avatar {
+  border-radius: 999px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  flex: 0 0 auto;
+  width: 160px;
+  height: 160px;
+  object-fit: cover;
+}
+
+@media (max-width: 520px) {
+  .heroLeft {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .avatar {
+    width: 120px;
+    height: 120px;
+  }
+}
+
+.heroText {
+  min-width: 0;
+}
+
+.title {
+  margin: 0;
+  font-size: 2rem;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+}
+
+.tagline {
+  margin: 0.25rem 0 0.75rem;
+  color: var(--ifm-font-color-secondary);
+  font-size: 1.05rem;
+}
+
+.lead {
+  margin: 0 0 1rem;
+  max-width: 65ch;
+  color: var(--ifm-font-color-base);
+}
+
+.cta {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.heroRight {
+}
+
+.panel {
+  padding: 1.15rem;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 18px;
+  background: var(--ifm-background-surface-color);
+}
+
+.panelTitle {
+  font-weight: 650;
+  margin-bottom: 0.65rem;
+}
+
+.list {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: var(--ifm-font-color-secondary);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.9rem;
+  margin: 1rem 0 1.5rem;
+}
+
+@media (max-width: 996px) {
+  .grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 520px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.pill {
+  display: block;
+  padding: 1rem;
+  border-radius: 16px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  background: var(--ifm-background-surface-color);
+  text-decoration: none;
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+
+.pill:hover {
+  transform: translateY(-2px);
+  border-color: var(--ifm-color-primary);
+}
+
+.pillTitle {
+  font-weight: 650;
+  margin-bottom: 0.35rem;
+  color: var(--ifm-font-color-base);
+}
+
+.pillDesc {
+  color: var(--ifm-font-color-secondary);
+  font-size: 0.95rem;
+}
+
+.latest {
+  padding: 1.25rem;
+  border-radius: 18px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  background: var(--ifm-background-surface-color);
+}
+
+.sectionTitle {
+  font-weight: 650;
+  margin-bottom: 0.6rem;
+}
+
+.sectionTitleSpacer {
+  margin-top: 22px;
+}
+
+.reco {
+  padding: 0.85rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+}
+
+.recoLink {
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.latestLinks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.linkRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  text-decoration: none;
+}
+
+.linkRow:hover {
+  border-color: var(--ifm-color-primary);
+}
+
+.linkRowMeta {
+  color: var(--ifm-font-color-secondary);
+  font-size: 0.95rem;
 }
