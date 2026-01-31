@@ -38,6 +38,17 @@ const config: Config = {
     [
       'classic',
       {
+        sitemap: {
+          changefreq: 'weekly',
+          priority: 0.5,
+          ignorePatterns: [
+            '/tags/**',
+            '/blog/tags/**',
+            '/blog/authors/**',
+            '/404.html',
+          ],
+          filename: 'sitemap.xml'
+        },
         docs: {
           sidebarPath: './sidebars.ts',
           // Please change this to your repo.
@@ -58,7 +69,7 @@ const config: Config = {
           // Useful options to enforce blogging best practices
           onInlineTags: 'warn',
           onInlineAuthors: 'warn',
-          onUntruncatedBlogPosts: 'warn'        
+          onUntruncatedBlogPosts: 'warn'
         },
         theme: {
           customCss: './src/css/custom.css',
@@ -67,20 +78,6 @@ const config: Config = {
     ],
   ],
   plugins: [
-    [
-      '@docusaurus/plugin-sitemap',
-      {
-        changefreq: 'weekly',
-        priority: 0.5,
-        ignorePatterns: [
-          '/tags/**',
-          '/blog/tags/**',
-          '/blog/authors/**',
-          '/404.html',
-        ],
-        filename: 'sitemap.xml',
-      },
-    ],
     [
       '@docusaurus/plugin-google-gtag',
       {
@@ -120,7 +117,7 @@ const config: Config = {
       darkTheme: prismThemes.dracula,
       additionalLanguages: ['csharp', 'powershell', 'yaml', 'json', 'bash', 'sql']
     },
-    algolia:{
+    algolia: {
       appId: 'B5T908NZ4O',
       apiKey: '321e9357fd3a8b56e06cc2339ac2d944',
       indexName: 'hugodeveloper',
