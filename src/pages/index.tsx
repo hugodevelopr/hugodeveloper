@@ -61,13 +61,10 @@ export default function Home(): ReactNode {
 
             <div className={styles.actions}>
               <Link to="/docs/00-start-here" className={styles.primary}>
-                Start Here
+                Explore the work
               </Link>
               <Link to="/blog" className={styles.secondary}>
                 Blog
-              </Link>
-              <Link to="/docs/06-decisions" className={styles.tertiary}>
-                Decisions
               </Link>
             </div>
 
