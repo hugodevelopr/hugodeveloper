@@ -91,8 +91,8 @@ const config: Config = {
     image: 'img/social-card.jpg',
     colorMode: {
       defaultMode: 'dark',
-      disableSwitch: true,
-      respectPrefersColorScheme: true,
+      disableSwitch: false,
+      respectPrefersColorScheme: true
     },
     navbar: {
       title: 'Hugo Moura',

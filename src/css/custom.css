@@ -33,6 +33,31 @@
 }
 
 /* ======================================================
+   LIGHT THEME — Modern tech (cool off-white + violet)
+   ====================================================== */
+:root[data-theme='light'] {
+  /* Backgrounds */
+  --ifm-background-color: #f7f8fc;           /* cool off-white */
+  --ifm-background-surface-color: #ffffff;   /* cards/panels */
+
+  /* Text */
+  --ifm-font-color-base: rgba(16, 18, 24, 0.92);        /* near-black */
+  --ifm-font-color-secondary: rgba(16, 18, 24, 0.68);
+
+  /* Borders / dividers */
+  --ifm-color-emphasis-200: rgba(16, 18, 24, 0.08);
+  --ifm-color-emphasis-300: rgba(16, 18, 24, 0.12);
+  --ifm-color-emphasis-400: rgba(16, 18, 24, 0.18);
+
+  /* TOC / chrome */
+  --ifm-toc-border-color: rgba(16, 18, 24, 0.10);
+  --ifm-navbar-background-color: rgba(247, 248, 252, 0.88);
+
+  /* Code highlight line bg (slightly softer in light) */
+  --docusaurus-highlighted-code-line-bg: rgba(155, 140, 255, 0.12);
+}
+
+/* ======================================================
    DARK THEME — IDE / BLACK + VIOLET
    ====================================================== */
 [data-theme='dark'] {
@@ -52,6 +77,8 @@
   /* TOC / chrome */
   --ifm-toc-border-color: rgba(255, 255, 255, 0.08);
   --ifm-navbar-background-color: rgba(7, 8, 13, 0.88);
+
+  --docusaurus-highlighted-code-line-bg: rgba(155, 140, 255, 0.14);
 }
 
 /* ======================================================
@@ -72,28 +99,11 @@
 }
 
 /* ======================================================
-   Code blocks — IDE feel
-   ====================================================== */
-.theme-code-block {
-  background: #0b0d16;
-  border: 1px solid rgba(255,255,255,0.08);
-  box-shadow: 0 18px 40px rgba(0,0,0,0.45);
-  overflow: hidden;
-}
-
-/* Inline code */
-code {
-  background: rgba(155, 140, 255, 0.12);
-  border-radius: 6px;
-  padding: 0.15rem 0.35rem;
-}
-
-/* ======================================================
    Navbar — subtle, professional
    ====================================================== */
 .navbar {
   backdrop-filter: blur(12px);
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
 }
 
 /* ======================================================
@@ -101,7 +111,16 @@ code {
    ====================================================== */
 .admonition {
   border-radius: 14px;
-  border: 1px solid rgba(255,255,255,0.08);
+  border: 1px solid var(--ifm-color-emphasis-200);
+}
+
+/* Light: cleaner surface */
+:root[data-theme='light'] .admonition {
+  background: rgba(155, 140, 255, 0.06);
+}
+
+/* Dark: slightly deeper */
+[data-theme='dark'] .admonition {
   background: rgba(155, 140, 255, 0.06);
 }
 
@@ -110,50 +129,119 @@ code {
 }
 
 /* ======================================================
-   Selection (small delight)
+   Inline code — balanced for both themes
    ====================================================== */
-::selection {
-  background: rgba(155, 140, 255, 0.35);
-  color: #fff;
+.markdown :not(pre) > code {
+  border-radius: 6px;
+  padding: 0.15rem 0.35rem;
 }
 
-/* ===============================
-   JetBrains Darcula-style CodeBlock
-   (keeps Docusaurus title bar + copy)
-   =============================== */
+/* Light inline code */
+:root[data-theme='light'] .markdown :not(pre) > code {
+  background: rgba(155, 140, 255, 0.12);
+  border: 1px solid rgba(16, 18, 24, 0.10);
+  color: rgba(16, 18, 24, 0.92);
+}
 
+/* Dark inline code */
+[data-theme='dark'] .markdown :not(pre) > code {
+  background: rgba(155, 140, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  color: rgba(232, 234, 237, 0.92);
+}
+
+/* ======================================================
+   Code blocks — IDE feel (keeps title bar + copy)
+   ====================================================== */
 .theme-code-block {
-  border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 14px;
   overflow: hidden;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.12);
+}
+
+/* Light code block container */
+:root[data-theme='light'] .theme-code-block {
+  border: 1px solid rgba(16, 18, 24, 0.10);
+  background: #ffffff;
+}
+
+/* Dark code block container */
+[data-theme='dark'] .theme-code-block {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #0b0d16;
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
 }
 
 /* Filename/title bar */
 .theme-code-block-title {
-  background: rgba(255, 255, 255, 0.04);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  color: rgba(232, 234, 237, 0.85);
   font-weight: 650;
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
 }
 
-/* Main code area */
-.theme-code-block pre {
-  background: #0c0f14 !important; /* Darcula-ish (slightly warm) */
+/* Light title bar */
+:root[data-theme='light'] .theme-code-block-title {
+  background: rgba(16, 18, 24, 0.03);
+  color: rgba(16, 18, 24, 0.78);
 }
 
-/* Inline code (Darcula-ish) */
-.markdown :not(pre) > code {
-  background: rgba(155, 140, 255, 0.12);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 6px;
-  padding: 0.15rem 0.35rem;
+/* Dark title bar */
+[data-theme='dark'] .theme-code-block-title {
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(232, 234, 237, 0.85);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* Highlighted line (use Docusaurus native highlighting) */
+/* Main code area background */
+:root[data-theme='light'] .theme-code-block pre {
+  background: #f3f4f8 !important; /* IDE light surface */
+}
+
+[data-theme='dark'] .theme-code-block pre {
+  background: #0c0f14 !important; /* Darcula-ish */
+}
+
+/* Highlighted line (native Docusaurus class) */
 .theme-code-block-highlighted-line {
-  background: rgba(155, 140, 255, 0.14);
   display: block;
   margin: 0 -1rem;
   padding: 0 1rem;
 }
+
+:root[data-theme='light'] .theme-code-block-highlighted-line {
+  background: rgba(155, 140, 255, 0.12);
+}
+
+[data-theme='dark'] .theme-code-block-highlighted-line {
+  background: rgba(155, 140, 255, 0.14);
+}
+
+/* ======================================================
+   Selection (small delight)
+   ====================================================== */
+::selection {
+  background: rgba(155, 140, 255, 0.28);
+  color: rgba(16, 18, 24, 0.95);
+}
+
+[data-theme='dark'] ::selection {
+  background: rgba(155, 140, 255, 0.35);
+  color: #fff;
+}
+
+.page {
+  color: var(--ifm-font-color-base);
+  background: var(--ifm-background-color);
+}
+
+.kicker {
+  color: var(--ifm-font-color-secondary);
+}
+
+.title {
+  color: var(--ifm-font-color-base);
+}
+
+.lead {
+  color: var(--ifm-font-color-secondary);
+}
+

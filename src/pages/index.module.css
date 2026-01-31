@@ -2,10 +2,11 @@
   position: relative;
   min-height: calc(100vh - var(--ifm-navbar-height, 0px));
   overflow: hidden;
-
   max-width: 1320px;
   margin: 0 auto;
   padding: clamp(1.4rem, 2.6vw, 2.9rem) clamp(1.1rem, 4vw, 3.7rem) 3rem;
+   color: var(--ifm-font-color-base);
+  background: var(--ifm-background-color);
 }
 
 /* Background */
@@ -41,7 +42,7 @@
 .grid {
   position: absolute;
   inset: 0;
-  opacity: 0.20;
+  opacity: 0.60;
   background-image: linear-gradient(to right, rgba(255, 255, 255, 0.09) 1px, transparent 1px),
     linear-gradient(to bottom, rgba(255, 255, 255, 0.09) 1px, transparent 1px);
   background-size: 92px 92px;
@@ -95,6 +96,7 @@
   text-transform: uppercase;
   color: rgba(255, 255, 255, 0.60);
   margin-bottom: 0.8rem;
+  color: var(--ifm-font-color-secondary);
 }
 
 .title {
@@ -102,7 +104,7 @@
   font-size: clamp(3.4rem, 6.2vw, 5.2rem);
   line-height: 0.99;
   letter-spacing: -0.055em;
-  color: rgba(255, 255, 255, 0.96);
+  color: var(--ifm-font-color-base);
 }
 
 .positioning {
@@ -114,7 +116,7 @@
 
 .lead {
   margin: 0.95rem 0 1.15rem;
-  color: rgba(255, 255, 255, 0.72);
+  color: var(--ifm-font-color-secondary);
   font-size: 1.14rem;
   line-height: 1.75;
   max-width: 65ch;
@@ -341,3 +343,166 @@
   color: rgba(122, 162, 255, 0.92);
   font-weight: 820;
 }
+
+
+/* ======================================================
+   LIGHT MODE — KILL WHITE BLOWOUT (HOME ONLY)
+   ====================================================== */
+
+:global([data-theme='light']) .bg {
+  filter: none;
+}
+
+/* REMOVE completamente o glow no light */
+:global([data-theme='light']) .glowA,
+:global([data-theme='light']) .glowB {
+  display: none;
+}
+
+/* Vignette correta: só escurece bordas */
+:global([data-theme='light']) .vignette {
+  background: radial-gradient(
+    1200px 700px at 50% 35%,
+    rgba(0, 0, 0, 0) 45%,
+    rgba(0, 0, 0, 0.08) 75%,
+    rgba(0, 0, 0, 0.14) 100%
+  );
+}
+
+/* Garante texto escuro no light */
+/* ===============================
+   LIGHT — TYPOGRAPHY FIX
+   =============================== */
+
+:global([data-theme='light']) .kicker {
+  color: rgba(16, 18, 24, 0.55);
+  letter-spacing: 0.08em;
+}
+
+:global([data-theme='light']) .title {
+  color: #101218;
+}
+
+:global([data-theme='light']) .lead {
+  color: rgba(16, 18, 24, 0.78);
+}
+
+/* ===============================
+   LIGHT — TAGS (signals) CONTRAST
+   =============================== */
+
+:global([data-theme='light']) .signals {
+  gap: 10px;
+}
+
+:global([data-theme='light']) .signal {
+  font-size: 0.88rem;
+  display: inline-flex;
+  align-items: center;
+  height: 38px;
+  padding: 0.50rem 0.70rem;
+
+  color: rgba(16, 18, 24, 0.82);
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(16, 18, 24, 0.16);
+  border-radius: 18px;
+
+  box-shadow:
+    0 1px 2px rgba(16, 18, 24, 0.06),
+    0 10px 24px rgba(16, 18, 24, 0.08);
+
+  backdrop-filter: blur(10px);
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+
+/* ===============================
+   LIGHT — CONTENT CARDS
+   =============================== */
+
+:global([data-theme='light']) .card {
+  background: #ffffff;
+  border: 1px solid rgba(16, 18, 24, 0.12);
+  box-shadow:
+    0 1px 2px rgba(16, 18, 24, 0.06),
+    0 18px 40px rgba(16, 18, 24, 0.12);
+}
+
+:global([data-theme='light']) .cardTitle {
+  color: #101218;
+}
+
+:global([data-theme='light']) .cardMeta {
+  color: rgba(16, 18, 24, 0.55);
+}
+
+:global([data-theme='light']) .cardDesc {
+  color: rgba(16, 18, 24, 0.75);
+}
+
+:global([data-theme='light']) .cardCta {
+  color: #8576f2;
+  font-weight: 600;
+}
+
+:global([data-theme='light']) .noise {
+  opacity: 0.08; /* bem baixo */
+  mix-blend-mode: normal; /* se existir blend-mode */
+}
+
+/* ===============================
+   LIGHT — GRID VISIBILITY
+   =============================== */
+
+:global([data-theme='light']) .grid {
+  opacity: 0.80;
+  background-image:
+    linear-gradient(rgba(16, 18, 24, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(16, 18, 24, 0.06) 1px, transparent 1px);
+}
+
+/* ===============================
+   LIGHT — BUTTONS
+   =============================== */
+
+:global([data-theme='light']) .primary {
+  background: linear-gradient(
+    180deg,
+    #9b8cff,
+    #8576f2
+  );
+  color: #0b0c10;
+  box-shadow: 0 10px 30px rgba(155, 140, 255, 0.35);
+}
+
+:global([data-theme='light']) .secondary {
+  background: #ffffff;
+  color: rgba(16, 18, 24, 0.85);
+  border: 1px solid rgba(16, 18, 24, 0.14);
+}
+
+/* ===============================
+   LIGHT — SIGNATURE
+   =============================== */
+
+:global([data-theme='light']) .signatureName {
+  color: #101218;
+}
+
+:global([data-theme='light']) .signatureRole {
+  color: rgba(16, 18, 24, 0.65);
+}
+
+:global([data-theme='light']) .signatureLine {
+  background: rgba(16, 18, 24, 0.12);
+}
+
+
+:global([data-theme='light']) .why {
+  border-top: 1px solid rgba(16, 18, 24, 0.12);
+}
+
+:global([data-theme='light']) .whyTitle {
+  color: rgba(16, 18, 24, 0.65);
+}
+
