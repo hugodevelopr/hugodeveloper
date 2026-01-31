@@ -1,5 +1,5 @@
-import {themes as prismThemes} from 'prism-react-renderer';
-import type {Config} from '@docusaurus/types';
+import { themes as prismThemes } from 'prism-react-renderer';
+import type { Config } from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
 // This runs in Node.js - Don't use client-side code here (browser APIs, JSX...)
@@ -34,7 +34,6 @@ const config: Config = {
     defaultLocale: 'en',
     locales: ['en'],
   },
-
   presets: [
     [
       'classic',
@@ -44,7 +43,7 @@ const config: Config = {
           // Please change this to your repo.
           // Remove this to remove the "edit this page" links.
           editUrl:
-            'https://github.com/facebook/docusaurus/tree/main/packages/create-docusaurus/templates/shared/',
+            'https://github.com/facebook/docusaurus/tree/main/packages/create-docusaurus/templates/shared/'
         },
         blog: {
           showReadingTime: true,
@@ -59,7 +58,7 @@ const config: Config = {
           // Useful options to enforce blogging best practices
           onInlineTags: 'warn',
           onInlineAuthors: 'warn',
-          onUntruncatedBlogPosts: 'warn',
+          onUntruncatedBlogPosts: 'warn'        
         },
         theme: {
           customCss: './src/css/custom.css',
@@ -67,7 +66,29 @@ const config: Config = {
       } satisfies Preset.Options,
     ],
   ],
-
+  plugins: [
+    [
+      '@docusaurus/plugin-sitemap',
+      {
+        changefreq: 'weekly',
+        priority: 0.5,
+        ignorePatterns: [
+          '/tags/**',
+          '/blog/tags/**',
+          '/blog/authors/**',
+          '/404.html',
+        ],
+        filename: 'sitemap.xml',
+      },
+    ],
+    [
+      '@docusaurus/plugin-google-gtag',
+      {
+        trackingID: 'G-ZKEDVMCMEP',
+        anonymizeIP: true
+      }
+    ]
+  ],
   themeConfig: {
     // Replace with your project's social card
     image: 'img/docusaurus-social-card.jpg',
@@ -90,14 +111,22 @@ const config: Config = {
           position: 'left',
           label: 'Docs',
         },
-        {to: '/blog', label: 'Blog', position: 'left'}
+        { to: '/blog', label: 'Blog', position: 'left' }
       ],
     },
     footer: undefined,
     prism: {
-      theme: prismThemes.github,
+      theme: prismThemes.vsDark,
       darkTheme: prismThemes.dracula,
+      additionalLanguages: ['csharp', 'powershell', 'yaml', 'json', 'bash', 'sql']
     },
+    algolia:{
+      appId: 'B5T908NZ4O',
+      apiKey: '321e9357fd3a8b56e06cc2339ac2d944',
+      indexName: 'hugodeveloper',
+      contextualSearch: true,
+      searchPagePath: 'search'
+    }
   } satisfies Preset.ThemeConfig,
 };
 
