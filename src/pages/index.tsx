@@ -47,16 +47,15 @@ export default function Home(): ReactNode {
         {/* HERO */}
         <section className={styles.hero}>
           <div className={styles.heroLeft}>
-            <div className={styles.kicker}>Who I am</div>
+            <div className={styles.kicker}>Author</div>
 
             <Heading as="h1" className={styles.title}>
               Hugo Moura
             </Heading>
 
             <p className={styles.lead}>
-              I document how I design and evolve backend systems under real
-              constraints — trade-offs, reliability, and execution. Built to be
-              readable, linkable, and useful.
+              I document how I design and evolve backend systems under real-world constraints.
+              Trade-offs. Reliability. Execution.
             </p>
 
             <div className={styles.actions}>
@@ -103,24 +102,24 @@ export default function Home(): ReactNode {
 
         {/* WHY STAY */}
         <section className={styles.why}>
-          <div className={styles.whyTitle}>What you’ll find here</div>
+          <div className={styles.whyTitle}>Content map</div>
 
           <div className={styles.cards}>
             <ValueCard
-              title="Deep Dives"
-              meta="high-signal"
+              title="Systems & Architecture"
+              meta="architecture"
               href="/docs/02-deep-dives"
-              desc="Failure modes, trade-offs, scaling, operability — the parts most posts skip."
+              desc="How systems behave under load, failure, and change."
             />
             <ValueCard
-              title="Guides"
-              meta="actionable"
+              title="Engineering Practice"
+              meta="practice"
               href="/docs/01-guides"
-              desc="End-to-end how-tos with checklists and pragmatic implementation notes."
+              desc="Execution patterns, tooling, and operational choices."
             />
             <ValueCard
-              title="Decisions"
-              meta="mini-ADRs"
+              title="Technical Decisions"
+              meta="decisions"
               href="/docs/06-decisions"
               desc="Context, options considered, trade-offs, consequences, and validation signals."
             />
