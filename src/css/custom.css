@@ -161,7 +161,7 @@
 
 /* Light code block container */
 :root[data-theme='light'] .theme-code-block {
-  border: 1px solid rgba(16, 18, 24, 0.10);
+  border: 1px solid rgba(16, 18, 24, 0.14);
   background: #ffffff;
 }
 
@@ -180,8 +180,8 @@
 
 /* Light title bar */
 :root[data-theme='light'] .theme-code-block-title {
-  background: rgba(16, 18, 24, 0.03);
-  color: rgba(16, 18, 24, 0.78);
+  background: rgba(16, 18, 24, 0.05);
+  color: rgba(16, 18, 24, 0.88);
 }
 
 /* Dark title bar */
@@ -191,9 +191,13 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+:root[data-theme='light'] .theme-code-block code {
+   color: #1a1c22;
+}
+
 /* Main code area background */
 :root[data-theme='light'] .theme-code-block pre {
-  background: #f3f4f8 !important; /* IDE light surface */
+   background: #e9ecf3 !important; /* IDE light surface */
 }
 
 [data-theme='dark'] .theme-code-block pre {
@@ -208,12 +212,35 @@
 }
 
 :root[data-theme='light'] .theme-code-block-highlighted-line {
-  background: rgba(155, 140, 255, 0.12);
+  background: rgba(155, 140, 255, 0.18);
 }
 
 [data-theme='dark'] .theme-code-block-highlighted-line {
-  background: rgba(155, 140, 255, 0.14);
+  background: rgba(155, 140, 255, 0.22);
 }
+
+/* keywords (public, class, sealed, etc.) */
+:root[data-theme='light'] .token.keyword {
+  color: #4f46e5 !important; /* violet/indigo forte */
+  font-weight: 500;
+}
+
+/* types / classes */
+:root[data-theme='light'] .token.class-name {
+  color: #0f766e !important; /* teal escuro */
+}
+
+/* strings */
+:root[data-theme='light'] .token.string {
+  color: #b45309 !important; /* amber escuro */
+}
+
+/* comments */
+:root[data-theme='light'] .token.comment {
+  color: rgba(16, 18, 24, 0.55) !important;
+  font-style: italic;
+}
+
 
 /* ======================================================
    Selection (small delight)
