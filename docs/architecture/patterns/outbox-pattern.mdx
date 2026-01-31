@@ -6,46 +6,201 @@ sidebar_label: Outbox Pattern
 sidebar_position: 10
 ---
 
-# Guides
 
-Guides are **implementation-focused**.
+## 1. What this document is about
 
-The goal is simple: you should be able to take a guide and apply it to a real system without guessing the missing pieces.
+This document describes the **Outbox Pattern** as a reliability mechanism for publishing integration events in systems that use a **relational database as the system of record**.
+It addresses the lack of atomicity between **state mutation** and **event publication** in distributed systems.
 
-## What you’ll find here
+This pattern applies to:
 
-- Patterns implemented end-to-end (not just theory)
-- Code-level details with operational considerations
-- Checklists you can use during implementation and review
+    - Event-driven architectures
+    - Systems using relational databases (SQL Server, PostgreSQL, MySQL)
+    - Domains where emitted events have **business meaning**
 
-```bash
-git add .
-git commit -m "feat: new feature"
-git push
+It does **not** apply to:
+
+    - Systems using a log-first architecture (e.g. Kafka as the source of truth)
+    - Purely synchronous request/response systems
+    - Best-effort or non-critical integrations
+
+---
+
+## 2. Why this matters in real systems
+
+The core issue is not messaging - it is **partial failure**.
+
+In real systems:
+
+    - Databaes fail independently from brokers
+    - Networks partition
+    - Processes crash between instructions
+    - Retries amplify side effects
+
+Common failure sequences:
+
+    1.  Transaction commits, broker publish fails → **lost event**
+    2.  Broker publish succeeds, transaction rolls back → **ghost event**
+    3.  Retry publishes the same event multiple times → **duplicate side effects**
+    4.  Service crashes after commit but before publish → **invisible inconsistency**
+
+These failures:
+
+    - Are hard to reproduce
+    - Surface weeks later
+    - Corrupt downstream projections
+    - Break reporting, billing, and compliance flows
+
+As systems evolve monoliths to distributed architectures, these inconsistencies become **systemic**, not accidental.
+
+---
+
+## 3. Core concpt (mental model)
+
+The **Outbox Pattern** enforces a simple rule:
+
+> **If a fact is not committed to the database, it must not be published.**
+
+Mental model:
+
+    - The database is the **source of truth**
+    - Events are **facts derived from committed state**
+    - Message brokers are **distribution mechanisms**, not transactional authorities
+
+Think of the outbox as:
+
+    - A **write-ahead log** for integration events
+    - A durable contract between domain logic and infrastructure
+    - A buffer that absorbs partial failures
+
+This decouples:
+
+    - Business correctness from delivery timing
+    - Domain logic from messaging infrastructure
+
+---
+
+## 4. How it works (step-by-step)
+
+1.  **Start a database transaction**
+    Defines the consistency boundary.
+
+2.  **Apply domain state changes**
+    Aggregate invariants are enforced normally.
+
+3.  **Create an outbox entry**
+
+    - Id                                                ```(guid)```
+    - Event type                                        ```(string)```
+    - Serialized payload                                ```(string)```
+    - Metadata (correlation id, tenant id, version)     ```(string)```
+    - Assembly                                          ```(string)```
+    - Sent                                              ```(bool)```
+    - Occurred at                                       ```(timestamp)```
+
+4.  **Commit the transaction**
+    At this point:
+
+    - Business state exists
+    - Event intent exists
+    - System in internally consistent
+
+5.  **Outbox processor queries pending messages**
+    - Typically ordered by occurrence times
+    - Bounded by batch size
+
+6.  **Publish events to the broker**
+    - Retryable
+    - Idempotent at the consumer side
+
+7.  **Mark messages as sent**
+    - Timestamp
+    - Optional delivery metadata
+
+
+### Key invariants
+
+    - The database transaction is the only atomic boundary
+    - Publishing is asyncronous and retryable
+    - Consumers must tolerate duplicates
+    - The outbox is append-only from the domain perspective
+
+---
+
+## 5. Minimal but realistic example
+
+This example focuses on **durable persistence**, **safe dispatch**, **type fidelity**, and **operational clarity**. 
+
+### 5.1 Table design (SQL Server)
+
+Design goals:
+
+    - Query efficiently for pending messages
+    - Store enough metadata to support evolution and debugging
+    - Keep dispatch idempotent and observable
+
+````sql
+
+CREATE TABLE dbo.OutboxMessage (
+    Id                  UNIQUEIDENTIFIER    NOT NULL CONSTRAINT PK_OutboxMessage PRIMARY KEY,
+    OccuredAtUtc        DATETIME2(3)        NOT NULL,
+    AggregateId         UNIQUEIDENTIFIER    NULL,
+    MessageType         NVARCHAR(256)       NOT NULL,       -- e.g. "OrderPaidIntegrationEvent"
+    AssemblyName        NVARCHAR(512)       NOT NULL,       -- e.g. "Company.Sales.Contracts, Company.Sales.Contracts"
+    Payload             NVARCHAR(MAX)       NOT NULL,       -- JSON
+    CorrelationId       UNIQUEIDENTIFIER    NULL,
+    TenantId            NVARCHAR(64)        NULL,
+    Sent                BIT                 NOT NULL CONSTRAINT DF_Outbox_Sent          DEFAULT(0),
+    SentAtUtc           DATETIME2(3)        NULL,
+    AttemptCount        INT                 NOT NULL CONSTRAINT DF_Outbox_AttemptCount  DEFAULT(0),
+    LastAttemptAtUtc    DATETIME2(3)        NULL,
+    LastError           NVARCHAR(2048)      NULL,
+    LockId              UNIQUEIDENTIFIER    NULL,
+    LockedAtUtc         DATETIME2(3)        NULL,
+    RowVersion          ROWVERSION          NOT NULL
+);
+
+
+CREATE INDEX IX_Outbox_Pending
+ON dbo.OutboxMessage (Sent, OccurredAtUtc)
+INCLUDE (MessageType, AssemblyName, CorrelationId, TenantId)
+
+CREATE INDEX IX_Outbox_Locks
+ON dbo.OutboxMessage (LockedAtUtc)
+INCLUDE (LockId, Sent);
+
+
 ```
 
-```csharp title="OutboxPublisher.cs"
-public sealed class OutboxPublisher { }  // [!code word:sealed]
+---
+
+### 5.2 Outbox model (.NET)
+
+
+```csharp
+
+    
+```
+
+
+```csharp
+
+using var transaction = await db.Database.BeginTransactionAsync();
+
+order.Pay();
+
+db.Orders.Update(order);
+
+var integrationEvent = new OrderPaidEvent(
+    order.Id,
+    order.TotalAmount,
+    DateTime.UtcNow
+);
+
+db.OutboxMessage.Add(new OutboxMessage());
+
+await db.SaveChangesAsync();
+await transaction.CommitAsync();
 
 ```
 
-## My guide template
-
-Each guide follows a consistent structure:
-
-1) **Context & problem**
-2) **Constraints**
-3) **Approach**
-4) **Implementation notes**
-5) **Testing strategy**
-6) **Operational concerns**
-7) **Trade-offs**
-8) **Checklist**
-
-## Start points
-
-If you’re not sure what to read:
-- Pick a topic you’re currently implementing (messaging, reliability, authn/authz, observability)
-- Use Reference to refresh concepts, then come back here
-
-Next: `/docs/02-deep-dives`
