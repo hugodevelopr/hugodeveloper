@@ -120,9 +120,10 @@ const config: Config = {
     algolia: {
       appId: 'B5T908NZ4O',
       apiKey: '321e9357fd3a8b56e06cc2339ac2d944',
-      indexName: 'hugodeveloper',
+      indexName: 'hugodeveloper_com_b5t908nz4o_pages',
       contextualSearch: true,
-      searchPagePath: 'search'
+      searchPagePath: 'search',
+      
     }
   } satisfies Preset.ThemeConfig,
 };
