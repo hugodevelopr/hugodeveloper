@@ -59,7 +59,7 @@ export default function Home(): ReactNode {
             </p>
 
             <div className={styles.actions}>
-              <Link to="/docs/00-start-here" className={styles.primary}>
+              <Link to="/docs/infra/cloud/azure" className={styles.primary}>
                 Explore the work
               </Link>
               <Link to="/blog" className={styles.secondary}>
@@ -108,19 +108,19 @@ export default function Home(): ReactNode {
             <ValueCard
               title="Systems & Architecture"
               meta="architecture"
-              href="/docs/02-deep-dives"
+              href="/docs/infra/cloud/azure"
               desc="How systems behave under load, failure, and change."
             />
             <ValueCard
               title="Engineering Practice"
               meta="practice"
-              href="/docs/01-guides"
+              href="/docs/infra/cloud/azure"
               desc="Execution patterns, tooling, and operational choices."
             />
             <ValueCard
               title="Technical Decisions"
               meta="decisions"
-              href="/docs/06-decisions"
+              href="/docs/infra/cloud/azure"
               desc="Context, options considered, trade-offs, consequences, and validation signals."
             />
           </div>
