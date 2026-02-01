@@ -1,0 +1,325 @@
+---
+title: Azure Governance at Scale
+slug: /platform/governance/azure
+description: Principled guidance on structuring Azure governance for multi-team, cost-aware, and regulated environments.
+sidebar_label: Azure Governance at Scale
+sidebar_position: 10
+---
+
+## 1. What this document is about
+
+This document defines **how to design, reason about, and stress-test Azure governance models** in 
+organizations where cloud scale is no longer a technical problem, but an **organizational one**.
+
+It applies to environments where:
+
+    - Multiple product teams deploy indepdendently
+    - Platform teams own shared capabilities, not products
+    - Cost, compliance, and security are strctural constraints
+    - Azure is a long-term execution plataform, not an experiment
+
+It explicitly does **not** apply to:
+
+    - Single-team or short-lived environments
+    - Azure used as "just infrastructure"
+    - Organizations without cost attribution
+    - Early-stage systems still discovering their boundaries
+
+This is a **decision framework** based on my experience, not a configuration guide.
+
+---
+
+## 2. Why this matters in real systems
+
+Azure governance becomes unavoidable when **organizational entropy outpaces informal coordination**.
+
+Common real-world inflection points:
+
+### Scale pressure
+
+    - 5 → 20 → subscriptions
+    - Multiple CI/CD pipelines deploying concurrently
+    - Teams optimizing locally, harming globally
+
+### Economic pressure
+
+    - Clound cost moves from "IT expense" to "business liability"
+    - Finance demands attribution, not estimates
+    - Engineers are asked to explain cost behavior after the fact
+
+### Regulatory pressure
+
+    - Audits require provable isolation
+    - "We trust this team" stops being an argument
+    - Manual controls stop being defensible
+
+When governance is absent or weak:
+
+    - Subscriptions accumulate unrelated workloads
+    - RBAC becomes irreversible without outages
+    - Policy exceptions multiply silently
+    - Platform teams are blamed for decisions they did not make
+
+Simplistic governance fails because:
+
+    - Central approval models do not survive deployment velocity
+    - Flat subscription models collapse under ownership ambiguity
+    - Tooling is mistaken for governance
+
+Governance emerges as a **survival mechanism**, not a best practice.
+
+---
+
+## 3. Core concept (mental model)
+
+Azure governance is best understood as **organizational topology encoded into infrastructure**.
+
+A precise mental model:
+
+> Governance defines _who can do what, where, at what cost, and with whose approval_ — **before code runs**.
+
+Key dimensions:
+
+    - **Hierarchy**: where decisions apply
+    - **Isolation**: where failures stop
+    - **Ownership**: who pays and who answers
+    - **Constraints**: what is impossible by design
+
+The system works when:
+
+    - Teams reason about boundaries, not rules
+    - Violations are detectable, not debatable
+    - Most decisions never require human approval
+
+Governance is not about control.
+It is about **making the wrong decisions expensive or impossible**.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1: Define non-negotiables (organizational, not technical)
+
+Example of _real_ non-negotiables:
+
+    - Regulated workloads must never share runtime with non-regulated ones
+    - Every cloud cost must map to a business ownership
+    - No production workload runs without observability baselines
+    - Platform teams must not approve day-to-day deployments
+
+If these are not explicit, Azure structure will encode the _wrong assumptions_.
+
+---
+
+### Step 2: Design the management group topology
+
+Management Groups are **policy blast-radius boundaries**, not folders.
+
+A mature topology often encodes:
+
+    - Regulatory domains
+    - Business criticality
+    - Platform vs product separation
+
+Example:
+
+```
+
+Tenant Root
+└── Corp
+    ├── Shared-Platform
+    ├── Regulated
+    │   ├── Financial
+    │   └── Identity
+    └── Non-Regulated
+        ├── Growth
+        └── Internal
+
+```
+
+#### Invariant:
+
+    - No subscription bypasses the Hierarchy
+    - Root policies are minimal and irreversible
+
+---
+
+### Step 3: Subscriptions as ownership and failure domains
+
+Subscriptions are
+
+    - **Cost units**
+    - **RBAC boundaries**
+    - **Failure containment zones**
+
+They are **not** environments by default.
+
+Bad model:
+
+> One subscription for all prod workloads
+
+Better model:
+
+> Subscriptions aligned to _team_ × _domain_ × _criticality_
+
+Example
+
+```
+
+Payments-Prod
+Risk-Prod
+Identity-Prod
+
+```
+
+Each with:
+
+    - Separate budgets
+    - Independent RBAC
+    - Independent incident blast radius
+
+This is expensive — **intentionally**.
+
+
+---
+
+### Step 4: Policy as enforcement, not documentation
+
+Azure Policy exists to **remove choice**, not guide behavior.
+
+Effective policies:
+
+    - Mandatory tagging with deny
+    - Allowed SKUs and regions
+    - Diagnostic settings enforcement
+    - Resource type allow-lists per domain
+
+Anti-pattern:
+
+    - Audit-only policies everywhere
+
+Audit-only governance creates **ilusion of control**.
+
+---
+
+### 5: RBAC as a liability surface
+
+RBAC scales poorly if unmanaged.
+
+Real constraints:
+
+    - Roles accumulate faster than they are removed
+    - Emergency access becomes permanent
+    - "Temporary" access is never revisited
+
+Governance responses:
+
+    - No individual assignments at subscription scope
+    - Role assignment via groups only
+    - Time-bound elevation for production
+
+RBAC without lifecycle is **technical debt with security impact**.
+
+---
+
+## 5. Concrete production model (end-to-end)
+
+#### Scenario
+A regulated fintech with shared platform services and autonomous product teams.
+
+#### Structure
+
+    - Plataform owns Shared-Plataform subscriptions
+    - Product teams own their domain subscriptions
+    - Security and compliance enforced at Management Group level
+
+#### Flow
+
+    1. Platform defines policies and landing zone templates
+    2. Teams request **subscriptions**, not permissions
+    3. CI/CD deploys within pre-approved boundaries
+    4. Cost reports map directly to business domains
+    5. Violations surface as signals, not incidents
+
+This model survices:
+
+    - Team churn
+    - Organizational reorgs
+    - Audit cycles
+    - Cost optimization initiatives
+
+---
+
+## 6. Design trade-offs
+
+| Decision | Gain | Cost |
+|:---------|:-----|:-----|
+|More subscriptions | Isolation, clarity | Higher baseline cost |
+|Strong deny policies | Predictability | Reduced flexibility |
+|Federated ownership | Speed | Policy complexity |
+|Plataform guardrails | Scalability | Initial design effort |
+
+
+Implicit acceptance:
+
+    - Governance increases upfront friction
+    - Poorly designed governance creates long-term drag
+    - You cannot optimize for speed and control simultaneously
+
+---
+
+## 7. Operational and production realities
+
+What you monitor in real governance:
+
+    - Policy violations trend (rate matters more than count)
+    - Cost drift per domain
+    - RBAC growth rate
+    - Exception lifetimes
+
+Early degradation signals:
+
+    - Teams asking for "temporary" bypasses
+    - Platform team pulled into delivery discussions
+    - Cost reviews becoming political
+
+Governance failure is **slow, then sudden**.
+
+---
+
+## 8. When NOT to use this
+
+Avoid this model when:
+
+    - Team count < 3
+    - No regulatory exposure
+    - Cloud spend is negligible
+    - Organization still changing structure monthly
+
+Governance before boundaries exist is **guesswork**.
+
+---
+
+## 9. Key takeaways
+
+    - Governance encodes organizational decisions into infrastructure
+    - Subscriptions represent ownership and failure, not convenience
+    - Guardrails outperform approvals at scale
+    - Policy without enforcement is theater
+    - RBAC is an attack surface, not just access control
+    - Governance must be observable to be trusted
+    - Over-governance is as harmful as none
+
+---
+
+## 10. High-Level Overview
+
+> Visual representation of Azure governance, highlighting enforced boundaries, subscription ownership, and feedback-driven evolution.
+
+import Light from './_assets/azure-governance-at-scale-light.svg';
+import Dark from './_assets/azure-governance-at-scale-dark.svg';
+
+<div className="kb-diagram-container">
+    <Light className="only-light kb-diagram" role="img" aria-label="Azure Governance high-level overview (light)" />
+    <Dark className="only-dark kb-diagram" role="img" aria-label="Azure Governance high-level overview (dark)" />
+</div>
