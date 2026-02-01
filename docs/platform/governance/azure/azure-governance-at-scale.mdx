@@ -318,8 +318,11 @@ Governance before boundaries exist is **guesswork**.
 
 import Light from './_assets/azure-governance-at-scale-light.svg';
 import Dark from './_assets/azure-governance-at-scale-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
 
-<div className="kb-diagram-container">
-    <Light className="only-light kb-diagram" role="img" aria-label="Azure Governance high-level overview (light)" />
-    <Dark className="only-dark kb-diagram" role="img" aria-label="Azure Governance high-level overview (dark)" />
-</div>
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Azure Governance high-level overview"
+  height={760}
+/>

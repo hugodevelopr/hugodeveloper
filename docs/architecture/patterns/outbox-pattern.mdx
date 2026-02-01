@@ -468,8 +468,12 @@ public sealed class AzureServiceBusPublisher : IServiceBusPublisher
 
 import Light from './_assets/outbox-pattern-sequence-light.svg';
 import Dark from './_assets/outbox-pattern-sequence-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
 
-<div className="kb-diagram-container">
-    <Light className="only-light kb-diagram" role="img" aria-label="Outbox flow (light)" />
-    <Dark className="only-dark kb-diagram" role="img" aria-label="Outbox flow (dark)" />
-</div>
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Outbox flow"
+  height={760}
+/>
