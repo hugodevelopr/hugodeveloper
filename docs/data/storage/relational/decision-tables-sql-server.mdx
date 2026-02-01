@@ -1,0 +1,271 @@
+---
+title: Decision Tables SQL Server
+slug: /data/storage/decision-tables-sql-server
+description: Practical guidance on implementing decision tables in SQL Server for flexible, data-driven rule management in enterprise systems.
+sidebar_label: Decision Tables SQL Server
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document explains how **decision tables implemented in SQL Server** can be used to externalize and 
+evaluate business decision in enterprise systems
+
+It focuses on:
+
+    - modeling decision tables in a relational database
+    - evaluating decisions at runtime
+    - integrating decision evaluation with application code
+    - understaing operational and architectural trade-offs
+
+This approach applies to systems where **decision logic must evolve independently from application deployments**
+and where **auditability and controlled flexibility** matter.
+
+It does not apply to:
+
+    - core domain invariants that must remain strongly enforced in code
+    - highly dynamic, user-authored rule systems without governance
+    - scenarios where rule evaluation latency in extremely constrained and cannot tolerate database access
+
+---
+
+## 2. Why this matters in real systems
+
+Decision tables tend to appear when systems reach a point where **hardcoded conditional logic becomes a bottleneck to change**.
+
+Common pressures include:
+
+    - business rules changing faster than deployment cycles
+    - Multiple variations of the same decision based on context (region, product, risk level, tenant)
+    - The need to explain _why_ a decision was made months later
+    - Regulatory or audit requirements demanding tracebility
+
+In early stages, these rules usually live as ```if/else``` blocks or configuration flags.
+Over time, this leads to:
+
+    - scattered logic across services
+    - duplicated conditions
+    - fragile refactoring when rules change
+    - limited visibility into which rules are active
+
+At scale, the problem is not complexity itself, but **change velocity combined with accountability**.
+Design tables emerge as a response to that pressure.
+
+---
+
+## 3. Core concept (mental model)
+
+The mental model is simple:
+
+> **A decision is data. Evaluation is deterministic. Execution is separate**.
+
+A decision table represents:
+
+    - a set of conditions (inputs)
+    - mapped to a result (output)
+    - evaluated according to explicit rules (priority, specificity, version, validity window)
+
+Instead of asking:
+
+> "Which code path should I take?"
+
+The system asks:
+
+> "Which row in this table applies to the current context?"
+
+The database becomes **a source of decision truth**, not business behavior.
+The application remains reponsible for _acting_ on the decision, not defining it.
+
+---
+
+## 4. How it works (step-by-step)
+
+1. **Model the decision space**
+    Identify which inputs influence the decision and which outputs are produced.
+
+2. **Persist rules as rows**
+    Each row represents one possible decision outcome under specific conditions.
+
+3. **Define evaluation rules**
+    Decide how conflicts are resolved:
+
+    - priority
+    - specificity
+    - first-match vs best-match
+
+4. **Query deterministically**
+    At runtime, query the table using the current context and ordering rules.
+
+5. **Return a single decision result**
+    The query must either return exactly one result or fail explicity.
+
+6.  **Execute behavior in code**
+    The application uses the result but does not re-evaluate the logic.
+
+Key invariants:
+
+    - decision evaluation must be deterministic
+    - rule precedence must be explicit
+    - ambiguity must be treated as a defect
+
+---
+
+## 5. Minimal concrete example 
+
+### Decision table schema (simplified)
+
+```sql
+
+CREATE TABLE PricingDecision (
+    Id              INT             IDENTITY    PRIMARY KEY,
+    CustomerType    VARCHAR(50)     NOT NULL,
+    Region          VARCHAR(50)     NOT NULL,
+    DiscountPercent DECIMAL(5, 2)   NOT NULL,
+    Priority        INT             NOT NULL,
+    EffectiveFrom   DATETIME2       NOT NULL,
+    EffectiveTo     DATETIME2       NULL
+);
+
+CREATE INDEX IX_PricingDecision_Eval
+ON PricingDecision (CustomerType, Region, Priority, EffectiveFrom);
+
+```
+
+### Runtime evaluation query
+
+```sql
+
+SELECT TOP 1 DiscountPercent
+FROM PricingDecision
+WHERE CustomerType = @customerType
+    AND Region = @region
+    AND EffectiveFrom <= SYSUTCDATETIME()
+    AND (EffectiveTo IS NULL OR EffectiveTo > SYSUTCDATETIME())
+ORDER BY Priority DESC;
+
+```
+
+### .NET integration (conceptual)
+
+```csharp 
+
+var discount = await connection.QuerySingleAsync<decimal>(sql, new { customerType, region });
+
+```
+
+This example shows:
+
+    - rules stored as data
+    - deterministic ordering via priority
+    - temporal versioning
+    - a clear contract between database and application
+
+---
+
+## 6. Design trade-offs
+
+| Aspect | Decision Tables | Hardcoded Logic |
+|:-------|:----------------|:----------------|
+|Change speed | High | Low |
+|Deploy required | No (rules only) | Yes |
+|Traceability | Strong | Weak |
+|Type safe | Lower | Strong |
+|Complexity location | Data layer | Codebase |
+|Operational risk | Higher | Lower |
+
+#### What you gain:
+
+    - flexibility
+    - auditability
+    - controlled evolution
+
+#### What you give up:
+
+    - compile-time guarantees
+    - simpler mental models
+    - easier local reasoning
+
+#### What you implicitly accept:
+
+    - governance overhead
+    - operational discipline
+    - stricter validation requirements
+
+---
+
+## 7. Common mistakes and misconceptions
+
+**Treating decision tables as "business logic in the database**
+This leads to uncontrolled growth and poor ownership.
+
+**Missing explicit priority or conflict rules**
+Ambiguous decisions surface only in production.
+
+**Overloading tables with unrelated decisions**
+Different decisions require different invariants.
+
+**No versioning or validity window**
+Rules become impossible to reason about over time.
+
+**Assuming non-technical users will manage rules safely**
+Without tooling and validation, this fails quickly.
+
+---
+
+## 8. Operational and production considerations
+
+In production, decision tables introduce new concerns:
+
+    - **Performance**: indexing and query shape matter early
+    - **Observability**: log which rule was applied and why
+    - **Validation**: prevent overlapping or contradictory rules
+    - **Testing**: treat rules as testable artifacts
+    - **Change control**: rule updates are production changes
+
+What degrades first is usually **confidence**, not latency.
+If you cannot explain a decision, the system becomes untrustworthy.
+
+---
+
+## 9. When NOT to use this
+
+Do not use decision tables when:
+
+    - the rule is a core domain invariant
+    - the decision changes rarely
+    - evaluation latency must be near-zero
+    - rule correctness depends on complex procedural logic
+    - the organization lacks operational discipline
+
+Decision tables are a **tool**, not a default.
+
+---
+
+## 10. Key takeaways
+
+    - Decision tables externalize decisions, not behavior
+    - Determinism and precedence must be explicit
+    - Flexibility introduces governance costs
+    - Auditability is often the real driver
+    - Versioning is not optional
+    - Ambiguity is a production defect
+    - Use them deliberately, not defensively
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of decision tables in SQL Server, highlighting deterministic rule evaluation, versioned validity windows, audit-backed governance, and application-side execution of outcomes.
+
+import Light from './_assets/decision-table-mssql-light.svg';
+import Dark from './_assets/decision-table-mssql-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Decision Table SQL Server high-level overview"
+  height={760}
+/>
+
