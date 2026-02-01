@@ -59,7 +59,7 @@ export default function Home(): ReactNode {
             </p>
 
             <div className={styles.actions}>
-              <Link to="/docs/infra/cloud/azure" className={styles.primary}>
+              <Link to="/docs/architecture/patterns/outbox-pattern" className={styles.primary}>
                 Explore the work
               </Link>
               <Link to="/blog" className={styles.secondary}>
