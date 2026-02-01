@@ -108,19 +108,19 @@ export default function Home(): ReactNode {
             <ValueCard
               title="Systems & Architecture"
               meta="architecture"
-              href="/docs/infra/cloud/azure"
+              href="/docs/architecture/patterns/outbox-pattern"
               desc="How systems behave under load, failure, and change."
             />
             <ValueCard
               title="Engineering Practice"
               meta="practice"
-              href="/docs/infra/cloud/azure"
+              href="/docs/architecture/patterns/outbox-pattern"
               desc="Execution patterns, tooling, and operational choices."
             />
             <ValueCard
               title="Technical Decisions"
               meta="decisions"
-              href="/docs/infra/cloud/azure"
+              href="/docs/architecture/patterns/outbox-pattern"
               desc="Context, options considered, trade-offs, consequences, and validation signals."
             />
           </div>

@@ -143,12 +143,6 @@
   color: rgba(16, 18, 24, 0.92);
 }
 
-/* Dark inline code */
-[data-theme='dark'] .markdown :not(pre) > code {
-  background: rgba(155, 140, 255, 0.12);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  color: rgba(232, 234, 237, 0.92);
-}
 
 /* ======================================================
    Code blocks — IDE feel (keeps title bar + copy)
@@ -159,18 +153,8 @@
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.12);
 }
 
-/* Light code block container */
-:root[data-theme='light'] .theme-code-block {
-  border: 1px solid rgba(16, 18, 24, 0.14);
-  background: #ffffff;
-}
 
-/* Dark code block container */
-[data-theme='dark'] .theme-code-block {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: #0b0d16;
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
-}
+
 
 /* Filename/title bar */
 .theme-code-block-title {
@@ -178,11 +162,6 @@
   border-bottom: 1px solid var(--ifm-color-emphasis-200);
 }
 
-/* Light title bar */
-:root[data-theme='light'] .theme-code-block-title {
-  background: rgba(16, 18, 24, 0.05);
-  color: rgba(16, 18, 24, 0.88);
-}
 
 /* Dark title bar */
 [data-theme='dark'] .theme-code-block-title {
@@ -191,18 +170,7 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-:root[data-theme='light'] .theme-code-block code {
-   color: #1a1c22;
-}
 
-/* Main code area background */
-:root[data-theme='light'] .theme-code-block pre {
-   background: #e9ecf3 !important; /* IDE light surface */
-}
-
-[data-theme='dark'] .theme-code-block pre {
-  background: #0c0f14 !important; /* Darcula-ish */
-}
 
 /* Highlighted line (native Docusaurus class) */
 .theme-code-block-highlighted-line {
@@ -211,35 +179,7 @@
   padding: 0 1rem;
 }
 
-:root[data-theme='light'] .theme-code-block-highlighted-line {
-  background: rgba(155, 140, 255, 0.18);
-}
 
-[data-theme='dark'] .theme-code-block-highlighted-line {
-  background: rgba(155, 140, 255, 0.22);
-}
-
-/* keywords (public, class, sealed, etc.) */
-:root[data-theme='light'] .token.keyword {
-  color: #4f46e5 !important; /* violet/indigo forte */
-  font-weight: 500;
-}
-
-/* types / classes */
-:root[data-theme='light'] .token.class-name {
-  color: #0f766e !important; /* teal escuro */
-}
-
-/* strings */
-:root[data-theme='light'] .token.string {
-  color: #b45309 !important; /* amber escuro */
-}
-
-/* comments */
-:root[data-theme='light'] .token.comment {
-  color: rgba(16, 18, 24, 0.55) !important;
-  font-style: italic;
-}
 
 
 /* ======================================================
@@ -272,3 +212,21 @@
   color: var(--ifm-font-color-secondary);
 }
 
+.kb-diagram {
+  display: block;
+  max-width: 100%;
+  width: 100%;
+  height: auto;
+  overflow: hidden;
+}
+
+.kb-diagram-container {
+  max-width: 100%;
+  overflow-x: auto; 
+}
+
+.only-light { display: block; }
+.only-dark { display: none; }
+
+html[data-theme='dark'] .only-light { display: none; }
+html[data-theme='dark'] .only-dark { display: block; }

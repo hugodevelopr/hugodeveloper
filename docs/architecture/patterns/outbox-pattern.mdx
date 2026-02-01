@@ -55,7 +55,7 @@ As systems evolve monoliths to distributed architectures, these inconsistencies 
 
 ---
 
-## 3. Core concpt (mental model)
+## 3. Core concept (mental model)
 
 The **Outbox Pattern** enforces a simple rule:
 
@@ -90,13 +90,14 @@ This decouples:
 
 3.  **Create an outbox entry**
 
-    - Id                                                ```(guid)```
-    - Event type                                        ```(string)```
-    - Serialized payload                                ```(string)```
-    - Metadata (correlation id, tenant id, version)     ```(string)```
-    - Assembly                                          ```(string)```
-    - Sent                                              ```(bool)```
-    - Occurred at                                       ```(timestamp)```
+    - _Id_                                                ```(guid)```
+    - _AggregateId_                                       ```(guid)```
+    - _Message Type_                                      ```(string)```
+    - _Payload_                                           ```(string)```
+    - _Assembly Name_                                     ```(string)```
+    - _Assembly_                                          ```(string)```
+    - _Sent_                                              ```(bool)```
+    - _Occured At_                                        ```(timestamp)```
 
 4.  **Commit the transaction**
     At this point:
@@ -139,7 +140,7 @@ Design goals:
     - Store enough metadata to support evolution and debugging
     - Keep dispatch idempotent and observable
 
-````sql
+```sql
 
 CREATE TABLE dbo.OutboxMessage (
     Id                  UNIQUEIDENTIFIER    NOT NULL CONSTRAINT PK_OutboxMessage PRIMARY KEY,
@@ -169,7 +170,6 @@ CREATE INDEX IX_Outbox_Locks
 ON dbo.OutboxMessage (LockedAtUtc)
 INCLUDE (LockId, Sent);
 
-
 ```
 
 ---
@@ -177,30 +177,299 @@ INCLUDE (LockId, Sent);
 ### 5.2 Outbox model (.NET)
 
 
-```csharp
+```csharp title="OutboxMessage.cs"
 
-    
+public sealed class OutboxMessage
+{
+    public Guid Id { get; private set; }
+    public DateTime OccurredAtUtc { get; private set; }
+    public Guid? AggregateId { get; private set; }
+    public string MessageType { get; private set; } = default!;
+    public string AssemblyName { get; private set; } = default!;
+    public string Payload { get; private set; } = default!;
+    public Guid? CorrelationId { get; private set; }
+    public string? TenantId { get; private set; }
+    public bool Sent { get; private set; }
+    public DateTime? SentAtUtc { get; private set; }
+    public int AttemptCount { get; private set; }
+    public DateTime? LastAttemptAtUtc { get; private set; }
+    public string? LastError { get; private set; }
+    public Guid? LockId { get; private set; }
+    public DateTime? LockedAtUtc { get; private set; }
+
+    private OutboxMessage() { }
+
+    public static OutboxMessage Create<T>(
+        T @event,
+        Guid? aggregateId,
+        Guid? correlationId,
+        string? tenantId,
+        DateTime utcNow) where T : class
+    {
+        var type = @event.GetType();
+
+        return new OutboxMessage
+        {
+            Id = Guid.NewGuid(),
+            OccurredAtUtc = utcNow,
+            AggregateId = aggregateId,
+            MessageType = type.FullName ?? type.Name,
+            AssemblyName = type.AssemblyQualifiedName ?? $"{type.FullName}, {type.Assembly.GetName().Name}",
+            Payload = JsonSerializer.Serialize(@event, type, JsonDefaults.Options),
+            CorrelationId = correlationId,
+            TenantId = tenantId,
+            Sent = false
+        };
+    }
+
+    public void MarkAttempt(DateTime utcNow, string? error)
+    {
+        AttemptCount++;
+        LastAttemptAtUtc = utcNow;
+        LastError = error;
+    }
+
+    public void MarkSent(DateTime utcNow)
+    {
+        Sent = true;
+        SentAtUtc = utcNow;
+        LockId = null;
+        LockedAtUtc = null;
+        LastError = null
+    }
+
+    public bool TryLock(Guid lockId, DateTime utcNow, TimeSpan lockTtl)
+    {
+        if(LockedAtUtc is not null && LockedAtUtc.Value > utcNow.Subtract(lockTtl))
+            return false;
+
+        LockId = lockId;
+        LockedAtUtc = utcNow;
+
+        return true;
+    }
+}
+
+public static class JsonDefaults
+{
+    public static readonly JsonSerializerOptions Options = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false
+    };
+}
+
 ```
+---
 
+### 5.3 Writing to Outbox inside the domain transaction
+
+Key point: state change and outbox insert share the same commit boundary.
 
 ```csharp
 
-using var transaction = await db.Database.BeginTransactionAsync();
+using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
 
-order.Pay();
+var utcNow = _clock.UtcNow;
 
+// 1) Apply domain changes
+order.MarkAsPaid(utcNow);
 db.Orders.Update(order);
 
-var integrationEvent = new OrderPaidEvent(
-    order.Id,
-    order.TotalAmount,
-    DateTime.UtcNow
+// 2) Capture integration event
+var @event = new OrderPaidIntegrationEvent(
+    orderId: order.Id,
+    amount: order.TotalAmount,
+    occurredAtUtc: utcNow,
+    version: 1
 );
 
-db.OutboxMessage.Add(new OutboxMessage());
+// 3) Persist outbox message inside the same transaction
+var outboxMessage = OutboxMessage.Create(
+    @event,
+    aggregatedId: order.Id,
+    correlationId: _correlation.CorrelationId,
+    tenantId: _tenant.Id,
+    utcNow: utcNow
+);
 
-await db.SaveChangesAsync();
-await transaction.CommitAsync();
+
+db.OutboxMessages.Add(outboxMessage);
+
+await db.SaveChangesAsync(cancellationToken);
+await transaction.CommitAsync(cancellationToken);
 
 ```
 
+#### Why this is correct
+    - The outbox record is a durable fact that "an event must be emitted".
+    - Messaging infrastructure is not part of the consistency boundary.
+
+---
+
+### 5.4 Dispatching with lock + idempotent Update
+
+Dispatch requirements:
+
+    - Multiple dispatcher instances must not double-send the same RowVersion
+    - Failures must be retryable
+    - "Sent" update must be safe and observable
+
+#### Dispatcher query strategy
+
+    - Pull pending messages
+    - Lock them optimistically (row update)
+    - Publish
+    - Mark as sent
+
+
+```csharp title="OutboxDispatcher.cs"
+
+public sealed class OutboxDispatcher
+{
+    private readonly AppDbContext _db;
+    private readonly IServiceBusPublisher _bus;
+    private readonly IClock _clock;
+
+    private static readonly TimeSpan LockTtl = TimeSpan.FromMinutes(2);
+
+    public OutboxDispatcher(AppDbContext db, IServiceBusPublisher bus, IClock clock)
+    {
+        _db = db;
+        _bus = bus;
+        _clock = clock;
+    }
+
+    public async Task DispatchOnceAsync(int batchSize, CancellationToken cancellationToken)
+    {
+        var utcNow = _clock.UtcNow;
+        var lockId = Guid.NewGuid();
+
+        // 1) Load candidates (cheap scan)
+        var candidates = await _db.OutboxMessages
+            .Where(x => !x.Sent)
+            .OrderBy(x => x.OccurredAtUtc)
+            .Take(batchSize)
+            .ToListAsync(cancellationToken);
+
+        foreach (var message in candidates)
+        {
+            // 2) Acquire lock (best-effort) and persist lock
+            if(!message.TryLock(lockId, utcNow, LockTtl))
+                continue;
+
+            message.MarkAttempt(utcNow, error: null);
+        }
+
+        await _db.SaveChangesAsync(cancellationToken);
+
+        // 3) Dispatch locked rows for this run
+        var locked = candidates.Where(x => x.LockId == lockId).ToList();
+
+        foreach(var message in locked)
+        {
+            try
+            {
+                var eventType = Type.GetType(message.AssemblyName, throwOnError: false);
+
+                await _bus.PublishAsync(
+                    messageType: message.MessageType,
+                    payloadJson: message.Payload,
+                    correlationId: message.CorrelationId,
+                    tenantId: message.TenantId,
+                    occurredAtUtc: message.OccurredAtUtc,
+                    cancellationToken: cancellationToken
+                );
+
+                message.MarkSent(_clock.UtcNow);
+            }
+            catch (Exception ex)
+            {
+                message.MarkAttempt(_clock.UtcNow, ex.Message);
+            }
+        }
+
+        await _db.SaveChangesAsync(cancellationToken);
+    }
+}
+
+```
+
+---
+
+### 5.5 Service Bus Publisher
+
+This publisher ensures:
+
+    - message id can be used for idempotency downstream
+    - correlation flows across services
+    - consistent metadata for observability and routing
+
+```csharp title="IServiceBusPublisher.cs"
+
+public interface IServiceBusPublisher
+{
+    Task PublishAsync(
+        string messageType, 
+        string payloadJson, 
+        Guid? correlationId, 
+        string? tenantId, 
+        DateTime occurredAtUtc, 
+        CancellationToken cancellationToken);
+}
+
+```
+
+```csharp title="AzureServiceBusPublisher.cs"
+
+public sealed class AzureServiceBusPublisher : IServiceBusPublisher
+{
+    private readonly ServiceBusSender _sender;
+
+    public AzureServiceBusPublisher(ServiceBusSender sender)
+    {
+        _sender = sender;
+    }
+
+    public async Task PublishAsync(
+        string messageType,
+        string payloadJson,
+        Guid? correlationId,
+        string? tenantId,
+        DateTime occurredAtUtc,
+        CancellationToken cancellationToken)
+    {
+        var message = new ServiceBusMessage(payloadJson)
+        {
+            ContentType = "application/json",
+            Subject = messageType,
+            CorrelationId = correlationId?.ToString(),
+            TimeToLive = TimeSpan.FromDays(7)
+        };
+
+        if (!string.IsNullOrWhiteSpace(tenantId))
+            message.ApplicationProperties["tenantId"] = tenantId;
+
+        message.ApplicationProperties["occurredAtUtc"] = occurredAtUtc.ToString("O");
+        message.ApplicationProperties["messageType"] = messageType;
+
+        await _send.SendMessageAsync(message, cancellationToken);
+    }
+}
+
+```
+
+---
+
+## 6. High-Level Flow Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
+import Light from './_assets/outbox-pattern-sequence-light.svg';
+import Dark from './_assets/outbox-pattern-sequence-dark.svg';
+
+<div className="kb-diagram-container">
+    <Light className="only-light kb-diagram" role="img" aria-label="Outbox flow (light)" />
+    <Dark className="only-dark kb-diagram" role="img" aria-label="Outbox flow (dark)" />
+</div>
