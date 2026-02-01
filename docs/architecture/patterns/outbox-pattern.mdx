@@ -1,7 +1,7 @@
 ---
 title: Oubox Pattern
 slug: /architecture/patterns/outbox-pattern
-description: Practical how-tos for building and operating backend systems — focused, actionable, and production-aware.
+description: Explains how to reliably publish integration events from relational databases using the Outbox Pattern, ensuring transactional consistency between state changes and asynchronous messaging.
 sidebar_label: Outbox Pattern
 sidebar_position: 10
 ---
@@ -462,7 +462,7 @@ public sealed class AzureServiceBusPublisher : IServiceBusPublisher
 
 ---
 
-## 6. High-Level Flow Overview
+## 6. High-Level Overview
 
 > Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
 

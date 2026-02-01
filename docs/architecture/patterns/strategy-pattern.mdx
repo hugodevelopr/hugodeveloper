@@ -1,0 +1,260 @@
+---
+title: Strategy Design Pattern
+slug: /architecture/patterns/strategy-design-pattern
+description: Practical guidance on using the Strategy Pattern to manage behavioral variation in enterprise systems.
+sidebar_label: Strategy Design Pattern
+sidebar_position: 20
+---
+
+
+## 1. What this document is about
+
+This document is about using the **Strategy Pattern** to deal with **behavioral variation** in real systems — especially when **the flow is stable**, but **the rules are not**.
+It fits enterprise systems where behavior changes based on context: customer type, tenant, regulation, contract, or policy.
+
+It is **not** a good fit for simple flows, stable rules, or situations where a conditional is clearly enough and is unlikely to change over time.
+
+---
+
+## 2. Why this matters in real systems
+
+In enterprise systems, variation is rarely accidental. It usually comes from:
+
+    - business rules per customer or plan
+    - policies that evolve over time
+    - regulatory exceptions
+    - logic that starts simple and grows fast
+
+When Strategy is not used, the outcome is predictable:
+
+    - services full of ```if/else```
+    - large ```switch``` blocks with “temporary” cases
+    - business logic spread across layers
+    - fear of change because no one understands the impact
+
+This is not just about ugly code. It leads to **fragile systems** that are hard to evolve and expensive to maintain.
+Strategy matters because it **contains change**, and change is the default state of any long-lived system.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of Strategy like:
+
+You have **one execution flow** that stays the same.
+What changes is **how a decision is made inside that flow.**
+
+The common mistake is thinking:
+
+> "Which branch do I execute?"
+
+The right question is:
+
+> "Which behavior applies here?"
+
+The Strategy Pattern separates:
+
+    - **the _when_** (orchestration, flow)
+    - **from the _how_** (algorihm, rule, policy)
+
+The flow stays clean.
+The variation is isolated.
+
+---
+
+## 4. How it works (step-by-step)
+
+1.  **Identify the point of variation**
+    Something that:
+
+    - changes often
+    - grows with the business
+    - generates repeated conditionals
+
+2.  **Define a stable contract**
+    
+    - Simple interface
+    - No infrastructure concerns
+    - Describes _what_ is done, no _how_
+
+3.  **Create isolated implementations**
+
+    - One behavior per strategy
+    - No knowledge of other strategies
+    - No coupling to the flow
+
+4.  **Centralize the selection**
+
+    - The decision of which strategy to use lives in one place
+    - Based on context, not scattered rules
+
+5.  **Execute through the abstraction**
+
+    - The flow calls the strategy
+    - It does not know — and does not care — which one it is
+
+#### Important invariants
+
+    - The flow never knows business rules
+    - Strategies do not select themselves
+    - Adding a new strategy does not break existing ones
+
+---
+
+## 5. Minimal concrete example (.NET)
+
+### Scenario
+Discount calculation varies by customer type
+
+### Contract
+
+```csharp title="IDiscountStrategy.cs"
+
+public interface IDiscountStrategy
+{
+    decimal Calculate(decimal orderTotal);
+}
+
+```
+
+
+### Strategies
+
+```csharp title="RegularCustomerDiscount.cs"
+
+public sealed class RegularCustomerDiscount : IDiscountStrategy
+{
+    public decimal Calculate(decimal orderTotal)
+        => orderTotal * 0.05m;
+}
+
+```
+
+```csharp title="PremiumCustomerDiscount.cs"
+
+public sealed class PremiumCustomerDiscount : IDiscountStrategy
+{
+    public decimal Calculate(decimal orderTotal)
+        => orderTotal * 0.15m;
+}
+
+```
+
+### Selection and execution
+
+```csharp title="DiscountService.cs"
+
+public sealed class DiscountService
+{
+    private readonly IReadOnlyDictionary<CustomerType, IDiscountStrategy> _strategies;
+
+    public DiscountService(IEnumerable<IDiscountStrategy> strategies)
+    {
+        _strategies = strategies.ToDictionary(
+            s => s switch
+            {
+                PremiumCustomerDiscount => CustomerType.Premium,
+                RegularCustomDiscount => CustomerType.Regular,
+                _ => throw new InvalidOperationException();
+            }
+        )
+    }
+
+    public decimal Apply(CustomerType customerType, decimal orderTotal)
+    {
+        var strategy = _strategies[customerType];
+        return strategy.Calculate(orderTotal);
+    }
+}
+
+```
+
+The important part here is **not the syntax**, but the effect:
+
+    - no business rules in the flow
+    - no scattered conditionals
+    - each variation is isolated and testable
+
+---
+
+## 6. Design trade-offs
+
+| Aspect | Strategy | If / Switch |
+|--------|----------|-------------|
+|Initial complexity | Higher | Lower |
+|Evolution | Controlled | Chaotic |
+|Testability | Excellent | Poor |
+|Long-term readability | Stable | Degrades quickly |
+|Runtime cost | Negligible | Negligible |
+
+#### What you gain
+
+    - change isolation
+    - clear intent
+    - predictable evolution
+
+#### What you pay
+
+    - more types
+    - more abstraction
+    - requires discipline
+
+---
+
+## 7. Common mistakes and misconceptions
+
+    1. **Creating a strategy for every tiny variation**
+    This leads to overengineering fast.
+
+    2. **Letting the strategy decide if it applies**
+    This breaks the model and introduces hidden coupling.
+
+    3. **Stateful strategies**
+    This creates concurrency issues and unpredictable behavior.
+
+    4. **Using Strategy as a universal solution**
+    Not every variation justifies this cost.
+
+---
+
+## 8. When NOT to use this
+
+Do not use Strategy when:
+
+    - the rule is stable and simple
+    - variation is rare
+    - the domain does not justify abstraction
+    - a conditional is clearer and will remain so
+
+Using Strategy too early creates **accidental complexity**.
+
+---
+
+## 9. Key takeaways
+
+     - Strategu separates **flow** from **variation**
+     - It exists to handle **change**, not elegance
+     - Strategy selection is a first-class design concern
+     - Strategies should be simple and stateless
+     - Overuse fragments systems
+     - Underuse creates rigidity
+     - The pattern only pays off in evolving systems
+
+---
+
+## 10. High-Level Flow Overview
+
+
+---
+
+## 6. High-Level Overview
+
+> Visual representation of the Strategy Pattern, highlighting centralized behavior selection, isolated strategies, and a stable execution flow.
+
+import Light from './_assets/strategy-design-pattern-light.svg';
+import Dark from './_assets/strategy-design-pattern-dark.svg';
+
+<div className="kb-diagram-container">
+    <Light className="only-light kb-diagram" role="img" aria-label="Outbox flow (light)" />
+    <Dark className="only-dark kb-diagram" role="img" aria-label="Outbox flow (dark)" />
+</div>
