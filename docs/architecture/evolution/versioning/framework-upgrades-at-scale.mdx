@@ -1,0 +1,330 @@
+---
+title: Framework Upgrades at Scale
+slug: /architecture/evolution/versioning/framework-upgrades-at-scale
+description: A platform-level strategy for coordinating framework and dependency upgrades across many long-lived applications.
+sidebar_label: Framework Upgrades at Scale
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document describes **a complete, end-to-end strategy for managing framework and dependency upgrades across many long-lived applications** in an enterprise environment.
+
+It covers:
+
+    - How to design a **platform-level upgrade model**
+    - How to implement it using executable standards
+    - How to operate upgrades continuously without turning them into projects
+
+This applies to:
+
+    - Organizations with **dozens or hundreds of .NET applications**
+    - Independent team ownership
+    - Long-term maintenance expectations
+
+This does not apply to:
+
+    - Single-application systems
+    - Short-lived products
+    - Teams without CI/CD or basic build discipline
+
+---
+
+## 2. Why this matters in real systems
+
+Framework upgrades become painful when **time and scale intersect**.
+    
+Common real-world scenarios:
+
+    - Security teams mandate framework upgrades within a fixed window
+    - Some applications upgrade early, others lag behind
+    - CI pipelines start breaking due to implicit SDK changes
+    - Teams fear upgrades because effort is unpredictable
+
+What breaks first:
+
+    - Build reproducibility
+    - Confidence in shared libraries
+    - Upgrade velocity
+
+At scale, the problem is no longer _how to upgrade_, but **how to coordinate upgrades without stopping delivery**.
+
+---
+
+## 3. Core concept (mental model)
+
+The core mental model is:
+
+> **Applications should consume upgrades. Platforms should produce them**.
+
+This leads to three explicit layers of responsibility:
+
+```css
+
+Application (business logic, delivery cadence)
+----------------------------------------------
+Platform Defaults (build rules, dependency policy)
+----------------------------------------------
+Toolchain (SDKs, CI, analyzers)
+
+```
+
+Key insight:
+
+    - Framework evolution must be **opt-in but opnionated**
+    - Drift must be visible, measurable and bounded
+    - Upgrades must be **repeatable artifacts**, not tribal knowledge
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Freeze the toolchain explicitly
+
+**Goal**: eliminate implicit variability.
+
+Actions:
+
+    - Introduce ```global.json``` at repository root
+    - Pin SDK version used by developers and CI
+
+```json
+{
+    "sdk": {
+        "version": "10.0.102",
+        "rollForward": "disable"
+    }
+}
+```
+
+Invariant:
+    
+    - If a build fails, it fails everywhere the same way.
+
+---
+
+### Step 2 — Centralize dependency versions
+
+**Goal**: prevent version drift across applications.
+
+Use centralized package management:
+
+```xml title="Directory.Packages.props"
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="8.0.2" />
+  </ItemGroup>
+</Project>
+
+```
+
+Application reference packages **without versions**.
+
+Assumptions:
+
+    - Teams agree that dependency version are platform concerns
+    - Local overrides require explicit justification
+
+---
+
+### Step 3 — Encode build and language standards
+
+**Goal**: eliminate per-project build divergence.
+
+Introduce shared build defaults:
+
+```xml title="Directory.Build.props"
+<Project>
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+</Project>
+
+```
+
+This ensures:
+
+    - New projects inherit the same baseline
+    - Upgrades change behavior consistently
+
+---
+
+### Step 4 — Create a platform Build SDK
+
+**Goal**: turn standards into a versioned product.
+
+Create an internal SDK, for example:
+
+    - ´´´Company.BuildSdk´´´
+
+Responsibilities:
+
+    - Import common MSBuild targets
+    - Register analyzers
+    - Apply cross-cutting defaults
+    - Fail builds that violate platform rules
+
+Consumptions:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <Sdk Name="Company.BuildSdk" Version="3.2.0" />
+</Project>
+```
+
+Upgrade flow:
+
+    - Platform team releases ```Company.BuildSdk 3.3.0```
+    - Application upgrade **one version number**
+    - Changes are reviewed once, not per repo
+
+---
+
+### Step 5 — Automate upgrade waves
+
+**Goal**: remove humans from repetitive coordination.
+
+Use dependency automation (e.g. Renovate or similar):
+
+    - Patch upgrades: continuous
+    - Minor upgrades: grouped monthly
+    - Major upgrades: gated, explicit windows
+
+Rules:
+
+    - Auto-merge only with green CI
+    - Group PRs by platform concern
+    - Never mix unrelated upgrades
+
+Invariant:
+
+    - No upgrade enters main without passing the full pipeline
+
+---
+
+### Step 6 — Measure and enforce drift
+
+**Goal**: make deviation visible, not forbidden.
+
+Track:
+
+    - Applications on latest baseline
+    - Applications lagging by N versions
+    - Average time to adopt platform upgrades
+
+Drift is acceptable.
+**Invisible drift is not**.
+
+---
+
+## 5. Minimal concrete example (.NET)
+
+**Scenario**: upgrading .NET runtime and EF Core across 40 services.
+
+Process:
+
+    1. Update ```global.json```
+    2. Bump EF Core version in ```Directory.Packages.props```
+    3. Release ```Company.BuildSdk``` with compatibility fixes
+    4. Automation opens grouped PRs
+    5. Teams fix local issues
+    6. CI gates enforce correctness
+
+No application defines its own strategy.
+Each application executes the same process.
+
+---
+
+## 6. Design trade-offs
+
+| Choice | Benefit | Cost |
+|:-------|:--------|:---------------------|
+|Centralized versions | Predictability | Reduced local freedom |
+|Platform SDK | Upgrade leverage | Platform ownership |
+|Automated waves | Higher | Lower |
+|Language neutrality | Consistency | Slower emergency changes |
+|Strict CI gates | Safety | Initial friction |
+
+#### You implicitly accept:
+
+    - Less ad-hoc flexibility
+    - More up-front design work
+
+#### You gain
+
+    - Predictable upgrade cost
+    - Fewer “upgrade projects”
+    - Faster security response
+
+---
+
+
+## 7. Operational and production considerations
+
+Monitor:
+
+    - Upgrade lead time
+    - CI failure rates after baseline changes
+    - Number of apps outside LTS
+
+Expect stress during:
+
+    - Major framework releases
+    - Security-driven deadlines
+
+Mitigate by:
+
+    - Smaller, more frequent upgrades
+    - Clear ownership of the platform layer
+
+--
+
+## 9. When NOT to use this
+
+Do not adopt this approach if:
+
+    - You have fewer than ~5 applications
+    - You lack CI/CD maturity
+    - Teams are unwilling to share baselines
+
+In these cases, manual upgrades are cheaper.
+
+---
+
+## 10. Key takeaways
+
+     - Framework upgrades are a platform responsibility
+     - Drift is inevitable; unmanaged drift is dangerous
+     - Executable standards scale better than documentation
+     - Upgrade cadence matters more than speed
+     - Platform SDKs turn upgrades into consumable artifacts
+     - Automation removes coordination cost
+     - The goal is **boring, repeatable upgrades**
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the framework upgrade operating model, highlighting platform-owned baselines, versioned upgrade artifacts, automated upgrade waves, and controlled application adoption.
+
+import Light from './_assets/framework-upgrades-at-scale-light.svg';
+import Dark from './_assets/framework-upgrades-at-scale-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Framework upgrades at scale"
+  height={760}
+/>

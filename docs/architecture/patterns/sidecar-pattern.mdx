@@ -1,0 +1,230 @@
+---
+title: Sidecar Pattern
+slug: /architecture/patterns/sidecard-pattern
+description: A principal-level reference on the Sidecar pattern applied to .NET services—why it exists, how it works in production (Kubernetes/service mesh), implementation options, observability and security integrations, and the hard trade-offs teams must manage.
+sidebar_label: Sidecar Pattern
+sidebar_position: 20
+---
+
+
+## 1. What this document is about
+
+This document explains the **Sidecar Pattern** as applied to .NET-based microservices.
+It ocuses on **why the pattern exists, how it behaves in real systems**, and **what trade-offs it introduces**
+when used to deliver cross-cutting converns outside application node.
+
+#### Applies to
+
+    - Containerized .NET services running alongside a companion process
+    - Kubernetes-based platforms and service-mesh environments
+    - Scenarios where consistency, policy enforcement, and operational control matter more than per-service customization
+
+#### Does not apply to
+
+    - Single-process or monolithic applications
+    - Systems where cross-cutting concerns are trivial or unlikely to change
+    - Teams without the operational maturity to manage additional runtime components
+
+---
+
+## 2. Why this matters in real systems
+
+As platforms grow, teams repeatedly hit the same pressure points:
+    
+    - **Cross-cutting logic leaks into business code** (telemetry, retries, auth headers, TLS, logging)
+    - **Inconsistent implementations** across teams lead to blind spots and security gaps
+    - **Framework-level solutions top scaling** once multiple languages, runtimes, or maturity levels are involved
+
+Early on, libraries and middleware work. Over time:
+
+    - Upgrading instrumentation requires redeploying every service
+    - Security fixes depend on application teams prioritizing non-business changes
+    - Observability becomes unven and unreliable
+
+The sidecar appears when organizations need **centralized control without centralizing application code**.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of the sidecar as a **co-resident runtime capability**, not a library.
+
+    - The **application container** owns business behavior
+    - The **sidecar container** owns operational behavior
+    - Both share the same lifecycle boundary (pod, task, VM)
+
+From the application's perpective:
+
+    - Traffic "just works"
+    - Telemetry "just exists"
+    - Security policies are enforced externally
+
+From the platform's perspective:
+
+    - Capabilities evolve independently
+    - Policies can be rolled out incrementally
+    - Behavior is observable and enforceable at runtime
+
+The key shift is **delegation**, not abstraction.
+
+---
+
+## 4. How it works (step-by-step)
+
+1.  **Pod/container starts**
+
+    - Application and sidecar are scheduled together
+    - Resource limits and startup order matter
+
+2.  **Traffic interception or collaboration**
+    
+    - Inbound/outbound traffic flows through the sidecar (proxy model)
+    - Or the app emits signals consumed by the sidecar (agent model)
+
+3.  **Cross-cutting logic executes**
+
+    - TLS termination, retries, rate limits, tracing, metrics, policy checks
+
+4.  **Signals are exported**
+
+    - Metrics, logs and traces are shipped to centralized backends
+
+5.  **Failure handling**
+
+    - Sidcar failure degrades platform features
+    - App failure does not remove observability or security guarantees
+
+**Invariant**: the application must remain functional even if the sidecar is restarted.
+
+---
+
+## 5. Minimal concrete example (.NET)
+
+### Scenario
+ASP.NET Core API with OpenTelemetry handled by a sidecar collector.
+
+#### Application container
+
+```csharp 
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddOpenTelemtry()
+    .WithTracing(options =>
+        options.AddAspNetCoreInstrumentation()
+               .AddHttpClientInstrumentation()
+               .AddOtlpExporter());
+
+var app = builder.Build();
+app.MapGet("/health", () => Results.Ok("ok"));
+app.Run();
+
+```
+
+#### Sidecar container
+
+    - Runs an OpenTelemetry Collector
+    - Receives OTLP from localhost
+    - Exports to Prometheus, Tempo or a managed backend
+
+The application Knows **nothing** about where telemetry goes.
+The sidecar owns that decision
+
+---
+
+## 6. Design trade-offs
+
+| Aspect | Sidecar | In-process libraries |
+|:-------|:--------|:---------------------|
+|Consistency | Higher | Medium |
+|App coupling | Low | High |
+|Operational complexity | Higher | Lower |
+|Language neutrality | Yes | No |
+|Failure surface | Wider | Narrower |
+
+#### What you gain
+
+    - Centralized control
+    - Faster policy rollout
+    - Cleaner application code
+
+#### What you give up
+
+    - Simplicity
+    - Some latency and resource efficiency
+    - Easier local debugging
+
+---
+
+## 7. Common mistakes and misconceptions
+
+    - **Treating sidecars as invisible**
+        - They consume CPU/memory and fail like any other process
+
+    - **Assuming zero latency impact**
+        - Every hop matters under load
+
+    - **Versioning sidecars carelessly**
+        - Drift breaks assumptions silently
+
+    - **Overloading the sidecar**
+        - It should enable capabilities, not become a dumping ground
+
+---
+
+## 8. Operational and production considerations
+
+Once deployed at scale, expect:
+
+    - **What degrades first**: latency and tail response times
+    - **What becomes expensive**: memory and CPU per pod
+    - **What to monitor**:
+        - Proxy saturation
+        - Queue depths
+        - Drop rates
+        - Startup ordering issues
+
+Golden signals must be observed **for the sidecar itself**, not just the app.
+
+--
+
+## 9. When NOT to use this
+
+Do not use sidebar pattern when:
+
+    - You control all application code and releases tightly
+    - Operational requirements are minimal
+    - Teams lack Kubernetes or container debugging expertise
+    - Latency budgets are extermely tight
+
+Sidecars are an optimization for **organizational scale**, not technical elegance.
+
+---
+
+## 10. Key takeaways
+
+     - Sidecars externalize cross-cutting concerns, not business logic
+     - They trade simplicity for consistency and control
+     - Operational maturity is a prerequisite, not an outcome
+     - Latency and cost are real and measurable
+     - Versioning and observability of the sidecar matter as much as the app
+     - The pattern scales teams more than it scales throughput
+     - Not every service deserves a sidecar
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the Sidecar Pattern, highlighting delegated cross-cutting concerns, independent operational components, and a stable application execution boundary.
+
+import Light from './_assets/sidecar-pattern-light.svg';
+import Dark from './_assets/sidecar-pattern-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Sidebar"
+  height={760}
+/>
