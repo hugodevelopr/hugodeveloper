@@ -96,7 +96,7 @@ What you're really building is:
 
 The is the "SQL Server-backed idempotency ledger" approach (durable, multi-instance safe).
 
-### 0 — Client responsibilities (contract)
+### Step 0 — Client responsibilities (contract)
 
     - Client generate a **unique key per command** and sends it in ```Idempotency-Key```
     - Client must reuse the _same key_ for retries of the _same logical command_.
