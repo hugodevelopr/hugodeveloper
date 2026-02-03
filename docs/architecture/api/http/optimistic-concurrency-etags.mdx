@@ -104,6 +104,8 @@ Typical token sources:
     - Hash of canonical representation (careful: expensive and easy to get wrong)
     - Explicit ```Version``` column incremented per write
 
+---
+
 ### Step 2 — Client includes ```If-Match``` on writes
 
 On ```PUT/PATCH/DELETE```,client sends:
@@ -112,12 +114,16 @@ On ```PUT/PATCH/DELETE```,client sends:
 
 Now the write expresses a precondition.
 
+---
+
 ### Step 3 — Server validates precondition before applying changes
 
 Server compares client token vs current token:
 
     - If match → apply update, generate new ETag, return it
     - If mismatch → reject with ```412 Precondition Failed```
+
+---
 
 ### Step 4 — Define the server behavior when ```If-Match``` is missing
 
@@ -130,6 +136,8 @@ You have two sane options:
     1. **Strict**: reject missing ```If-Match``` with ```428 Precondition Required```
     2. **Migration-friendly**: for a period, allow missing header only for specific clients/paths, behind a feature flag, then enforce globally
 
+---
+
 ### Step 5 — Return updated ETag on successful writes
 
 Return:
@@ -138,6 +146,8 @@ Return:
     - ```ETag: "<new-token>"```
 
 Clients should update their cached token.
+
+---
 
 ### Step 6 — Conflict resolution is the client's reponsibility (by design)
 
@@ -459,7 +469,7 @@ Don’t force this blindly across all endpoints:
 
 ## 11. High-Level Overview
 
-> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+> Visual representation of the end-to-end HTTP write flow, highlighting conditional requests, ETag-based optimistic concurrency, and explicit conflict signaling (428 / 412).
 
 import Light from './_assets/etag-optimistic-concurrency-light.svg';
 import Dark from './_assets/etag-optimistic-concurrency-dark.svg';
