@@ -1,0 +1,778 @@
+---
+id: idempotent-requests
+title: Idempotent Requests
+slug: /architecture/api/http/idempotent-requests
+description: Design and implement idempotent .NET APIs to safely handle retries, prevent duplicate side effects, and ensure consistent outcomes at scale.
+sidebar_label: Idempotent Requests
+sidebar_position: 30
+---
+
+
+## 1. What this document is about
+
+This document explains how to implement **idempotency** in **ASP.NET Core APIs** so that **retries do not create duplicate side effects** 
+(e.g., double charge, duplicate order, duplicated writes).
+
+It covers:
+
+    - How idempotency _actually_ fails in production (timeouts after commit, concurrent duplicates, gateway retries).
+    - A robust implementation model using **SQL Server as the source of truth**, safe under **horizontal scaling** and **concurrency**.
+    - Storage and lifecycle of idempotency records, reponse replay, and failure handling.
+    - Trade-offs and operational guidance.
+
+Where it applies:
+
+    - **Command-like HTTP endpoints** that cause side effects (POST/PUT/PATCH).
+    - Workflows exposed to unreliable networks (mobile, IoT), multi-hop systems, or gateways with automic retries.
+    - Systems where "at-least-once" delivery is unavoidable.
+
+Where it does **not** apply:
+
+    - Read-only operations (GET) where caching semantics are sufficent.
+    - Domains where duplicate effects are acceptable (rare) or already prevented by **strong domain keys** (e.g., unique natural keys that make duplicates impossible).
+    - Places where you want **deduplication** but not **response replay** (different requirements; you may want "drop duplicates" instead).
+
+---
+
+## 2. Why this matters in real systems
+
+Idempotency becomes mandatory when the system is under pressures that make **duplicate delivery normal**:
+
+### Typical triggers
+
+    - **Client retries** due to timeouts (client never receives response, but server completed the work).
+    - **Gateway/proxy retries** (API gateways, LBs, WAFs, service meshes) applying retry policies automatically.
+    - **Mobile network** (flaky connectivity, background resume → duplicate sends).
+    - **Async edges**: HTTP endpoints that enqueue work and return quickly; background consumers may retry.
+
+### What tends to break when you ignore it
+
+    - **Double money movement**: charges, refunds, wallet debits.
+    - **Duplicate business entities**: orders, subscriptions, provisioning requests.
+    - **Cascading duplicates**: one duplicate command triggers multiple downstream duplicates.
+
+### Why simple approaches stop working
+
+    - "Just make the handler check if it exists" fail under **concurrency** (two requests race before the "exists" row in committed).
+    - "Use distributed cache" fail under **evictions, cache partition** and "cache is not a source of truth".
+    - "Use unique constraints only" helps but doesn't solve:
+        - replaying the original response (clients often need the original result)
+        - multi-entity side effects (it's not always one insert)
+        - post-commit timeout scenario (the hardest one)
+
+In other words: in production, duplicates are not a bug — **they're a delivery guarantee** ("at least one"). Your job is to make the _effects_ behave
+"exactly once".
+
+---
+
+## 3. Core concept (mental model)
+
+Think of idempotency as a **transactional "receipt" for a request**:
+
+    - The client supplies an **Idempotency Key** (a stable identifier for "this command instance").
+    - The server stores a record:
+        - (**Key** + **Request Fingerprint**) → **Status** + **Response Snapshot** + **Expiry**
+    - On retry:
+        - If the same request comes with the same key: **replay the stored response**.
+        - If the same key comes with a different request: reject (client bug or misuse).
+    
+The mental model is a **state machine**:
+
+    1. **New key** → create am ode,´ptemcu recprd om ```Started```
+    2. Execute the command
+    3. Persist effects and response, move record to ```Completed```
+    4. If failure happens:
+        - record is ```Failed``` (optional) or remains ```Started``` and will be recovered via TTL / timeout rules
+
+What you're really building is:
+
+    - a **deduplication gate** (only one execution per key)
+    - a **response cache with correctness guarantees** (replay exactly what was returned)
+    - a **concurrency control point** safe across instances
+
+---
+
+## 4. How it works (step-by-step)
+
+The is the "SQL Server-backed idempotency ledger" approach (durable, multi-instance safe).
+
+### 0 — Client responsibilities (contract)
+
+    - Client generate a **unique key per command** and sends it in ```Idempotency-Key```
+    - Client must reuse the _same key_ for retries of the _same logical command_.
+    - Client must not reuse a key across different logical commands.
+
+You can enforce this at API gateway, SDK or client library level.
+
+---
+
+### Step 1 — Normalize the request “fingerprint”
+
+You must decide what makes two requests "the same" for a given key.
+
+Common practice:
+    - HTTP method + route template + relevant headers (tenant/user) + body hash
+
+Why:
+    - Prevents a client from accidentally reusing a key with a different payload and silently getting the wrong response.
+
+Invariant:
+    - **Same key must map to one fingerprint**. If not, you must return a **conflict**.
+
+---
+
+### Step 2 — Acquire the idempotency record (durably)
+
+You do a single atomic opration against SQL Sever to guarantee:
+
+    - Only one request "wins" and executes
+    - Others detect the record exists and decide whether to wait or replay
+
+Common pattern:
+    - Table with unique constraint on ```(TenantId, IdempotencyKey)``` or ```(Scope, Key)```
+    - Insert row in ```(Started)``` state
+    - If insert fails due to unique constraint, you load the existing row
+
+This is your concurrency boundary across app instances.
+
+---
+
+### Step 3 — If record exists, decide replay vs wait vs reject
+
+    - If ```Completed```: return stored response (status + body)
+    - If ```Started```:
+        - Option A: wait/pool for completion up to timeout, then return 409/425/202
+        - Option B: fail fast with 409/425 ("request in process")
+    - If ```Failed```: either replay failure response, or allow controlled re-execution (dangerous; must be explicit)
+
+Most enterprise APIs choose:
+    - **Replay on Completed**
+    - **Fail fast on Started** (keeps resources predictable)
+    - **Treat mismatch fingerprint as 409*** (client misuse)
+
+---
+
+### Step 4 — Execute the business logic
+
+The execution must be done in a way where:
+
+    - If the process crashes after effects are committed, retries will still return consistent results.
+
+This is why response snapshot is important: it allows "exactly once outcome" for the client event if the first response never arrived.
+
+---
+
+### Step 5 — Persist the response snapshot
+
+Inside the same overall operational flow, you update the idempotency record:
+
+    - ```Status = Completed```
+    - store ```HttpStatusCode```
+    - store response body (or a pointer to it)
+    - store relevant headers (optional)
+    - store ```CompleteAt```
+
+You should also store:
+
+    - ```RequestHash```
+    - ```ResourceId``` (if your command creates/returns an ID)
+    - ```CorrelationId/TraceId``` for observability
+
+---
+
+### Step 6 — Enforce TTL and cleanup
+
+Without retention control, idempotency tables become operational debt.
+
+You define:
+
+    - retention duration (24h, 7d, etc.)
+    - background cleanup job
+    - partitioning strategy if needed (by date, tenant)
+
+Constraints:
+
+    - Don't store PII in response snapshots if that violates policies
+    - If response contains sentive data, store a pointer / encrypted payload / minimal result reference
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+Below is a minimal implementation that is still production-aware
+
+    - Works with multiple instances
+    - Uses SQL Server unique constraint to gate execution
+    - Stores a response snapshot for replay
+    - Detects key reuse with different request payload
+
+### SQL Server table
+
+```sql
+CREATE TABLE dbo.IdempotencyRecords
+(
+    Id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    Scope NVARCHAR(200) NOT NULL,              -- e.g. tenantId + endpoint name
+    IdempotencyKey NVARCHAR(128) NOT NULL,
+    RequestHash VARBINARY(32) NOT NULL,        -- SHA-256
+    Status TINYINT NOT NULL,                   -- 0=Started, 1=Completed
+    HttpStatusCode INT NULL,
+    ResponseBody VARBINARY(MAX) NULL,          -- store compressed/encrypted bytes if needed
+    ResponseContentType NVARCHAR(100) NULL,
+    CreatedAt DATETIME2 NOT NULL,
+    CompletedAt DATETIME2 NULL,
+    ExpiresAt DATETIME2 NOT NULL,
+    CorrelationId NVARCHAR(64) NULL
+);
+
+CREATE UNIQUE INDEX UX_Idempotency_Scope_Key
+ON dbo.IdempotencyRecords (Scope, IdempotencyKey);
+
+CREATE INDEX IX_Idempotency_ExpiresAt
+ON dbo.IdempotencyRecords (ExpiresAt);
+
+```
+
+### .NET types
+
+```csharp
+public enum IdempotencyStatus : byte
+{
+    Started = 0,
+    Completed = 1
+}
+
+public sealed record IdempotencyReplay(
+    int HttpStatusCode,
+    string ContentType,
+    byte[] Body
+);
+```
+
+### Repository (Dapper for lightweight)
+
+```csharp
+using Dapper;
+using Microsoft.Data.SqlClient;
+using System.Security.Cryptography;
+
+public sealed class IdempotencyStore
+{
+    private readonly string _connectionString;
+
+    public IdempotencyStore(string connectionString) => _connectionString = connectionString;
+
+    public static byte[] Sha256(byte[] bytes) => SHA256.HashData(bytes);
+
+    public async Task<(long recordId, bool createdNew)> TryStartAsync(
+        string scope,
+        string key,
+        byte[] requestHash,
+        DateTimeOffset now,
+        DateTimeOffset expiresAt,
+        string? correlationId,
+        CancellationToken cancellationToken)
+    {
+            const string sql = @"
+        BEGIN TRY
+            INSERT INTO dbo.IdempotencyRecords
+                (Scope, IdempotencyKey, RequestHash, Status, CreatedAt, ExpiresAt, CorrelationId)
+            VALUES
+                (@Scope, @Key, @RequestHash, @Status, @CreatedAt, @ExpiresAt, @CorrelationId);
+
+            SELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS Id, CAST(1 AS BIT) AS CreatedNew;
+        END TRY
+        BEGIN CATCH
+            IF ERROR_NUMBER() IN (2601, 2627)
+            BEGIN
+                SELECT TOP(1) Id AS Id, CAST(0 AS BIT) AS CreatedNew
+                FROM dbo.IdempotencyRecords
+                WHERE Scope = @Scope AND IdempotencyKey = @Key;
+            END
+            ELSE
+                THROW;
+        END CATCH
+        ";
+
+            await using var con = new SqlConnection(_connectionString);
+            await con.OpenAsync(cancellationToken);
+
+            var result = await con.QuerySingleAsync<(long Id, bool CreatedNew)>(
+                new CommandDefinition(
+                    sql,
+                    new
+                    {
+                        Scope = scope,
+                        Key = key,
+                        RequestHash = requestHash,
+                        Status = (byte)IdempotencyStatus.Started,
+                        CreatedAt = now.UtcDateTime,
+                        ExpiresAt = expiresAt.UtcDateTime,
+                        CorrelationId = correlationId
+                    },
+                    cancellationToken: cancellationToken
+                )
+            );
+
+            return (result.Id, result.CreatedNew);
+    }
+
+    public async Task CompleteAsync(
+        long id,
+        int httpStatusCode,
+        string contentType,
+        byte[] responseBody,
+        DateTimeOffset completedAt,
+        CancellationToken cancellationToken)
+    {
+            const string sql = @"
+                UPDATE dbo.IdempotencyRecords
+                SET Status = @Status,
+                    HttpStatusCode = @HttpStatusCode,
+                    ResponseContentType = @ContentType,
+                    ResponseBody = @Body,
+                    CompletedAt = @CompletedAt
+                WHERE Id = @Id;";
+
+            await using var con = new SqlConnection(_connectionString);
+            await con.OpenAsync(cancellationToken);
+
+            var rows = await con.ExecuteAsync(
+                new CommandDefinition(
+                    sql,
+                    new
+                    {
+                        Id = id,
+                        Status = (byte)IdempotencyStatus.Completed,
+                        HttpStatusCode = httpStatusCode,
+                        ContentType = contentType,
+                        Body = responseBody,
+                        CompletedAt = completedAt.UtcDateTime
+                    },
+                    cancellationToken: cancellationToken
+                )
+            );
+
+            if (rows != 1)
+                throw new InvalidOperationException("Failed to update idempotency record.");
+    }
+
+    public async Task<(IdempotencyStatus status, byte[] requestHash, IdempotencyReplay? replay)> GetAsync(long id, CancellationToken cancellationToken)
+    {
+            const string sql = @" SELECT Status, RequestHash, HttpStatusCode, ResponseContentType, ResponseBody
+                                  FROM dbo.IdempotencyRecords
+                                  WHERE Id = @Id;";
+
+            await using var con = new SqlConnection(_connectionString);
+            await con.OpenAsync(cancellationToken);
+
+            var row = await con.QuerySingleOrDefaultAsync<IdempotencyRow>(
+                new CommandDefinition(sql, new { Id = id }, cancellationToken: cancellationToken)
+            );
+
+            if (row is null)
+                throw new InvalidOperationException("Idempotency record not found.");
+
+            var status = (IdempotencyStatus)row.Status;
+
+            if (status == IdempotencyStatus.Completed)
+            {
+                var replay = new IdempotencyReplay(
+                    row.HttpStatusCode!.Value,
+                    row.ResponseContentType!,
+                    row.ResponseBody!
+                );
+
+                return (status, row.RequestHash, replay);
+            }
+
+            return (status, row.RequestHash, null);
+    }
+
+private sealed class IdempotencyRow
+{
+    public byte Status { get; init; }
+    public byte[] RequestHash { get; init; } = default!;
+    public int? HttpStatusCode { get; init; }
+    public string? ResponseContentType { get; init; }
+    public byte[]? ResponseBody { get; init; }
+}
+
+
+```
+
+### ASP.NET Core filter (intercepts command endpoints)
+
+This filter:
+
+    - Requires ```Idempotency-Key```
+    - Hashes request body
+    - Attempts to insert ```Started```
+    - If existing record is ```Completed```, replays response
+    - If ```Started```, fails fast (you can change to wait/poll)
+    - After action executes, stores response snapshot
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.IO; // RecyclableMemoryStream (optional)
+using System.Text;
+
+public sealed class IdempotencyFilter : IAsyncActionFilter
+{
+    private readonly IdempotencyStore _store;
+    private readonly TimeSpan _ttl = TimeSpan.FromHours(24);
+
+    public IdempotencyFilter(IdempotencyStore store) => _store = store;
+
+    public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
+    {
+        var req = context.HttpContext.Request;
+
+        // Apply only to commands; in real usage, bind via attribute or endpoint metadata.
+        if (HttpMethods.IsGet(req.Method) || HttpMethods.IsHead(req.Method))
+        {
+            await next();
+            return;
+        }
+
+        if (!req.Headers.TryGetValue("Idempotency-Key", out var keyValues) || string.IsNullOrWhiteSpace(keyValues))
+        {
+            context.Result = new BadRequestObjectResult(new
+            {
+                error = "Idempotency-Key header is required for this endpoint."
+            });
+            return;
+        }
+
+        var idempotencyKey = keyValues.ToString().Trim();
+
+        // Scope should include tenant + route template to avoid cross-endpoint collisions.
+        // Use route template name, not raw path, when possible.
+        var tenantId = context.HttpContext.User.FindFirst("tenant_id")?.Value ?? "unknown";
+        var route = context.ActionDescriptor.AttributeRouteInfo?.Template ?? req.Path.Value ?? "unknown";
+        var scope = $"{tenantId}:{route}:{req.Method}";
+
+        // Read and hash the body (enable buffering)
+        req.EnableBuffering();
+
+        byte[] bodyBytes;
+        using (var ms = new MemoryStream())
+        {
+            await req.Body.CopyToAsync(ms);
+            bodyBytes = ms.ToArray();
+        }
+        req.Body.Position = 0;
+
+        var requestHash = IdempotencyStore.Sha256(bodyBytes);
+
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = now.Add(_ttl);
+        var correlationId = context.HttpContext.TraceIdentifier;
+
+        var (recordId, createdNew) = await _store.TryStartAsync(
+            scope, idempotencyKey, requestHash, now, expiresAt, correlationId, context.HttpContext.RequestAborted);
+
+        var (status, storedHash, replay) = await _store.GetAsync(recordId, context.HttpContext.RequestAborted);
+
+        // Key reuse with different payload is a correctness violation.
+        if (!storedHash.SequenceEqual(requestHash))
+        {
+            context.Result = new ConflictObjectResult(new
+            {
+                error = "Idempotency-Key reuse with a different request payload is not allowed.",
+                scope,
+                idempotencyKey
+            });
+            return;
+        }
+
+        if (status == IdempotencyStatus.Completed && replay is not null)
+        {
+            context.Result = new ContentResult
+            {
+                StatusCode = replay.HttpStatusCode,
+                ContentType = replay.ContentType,
+                Content = Encoding.UTF8.GetString(replay.Body)
+            };
+            return;
+        }
+
+        if (!createdNew && status == IdempotencyStatus.Started)
+        {
+            // Another request is executing the same key.
+            // Option: return 409/425/202. Pick one and document the contract.
+            context.Result = new StatusCodeResult(StatusCodes.Status409Conflict);
+            return;
+        }
+
+        var executed = await next();
+
+        // Only snapshot successful results by default; your policy can vary.
+        if (executed.Exception is not null && !executed.ExceptionHandled)
+        {
+            // You can optionally record a "Failed" state.
+            return;
+        }
+
+        // Snapshot: simplest case - ObjectResult / Json
+        if (executed.Result is ObjectResult obj)
+        {
+            // Serialize using System.Text.Json
+            var json = System.Text.Json.JsonSerializer.Serialize(obj.Value);
+            var bytes = Encoding.UTF8.GetBytes(json);
+
+            await _store.CompleteAsync(
+                recordId,
+                obj.StatusCode ?? StatusCodes.Status200OK,
+                "application/json",
+                bytes,
+                DateTimeOffset.UtcNow,
+                context.HttpContext.RequestAborted);
+        }
+        else if (executed.Result is StatusCodeResult scr)
+        {
+            var bytes = Encoding.UTF8.GetBytes(string.Empty);
+
+            await _store.CompleteAsync(
+                recordId,
+                scr.StatusCode,
+                "text/plain",
+                bytes,
+                DateTimeOffset.UtcNow,
+                context.HttpContext.RequestAborted);
+        }
+        else
+        {
+            // Fallback: for non-standard results, you may need a response-capture middleware.
+            // Keep this explicit; silent partial support is dangerous.
+        }
+    }
+}
+
+```
+
+### How the example maps to the concept
+
+    - The SQL table + unique index implements the **durable dedup gate**.
+    - ```TryStartAsync``` implements the "only one wins" behavior across instances.
+    - ```RequestHash``` enforces key correctness (no key reuse across payloads).
+    - ```CompleteAsync``` stores the response snapshot for **replay** after timeout/retries.
+
+This is minimal, but the hard parts are present: concurrency, replay, mismatch detection, TTL.
+
+---
+
+## 6. Design trade-offs
+
+Idempotency is always trading simplicity for correctness under retries. The correct design depends on your domain.
+
+| Approach                         | What it gives you      | What it costs                     |Typical failure modes                 |When it fits                |
+|:---------------------------------|------------------------|-----------------------------------|--------------------------------------|----------------------------|
+|**DB-backed idempotency ledger (this doc)**    |Durable, multi-instance safe, replayable responses | DB writes per request, storage/cleanup, careful schema    | Hot partitions, table growth, response snapshot bloat |  Payments, provisioning, orders, regulated systems |
+|Unique constraint only (domain key)            |Cheap, simple               | No response replay, not universal               | Client retries after commit get 409/500 and no resource ID | When “create” has stable natural key |
+|Cache-based dedup (Redis)                          |Fast, easy to add                | Not source of truth, eviction risk    | Duplicate effects during cache loss / failover | Non-critical, best-effort dedup |
+|Queue + consumer dedup           |Great for async workflows | Changes API semantics          | “Exactly once” is still hard downstream |  Workflows where 202 + async fits |
+
+
+### Response snapshot vs “result pointer”
+
+    -  Snapshot (store response body)
+        - ✅ easiest replay
+        - ❌ storage and PII risks
+    - Pointer (store resource id + re-hydrate response)
+        - ✅ less storage, easier compliance
+        - ❌ response might change over time (representation drift), which can violate "same outcome"
+
+If your API contarct demands "same request => same response", snapshot is the cleanest.
+If your compliance prohibits storing responses, store a **resource ID** and return ```201 Location```, then rehydrate by reading current
+state (accepting representation drift explicitly).
+
+### Wait vs fail-fast on "Started"
+
+    - Wait:
+        - ✅ better client experience
+        - ❌ ties up threads and increases tail latency under spikes
+    - Fail-fast:
+        - ✅ keeps system stable under contention
+        - ❌ client must implement backoff + status check
+
+For enterprise systems under load, **fail-fast** is often the safer default, with an optional "status endpoint".
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### 1) “Idempotency is just ‘safe to retry’”
+
+**Why it happends**:
+    - people conflate idempotent HTTP methods (PUT) with idempotent business effects.
+
+**Avoid**:
+    - Treat idempotency as **business command deduplication**, not HTTP semantics.
+
+---
+
+### 2) Accepting the same key with different payload
+
+**Why it happends**:
+    - teams eams only key on ```Idempotency-Key```
+
+**Problem**:
+    - client bug can cause “wrong response replay” and corrupt business behavior.
+
+**Avoid**:
+    - Always store and compare a ***fingerprint*** (```RequestHash```).
+
+---
+
+### 3) Using Redis as "the truth"
+
+**Why it happends**:
+    - speed bias.
+
+**Problem**:
+    - cache eviction/failover reintroduces duplicates at the worst moment (incident).
+
+**Avoid**:
+    - If correctness matters, the idempotency ledger must be **durable** (DB or equivalent).
+
+---
+
+### 4) Not defining scope (key collisions across endpoints/tenants)
+
+**Why it happends**:
+    - key is treated as globally unique.
+
+**Problem**:
+    - client may reuse a key across different endpoints, causing incorrect replays.
+
+**Avoid**:
+    - Scope keys by **tenant + endpoint + method** at minimum.
+
+---
+
+### 5) No retention plan
+
+**Why it happends**:
+    - teams ship feature, ignore lifecycle.
+
+**Problem**:
+    - DB grows unbounded, becomes expensive, backup/restore suffers.
+
+**Avoid**:
+    - Define TTL, cleanup job, indexing strategy from day one.
+
+---
+
+### 6) Capturing response incorrectly
+
+**Why it happends**:
+    - results vary (streaming, file, problem details, etc.)
+
+**Problem**:
+    - you believe you’re replaying but actually are not, leading to inconsistent client behavior.
+
+**Avoid**:
+    - Either strictly support a bounded set of response types or use a **response-capture middleware** designed for this purpose.
+
+---
+
+## 8. Operational and production considerations
+
+### Things to monitor:
+
+At minimum, publish counters and traces for:
+
+    - ```idempotency.started_total```
+    - ```idempotency.replayed_total```
+    - ```idempotency.in_progress_conflicts_total```
+    - ```idempotency.mismatched_hash_conflicts_total```
+    - ```idempotency.complete_failures_total```
+    - DB latency for idempotency operations (p95/p99)
+
+Tie them to:
+
+    - endpoint name
+    - tenant id (careful with cardinality)
+    - status (Started/Completed)
+
+### What degrades first
+
+    - **Hot key contention**: many retries for the same key cause conflicts and client churn.
+    - **Table growth**: response snapshots can become the dominant DB storage consumer.
+    - **Tail latency**: if you "wait" for in-progress keys, the system's p99 becomes hostage to slow executions.
+
+### Avoiding lock contention / hot partitions
+
+    - Ensure your unique index is selective enough (```Scope + Key```).
+    - Consider:
+        - endpoint-specific TTL
+        - storing response bodies outside the main table if large (separate table or blob store)
+        - partitioning by date if your scale requires it
+
+### Handling partial failures (the real problem)
+
+Scenario: server commits business transaction, then crashes before returning response.
+    - On retry, idempotency record should alread be ```Completed``` with the response snapshot.
+    - If crash happens befor ```Completed``` update, you have a "stuck Started" record.
+
+Mitigations:
+    - Keep the window small: complete the idempotency record immediately after commit.
+    - Define a max "Started age" policy:
+        - If ```Started``` older than X seconds/minutes, treat as ambiguous:
+            - either return 409/202 and require status lookup
+            - or attempt safe recovery by checking domain state (only if you have deterministic resource IDs)
+
+### Observability signals
+
+    - High replay ratio can indicate:
+        - client behavior (bad networks)
+        - gateway retry misconfiguration
+        - timeout too aggressive
+    -High mismatch conflicts indicate:
+        - client key reuse bug
+        - SDK misuse
+        - scope collision
+
+---
+
+## 9. When NOT to use this
+
+Do not introduce a full idempotency ledger when:
+
+    - The operation is **read-only** or effects are naturally idempotent.
+    - The domain already has a **stable natural key** and the only side effect is a single insert protected by a unique index, and you **do not need response replay**.
+    - The API is low-stakes and duplicates are acceptable (e.g., logging endpoints, telemetry ingestion without strict dedup requirements).
+    - You cannot commit to operational ownership (TTL, cleanup, monitoring). An idempotency table without lifecycle becomes long-term damage.
+    - Your API semantics are asynchronous anyway (202 + job status). In that case, dedup may be better at the workflow/job layer than HTTP response replay.
+
+---
+
+## 10. Key takeaways
+
+    - Idempotency is about **exactly-once effects under at-least-once delivery**, not HTTP method semantics.
+    - The durable solution is a **deduplication gate + response replay ledger** anchored in a **source-of-truth store** (SQL Server here).
+    - Always scope your key (```tenant + endpoint + method```) and enforce a **request fingerprint** to prevent key misuse.
+    - Decide explicitly how to handle “in progress” duplicates: **fail-fast** is safer under load; waiting improves UX but increases tail risk.
+    - Response snapshots make retries correct after “timeout after commit”, but introduce storage and compliance costs—own them deliberately.
+    - Operational success requires TTL, cleanup, metrics, and clear failure contracts—idempotency without ops is a trap.
+    - If your system can’t replay responses safely, prefer returning stable identifiers (```201 Location```, job id) and make idempotency about resource identity, not body replay.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
+import Light from './_assets/idempotent-requests-light.svg';
+import Dark from './_assets/idempotent-requests-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Idempotent requests"
+  height={1200}
+/>
