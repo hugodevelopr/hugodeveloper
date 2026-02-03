@@ -119,8 +119,8 @@ const config: Config = {
     algolia: {
       appId: 'B5T908NZ4O',
       apiKey: '4af50d3536afbf35236e638218a0ce48',
-      indexName: 'hugodeveloper_com_b5t908nz4o_pages',
-      contextualSearch: true,
+      indexName: 'hugodeveloper_com_b5t908nz4o_docsearch',
+      contextualSearch: false,
       searchPagePath: 'search',
       
     }
