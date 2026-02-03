@@ -1,0 +1,81 @@
+---
+title: Structural Decisions
+description: A curated knowledge base on architectural decisions, trade-offs, and system design accumulated through real-world experience.
+---
+
+```text
+ █████╗ ██████╗  ██████╗██╗  ██╗██╗████████╗███████╗ ██████╗████████╗██╗   ██╗██████╗ ███████╗
+██╔══██╗██╔══██╗██╔════╝██║  ██║██║╚══██╔══╝██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔══██╗██╔════╝
+███████║██████╔╝██║     ███████║██║   ██║   █████╗  ██║        ██║   ██║   ██║██████╔╝█████╗  
+██╔══██║██╔══██╗██║     ██╔══██║██║   ██║   ██╔══╝  ██║        ██║   ██║   ██║██╔══██╗██╔══╝  
+██║  ██║██║  ██║╚██████╗██║  ██║██║   ██║   ███████╗╚██████╗   ██║   ╚██████╔╝██║  ██║███████╗
+╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝   ╚═╝   ╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝
+
+  designing systems under uncertainty • balancing trade-offs • containing failure
+```
+
+## Context
+
+This section represents a **personal knowledge base** built over years of designing, evolving, and operating software systems.
+
+Not everything encountered along the way is documented here.
+Only the parts that proved to be durable, recurring, or costly enough to justify reflection.
+
+Architecture, in this context, is not treated as a theoretical discipline, but as a byproduct of real constraints:
+delivery pressure, scale, failure, organizational boundaries, and time.
+
+---
+
+## What Is Collected Here
+
+The material under this section focuses on **architectural decisions that tend to persist**, regardless of technology stack or momentary trends.
+
+These include, but are not limited to:
+- how systems are structured and where boundaries are drawn  
+- how responsibilities are assigned and enforced  
+- how data, communication, and failure propagate through a system  
+- how trade-offs are evaluated when there is no clearly correct choice  
+
+The intent is not to catalogue patterns, but to document the **reasoning behind structural choices** and the consequences they tend to produce over time.
+
+---
+
+## Assumptions and Perspective
+
+The perspective taken throughout this section assumes that:
+
+- most systems are distributed in practice, even when not designed to be  
+- partial failure is the norm, not an edge case  
+- scalability is constrained as much by teams and processes as by infrastructure  
+
+If a problem can be addressed without considering time, failure modes, or organizational structure, it is unlikely to be architectural in nature.
+
+---
+
+## Architecture as an Accumulation of Decisions
+
+Very few systems are architected in a single moment.
+
+What usually exists instead is an accumulation of decisions:
+some explicit, many implicit, most made under imperfect information.
+
+Over time, these decisions solidify into structure.
+At that point, architecture becomes less about design and more about **understanding what has already been locked in**.
+
+This section documents that reality, rather than idealized greenfield scenarios.
+
+---
+
+## How to Use This Material
+
+These documents are not meant to be consumed sequentially or treated as reference manuals.
+
+They are intended to be:
+- revisited as systems evolve  
+- questioned when context changes  
+- compared against lived experience  
+
+Disagreement is expected.
+In many cases, it is a sign that the material is doing its job.
+
+The value of this knowledge compounds not through agreement, but through reflection.

@@ -16,7 +16,7 @@ This document explains how to prevent **lost updates** (uninteded overwrites) in
 It covers:
 
     - The real problem: **concurrent writers + stale reads → silent overwrites**
-    - The HTTP mechanism: **ETag as version, ```If-Match``` as **precondition**
+    - The HTTP mechanism: **ETag** as version, ```If-Match``` as **precondition**
     - A concrete, production-aware implementation in **.NET / ASP.NET Core**
     - Trade-offs, failure modes and operational implications
 
