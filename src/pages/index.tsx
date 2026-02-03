@@ -44,6 +44,7 @@ export default function Home(): ReactNode {
           <div className={styles.vignette} />
         </div>
 
+
         {/* HERO */}
         <section className={styles.hero}>
           <div className={styles.heroLeft}>
@@ -54,18 +55,21 @@ export default function Home(): ReactNode {
             </Heading>
 
             <p className={styles.lead}>
-              I document how I design and evolve backend systems under real-world constraints.
-              Trade-offs. Reliability. Execution.
+              I document how I design and evolve backend systems under
+              real-world constraints. Trade-offs. Reliability. Execution.
             </p>
 
             <div className={styles.actions}>
-              <Link to="/docs/architecture/patterns/outbox-pattern" className={styles.primary}>
+              <Link
+                to="/docs/architecture/patterns/outbox-pattern"
+                className={styles.primary}
+              >
                 Explore the work
               </Link>
               <Link to="/blog" className={styles.secondary}>
                 Blog
               </Link>
-            </div>
+            </div>            
 
             <div className={styles.signals}>
               <span className={styles.signal}>Architecture</span>
@@ -94,8 +98,36 @@ export default function Home(): ReactNode {
               <div className={styles.signatureLine} aria-hidden="true" />
               <div className={styles.signatureText}>
                 <div className={styles.signatureName}>Hugo Moura</div>
-                <div className={styles.signatureRole}>Principal Software Engineer</div>
+                <div className={styles.signatureRole}>
+                  Principal Software Engineer
+                </div>
               </div>
+            </div>
+
+            <div className={styles.contacts}>
+              <a
+                className={styles.contactPill}
+                href="https://www.linkedin.com/in/hugo-moura"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="LinkedIn"
+              >
+                <span className={styles.onlineDot} aria-hidden="true" />
+                <span className={styles.contactLabel}>LinkedIn</span>
+                <span className={styles.contactHandle}></span>
+              </a>
+
+              <a
+                className={styles.contactPill}
+                href="https://www.instagram.com/hugo.woura/"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="Instagram"
+              >
+                <span className={styles.onlineDot} aria-hidden="true" />
+                <span className={styles.contactLabel}>Instagram</span>
+                <span className={styles.contactHandle}>@hugo.woura</span>
+              </a>
             </div>
           </div>
         </section>
