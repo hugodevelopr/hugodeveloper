@@ -10,460 +10,465 @@ sidebar_position: 10
 
 ## 1. What this document is about
 
-This document describes the **Outbox Pattern** as a reliability mechanism for publishing integration events in systems that use a **relational database as the system of record**.
-It addresses the lack of atomicity between **state mutation** and **event publication** in distributed systems.
+This document explains how to prevent **lost updates** (uninteded overwrites) in HTTP APIs by enforcing
+**optimistic concurrency** using **ETags** and ```If-Match``` request header.
 
-This pattern applies to:
+It covers:
 
-    - Event-driven architectures
-    - Systems using relational databases (SQL Server, PostgreSQL, MySQL)
-    - Domains where emitted events have **business meaning**
+    - The real problem: **concurrent writers + stale reads → silent overwrites**
+    - The HTTP mechanism: **ETag as version, ```If-Match``` as **precondition**
+    - A concrete, production-aware implementation in **.NET / ASP.NET Core**
+    - Trade-offs, failure modes and operational implications
 
-It does **not** apply to:
+Where it applies:
 
-    - Systems using a log-first architecture (e.g. Kafka as the source of truth)
-    - Purely synchronous request/response systems
-    - Best-effort or non-critical integrations
+    - Any API exposing **mutate resources** (PUT/PATCH/DELETE)
+    - Systems where **multiple clients** can update the same resource
+    - Systems where "last write wins" is **not acceptable**
+
+Where it does not apply:
+
+    - Append-only/event-sourced APIs where updates are modeled as commands/events
+    - Single-writer resource (true single writer, not "usually single writer")
+    - Scenarios where overwrites are acceptable and explicitly documented (rare)
 
 ---
 
 ## 2. Why this matters in real systems
 
-The core issue is not messaging - it is **partial failure**.
+You don't feel this problem when:
 
-In real systems:
+    - There's one client
+    - Writes are rare
+    - Payloads include all fields and clients always send the last state
 
-    - Databaes fail independently from brokers
-    - Networks partition
-    - Processes crash between instructions
-    - Retries amplify side effects
+You get hit in production when:
 
-Common failure sequences:
+    - Multiple devices/users update the same entity (mobile, web, integrations)
+    - Updates are partial and occur on different fields
+    - Clients cache aggressively and replay old "save" actions
+    - Retries happen due to network failures (especially with PATCH)
+    - Background processes update records concurrently with user actions
+    - Third-party integrators are sloppy (they will be)
 
-    1.  Transaction commits, broker publish fails → **lost event**
-    2.  Broker publish succeeds, transaction rolls back → **ghost event**
-    3.  Retry publishes the same event multiple times → **duplicate side effects**
-    4.  Service crashes after commit but before publish → **invisible inconsistency**
+What breaks when you ignore this:
 
-These failures:
+    - A user changes "Address", another changes "Phone", one overwrites the other
+    - A UI loads an entity, leaves tab open, later "Save" wipes newer changes
+    - Integrations "sync" by overwritting whole entities from stale snapshots
+    - You get "random" data regressions and nobody can reproduce them
 
-    - Are hard to reproduce
-    - Surface weeks later
-    - Corrupt downstream projections
-    - Break reporting, billing, and compliance flows
+Why simpler approaches stop working:
 
-As systems evolve monoliths to distributed architectures, these inconsistencies become **systemic**, not accidental.
+    - "We'll just use PATCH" doesn't solve stale state — PATCH can still be applied against a stale version
+    - "The DB will handle it" only helps if you enforce concurrency at the DB boundary _and_ surface it correctly at the API contract
+    - "Last write wins" is a design decision. If you didn't explicitly choose it, you're just being careless.
 
 ---
 
 ## 3. Core concept (mental model)
 
-The **Outbox Pattern** enforces a simple rule:
+Think of each resource presentation as having a **version token**
 
-> **If a fact is not committed to the database, it must not be published.**
+    - **ETag** = "This is the version of the representation you retrieved."
+    - ```If-Match``` = "Only apply this update if the current version still matches what I read."
 
-Mental model:
+So an update becomes conditional:
 
-    - The database is the **source of truth**
-    - Events are **facts derived from committed state**
-    - Message brokers are **distribution mechanisms**, not transactional authorities
+> "Update X **only if** noboody has modified X since I last fetched it."
 
-Think of the outbox as:
+If the condition fails, the server rejects the write with ```412 Precondition Failed``` instead of silently overwriting.
 
-    - A **write-ahead log** for integration events
-    - A durable contract between domain logic and infrastructure
-    - A buffer that absorbs partial failures
+This is not "locking". This is **detecting** conflicts at write time, cheaply.
 
-This decouples:
+Key invariant:
 
-    - Business correctness from delivery timing
-    - Domain logic from messaging infrastructure
+    - **A wirte must never be accepted if the client is operating on stale state**.
+    - If a client wants to update, it must prove it knows the current version (or explicitly choose an override policy).
 
 ---
 
 ## 4. How it works (step-by-step)
 
-1.  **Start a database transaction**
-    Defines the consistency boundary.
+### Step 1 — Server returns an ETag on reads
 
-2.  **Apply domain state changes**
-    Aggregate invariants are enforced normally.
+On ```GET /resources/{id}```, server returns:
+    - ```ETag: "<token>``` (strong or weak)
+    - Representation in the body
 
-3.  **Create an outbox entry**
+The token must change whenever the resource changes in a way that should invalidate a stale update.
 
-    - _Id_                                                ```(guid)```
-    - _AggregateId_                                       ```(guid)```
-    - _Message Type_                                      ```(string)```
-    - _Payload_                                           ```(string)```
-    - _Assembly Name_                                     ```(string)```
-    - _Assembly_                                          ```(string)```
-    - _Sent_                                              ```(bool)```
-    - _Occured At_                                        ```(timestamp)```
+Typical token sources:
 
-4.  **Commit the transaction**
-    At this point:
+    - ```rowversion``` / ```xmin``` / update counter
+    - Hash of canonical representation (careful: expensive and easy to get wrong)
+    - Explicit ```Version``` column incremented per write
 
-    - Business state exists
-    - Event intent exists
-    - System in internally consistent
+### Step 2 — Client includes ```If-Match``` on writes
 
-5.  **Outbox processor queries pending messages**
-    - Typically ordered by occurrence times
-    - Bounded by batch size
+On ```PUT/PATCH/DELETE```,client sends:
 
-6.  **Publish events to the broker**
-    - Retryable
-    - Idempotent at the consumer side
+    - ```If-Match: "<token-from-last-read>"```
 
-7.  **Mark messages as sent**
-    - Timestamp
-    - Optional delivery metadata
+Now the write expresses a precondition.
 
+### Step 3 — Server validates precondition before applying changes
 
-### Key invariants
+Server compares client token vs current token:
 
-    - The database transaction is the only atomic boundary
-    - Publishing is asyncronous and retryable
-    - Consumers must tolerate duplicates
-    - The outbox is append-only from the domain perspective
+    - If match → apply update, generate new ETag, return it
+    - If mismatch → reject with ```412 Precondition Failed```
+
+### Step 4 — Define the server behavior when ```If-Match``` is missing
+
+This is where systems get sloppy.
+
+If your requirement is "must pass If-Match, otherwise no overwrite", then missing ```If-Match``` must not be treated as "best effort".
+
+You have two sane options:
+
+    1. **Strict**: reject missing ```If-Match``` with ```428 Precondition Required```
+    2. **Migration-friendly**: for a period, allow missing header only for specific clients/paths, behind a feature flag, then enforce globally
+
+### Step 5 — Return updated ETag on successful writes
+
+Return:
+
+    - ```200 OK``` (or ```204 No Content```)
+    - ```ETag: "<new-token>"```
+
+Clients should update their cached token.
+
+### Step 6 — Conflict resolution is the client's reponsibility (by design)
+
+When receiving ```412```:
+
+    - Client must re-fetch (```GET```)
+    - Decide whether to retry with latest ETag
+    - Possibly present a merge UI, or reapply changes against fresh state
+
+Your API should privide enough info to make workable (details later).
 
 ---
 
 ## 5. Minimal but realistic example
 
-This example focuses on **durable persistence**, **safe dispatch**, **type fidelity**, and **operational clarity**. 
+Below is a minimal but production-awave approach in **ASP.NET Core** with:
 
-### 5.1 Table design (SQL Server)
+    - ```GET``` returns ETag based on a DB ```rowversion```
+    - ```PUT``` requires ```If-Match```
+    - Write is rejected with ```428``` is missing header
+    - Write is rejected with ```412``` is stale
 
-Design goals:
-
-    - Query efficiently for pending messages
-    - Store enough metadata to support evolution and debugging
-    - Keep dispatch idempotent and observable
-
-```sql
-
-CREATE TABLE dbo.OutboxMessage (
-    Id                  UNIQUEIDENTIFIER    NOT NULL CONSTRAINT PK_OutboxMessage PRIMARY KEY,
-    OccuredAtUtc        DATETIME2(3)        NOT NULL,
-    AggregateId         UNIQUEIDENTIFIER    NULL,
-    MessageType         NVARCHAR(256)       NOT NULL,       -- e.g. "OrderPaidIntegrationEvent"
-    AssemblyName        NVARCHAR(512)       NOT NULL,       -- e.g. "Company.Sales.Contracts, Company.Sales.Contracts"
-    Payload             NVARCHAR(MAX)       NOT NULL,       -- JSON
-    CorrelationId       UNIQUEIDENTIFIER    NULL,
-    TenantId            NVARCHAR(64)        NULL,
-    Sent                BIT                 NOT NULL CONSTRAINT DF_Outbox_Sent          DEFAULT(0),
-    SentAtUtc           DATETIME2(3)        NULL,
-    AttemptCount        INT                 NOT NULL CONSTRAINT DF_Outbox_AttemptCount  DEFAULT(0),
-    LastAttemptAtUtc    DATETIME2(3)        NULL,
-    LastError           NVARCHAR(2048)      NULL,
-    LockId              UNIQUEIDENTIFIER    NULL,
-    LockedAtUtc         DATETIME2(3)        NULL,
-    RowVersion          ROWVERSION          NOT NULL
-);
-
-
-CREATE INDEX IX_Outbox_Pending
-ON dbo.OutboxMessage (Sent, OccurredAtUtc)
-INCLUDE (MessageType, AssemblyName, CorrelationId, TenantId)
-
-CREATE INDEX IX_Outbox_Locks
-ON dbo.OutboxMessage (LockedAtUtc)
-INCLUDE (LockId, Sent);
-
-```
-
----
-
-### 5.2 Outbox model (.NET)
-
-
-```csharp title="OutboxMessage.cs"
-
-public sealed class OutboxMessage
-{
-    public Guid Id { get; private set; }
-    public DateTime OccurredAtUtc { get; private set; }
-    public Guid? AggregateId { get; private set; }
-    public string MessageType { get; private set; } = default!;
-    public string AssemblyName { get; private set; } = default!;
-    public string Payload { get; private set; } = default!;
-    public Guid? CorrelationId { get; private set; }
-    public string? TenantId { get; private set; }
-    public bool Sent { get; private set; }
-    public DateTime? SentAtUtc { get; private set; }
-    public int AttemptCount { get; private set; }
-    public DateTime? LastAttemptAtUtc { get; private set; }
-    public string? LastError { get; private set; }
-    public Guid? LockId { get; private set; }
-    public DateTime? LockedAtUtc { get; private set; }
-
-    private OutboxMessage() { }
-
-    public static OutboxMessage Create<T>(
-        T @event,
-        Guid? aggregateId,
-        Guid? correlationId,
-        string? tenantId,
-        DateTime utcNow) where T : class
-    {
-        var type = @event.GetType();
-
-        return new OutboxMessage
-        {
-            Id = Guid.NewGuid(),
-            OccurredAtUtc = utcNow,
-            AggregateId = aggregateId,
-            MessageType = type.FullName ?? type.Name,
-            AssemblyName = type.AssemblyQualifiedName ?? $"{type.FullName}, {type.Assembly.GetName().Name}",
-            Payload = JsonSerializer.Serialize(@event, type, JsonDefaults.Options),
-            CorrelationId = correlationId,
-            TenantId = tenantId,
-            Sent = false
-        };
-    }
-
-    public void MarkAttempt(DateTime utcNow, string? error)
-    {
-        AttemptCount++;
-        LastAttemptAtUtc = utcNow;
-        LastError = error;
-    }
-
-    public void MarkSent(DateTime utcNow)
-    {
-        Sent = true;
-        SentAtUtc = utcNow;
-        LockId = null;
-        LockedAtUtc = null;
-        LastError = null
-    }
-
-    public bool TryLock(Guid lockId, DateTime utcNow, TimeSpan lockTtl)
-    {
-        if(LockedAtUtc is not null && LockedAtUtc.Value > utcNow.Subtract(lockTtl))
-            return false;
-
-        LockId = lockId;
-        LockedAtUtc = utcNow;
-
-        return true;
-    }
-}
-
-public static class JsonDefaults
-{
-    public static readonly JsonSerializerOptions Options = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented = false
-    };
-}
-
-```
----
-
-### 5.3 Writing to Outbox inside the domain transaction
-
-Key point: state change and outbox insert share the same commit boundary.
+### Data model (EF Core style)
 
 ```csharp
 
-using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+public sealed class Customer
+{
+    public Guid Id { get; private set; }
+    public string Name { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
 
-var utcNow = _clock.UtcNow;
-
-// 1) Apply domain changes
-order.MarkAsPaid(utcNow);
-db.Orders.Update(order);
-
-// 2) Capture integration event
-var @event = new OrderPaidIntegrationEvent(
-    orderId: order.Id,
-    amount: order.TotalAmount,
-    occurredAtUtc: utcNow,
-    version: 1
-);
-
-// 3) Persist outbox message inside the same transaction
-var outboxMessage = OutboxMessage.Create(
-    @event,
-    aggregatedId: order.Id,
-    correlationId: _correlation.CorrelationId,
-    tenantId: _tenant.Id,
-    utcNow: utcNow
-);
-
-
-db.OutboxMessages.Add(outboxMessage);
-
-await db.SaveChangesAsync(cancellationToken);
-await transaction.CommitAsync(cancellationToken);
+    // SQL Server rowversion (timestamp) maps to byte[].
+    // PostgreSQL alternative: xmin (unit) or a Version column.
+    [Timestamp]
+    public byte[] RowVersion { get; set; } = Array.Empty<byte>();
+}
 
 ```
 
-#### Why this is correct
-    - The outbox record is a durable fact that "an event must be emitted".
-    - Messaging infrastructure is not part of the consistency boundary.
+### ETag helper
 
----
+Use a stable encoding. For rowversion (byte[]), base64 if fine.
 
-### 5.4 Dispatching with lock + idempotent Update
+Importat: ETags in HTTP are quoted strings. Keep them quoted.
 
-Dispatch requirements:
+```csharp
 
-    - Multiple dispatcher instances must not double-send the same RowVersion
-    - Failures must be retryable
-    - "Sent" update must be safe and observable
-
-#### Dispatcher query strategy
-
-    - Pull pending messages
-    - Lock them optimistically (row update)
-    - Publish
-    - Mark as sent
-
-
-```csharp title="OutboxDispatcher.cs"
-
-public sealed class OutboxDispatcher
+public static class ETag
 {
-    private readonly AppDbContext _db;
-    private readonly IServiceBusPublisher _bus;
-    private readonly IClock _clock;
-
-    private static readonly TimeSpan LockTtl = TimeSpan.FromMinutes(2);
-
-    public OutboxDispatcher(AppDbContext db, IServiceBusPublisher bus, IClock clock)
+    public static string FromRowVersion(byte[] rowVersion)
     {
-        _db = db;
-        _bus = bus;
-        _clock = clock;
+        var token = Convert.ToBase64String(rowVersion);
+        return $"\"{token}\"";      //quoted        
     }
 
-    public async Task DispatchOnceAsync(int batchSize, CancellationToken cancellationToken)
+    public static bool TryParseIfMatch(HttpRequest request, out string etag)
     {
-        var utcNow = _clock.UtcNow;
-        var lockId = Guid.NewGuid();
+        etag = "";
+        if (!request.Headers.TryGetValue("If-Match", out var values))
+            return false;
 
-        // 1) Load candidates (cheap scan)
-        var candidates = await _db.OutboxMessages
-            .Where(x => !x.Sent)
-            .OrderBy(x => x.OccurredAtUtc)
-            .Take(batchSize)
-            .ToListAsync(cancellationToken);
-
-        foreach (var message in candidates)
-        {
-            // 2) Acquire lock (best-effort) and persist lock
-            if(!message.TryLock(lockId, utcNow, LockTtl))
-                continue;
-
-            message.MarkAttempt(utcNow, error: null);
-        }
-
-        await _db.SaveChangesAsync(cancellationToken);
-
-        // 3) Dispatch locked rows for this run
-        var locked = candidates.Where(x => x.LockId == lockId).ToList();
-
-        foreach(var message in locked)
-        {
-            try
-            {
-                var eventType = Type.GetType(message.AssemblyName, throwOnError: false);
-
-                await _bus.PublishAsync(
-                    messageType: message.MessageType,
-                    payloadJson: message.Payload,
-                    correlationId: message.CorrelationId,
-                    tenantId: message.TenantId,
-                    occurredAtUtc: message.OccurredAtUtc,
-                    cancellationToken: cancellationToken
-                );
-
-                message.MarkSent(_clock.UtcNow);
-            }
-            catch (Exception ex)
-            {
-                message.MarkAttempt(_clock.UtcNow, ex.Message);
-            }
-        }
-
-        await _db.SaveChangesAsync(cancellationToken);
+        // We accept exactly one value for simplicity.
+        // If you need multiple, handle CSV parsing properly.
+        etag = values.ToString().Trim();
+        
+        return !string.IsNullOrWhiteSpace(etag);
     }
 }
 
 ```
 
----
+### GET endpoint return ETag
 
-### 5.5 Service Bus Publisher
+```csharp
 
-This publisher ensures:
-
-    - message id can be used for idempotency downstream
-    - correlation flows across services
-    - consistent metadata for observability and routing
-
-```csharp title="IServiceBusPublisher.cs"
-
-public interface IServiceBusPublisher
+app.MapGet("/customers/{id:guid}", async (Guid id, AppDbContext db, HttpResponse response) =>
 {
-    Task PublishAsync(
-        string messageType, 
-        string payloadJson, 
-        Guid? correlationId, 
-        string? tenantId, 
-        DateTime occurredAtUtc, 
-        CancellationToken cancellationToken);
-}
+    var customer = await db.Customers
+        .AsNoTracking()
+        .FirstOrDefaultAsync(x => x.Id == id);
+
+    if (customer is null)
+        return Results.NotFound();
+
+    response.Headers.ETag = ETag.FromRowVersion(customer.RowVersion);
+
+    return Results.Ok(new
+    {
+        customer.Id,
+        customer.Name,
+        customer.Email
+    });
+});
 
 ```
 
-```csharp title="AzureServiceBusPublisher.cs"
+### PUT endpoint requires If-Match and enforces it
 
-public sealed class AzureServiceBusPublisher : IServiceBusPublisher
+```csharp
+
+public sealed record UpdateCustomerRequest(string Name, string Email);
+
+app.MapPut("/customers/{id:guid}", async (
+    Guid id,
+    UpdateCustomerRequest body,
+    AppDbContext db,
+    HttpRequest request,
+    HttpResponse response) =>
 {
-    private readonly ServiceBusSender _sender;
+    // 1) Enforce presence of If-Match (your stated requirement)
+    if (!ETag.TryParseIfMatch(request, out var ifMatch))
+        return Results.StatusCode(StatusCodes.Status428PreconditionRequired);
 
-    public AzureServiceBusPublisher(ServiceBusSender sender)
+    // 2) Load current entity (tracked)
+    var customer = await db.Customers.FirstOrDefaultAsync(x => x.Id == id);
+    if (customer is null)
+        return Results.NotFound();
+
+    // 3) Compare If-Match with current ETag
+    var currentEtag = ETag.FromRowVersion(customer.RowVersion);
+    if (!string.Equals(ifMatch, currentEtag, StringComparison.Ordinal))
     {
-        _sender = sender;
+        // Optional: include current ETag to help the client recover
+        response.Headers.ETag = currentEtag;
+
+        return Results.StatusCode(StatusCodes.Status412PreconditionFailed);
     }
 
-    public async Task PublishAsync(
-        string messageType,
-        string payloadJson,
-        Guid? correlationId,
-        string? tenantId,
-        DateTime occurredAtUtc,
-        CancellationToken cancellationToken)
-    {
-        var message = new ServiceBusMessage(payloadJson)
-        {
-            ContentType = "application/json",
-            Subject = messageType,
-            CorrelationId = correlationId?.ToString(),
-            TimeToLive = TimeSpan.FromDays(7)
-        };
+    // 4) Apply update
+    customer.Name = body.Name;
+    customer.Email = body.Email;
 
-        if (!string.IsNullOrWhiteSpace(tenantId))
-            message.ApplicationProperties["tenantId"] = tenantId;
+    // 5) Save - rowversion changes automatically
+    await db.SaveChangesAsync();
 
-        message.ApplicationProperties["occurredAtUtc"] = occurredAtUtc.ToString("O");
-        message.ApplicationProperties["messageType"] = messageType;
+    // 6) Return new ETag
+    response.Headers.ETag = ETag.FromRowVersion(customer.RowVersion);
 
-        await _send.SendMessageAsync(message, cancellationToken);
-    }
-}
+    return Results.NoContent();
+});
 
 ```
 
+#### What this maps to conceptually
+
+    - ```GET``` gives the client a **version token**
+    - ```PUT``` requires the client to **prove freshness** via ```If-Match```
+    - The server rejects stale writes deterministically
+    - No locks, no long-lived sessions, just correct conditional semantics
+
+### Pratical notes you shouldn't ignore
+
+    - If you **PATCH**, you must enforce the same rule, PATCH is not a "safe concurrency" endpoint by default.
+    - Don't generate ETag from the serialized JSON output unless you control canonicalization and understand the cost.
+    - If you have multiple representations (fields hidden by auth/scopes), your ETag must reflect what matters for updates, not what happened to be returned.
+
 ---
 
-## 6. High-Level Overview
+## 6. Design trade-offs
+
+
+| Approach                         | Prevents lost updates  | Client complexity | Server complexity | Operational cost | Failure modes             |
+|:---------------------------------|-----------------------:|------------------:|------------------:|-----------------:|:--------------------------|
+|**ETag + If-Match (optimistic)**  |✅ Strong              | Medium            | Medium            | Low              | Client needs retry/merge  |
+|DB-only optimistic concurrency (EF ```rowversion```) without HTTP recondition | ✅ (server-side) | Low              | Low                | Low             | API returns generic 409/500, clients can't reason well       |
+|Pessimistic locking               |✅                     | Low               | High              | High             | Deadlocks, lock contention, timeouts |
+|Last-write-wins                   |❌                     | Low               | Low               | Low              | Silent data loss           |
+|Field-level merges on server      |✅                     | Low               | High              | High             | Complexity explosion, hidden merge rules |
+
+What you gain with ETag/If-Match:
+
+    - Correctness under concurrency without locks
+    - Protocol-level semantics that work across languages and clients
+    - A clean contract: stale writes are rejected
+
+When you give up:
+
+    - Clients must handle ```412``` (re-fetch/retry/merge)
+    - You must define versioning boundaries carefully (what changes ETag)
+    - You must migrate existing clients if they currently write without preconditions
+
+Hidden aceptance you're making:
+
+    - Conflicts are normal in distributed systems; you're choosing to **surface** them instead of hiding them.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Mistake 1 — Accepting updates without ```If-Match```
+
+    - **Why it happens**: "Some old clients don't send it."
+    - **What it causes**: You reintroduce silent overwrites exactly where you need correctness.
+
+How to avoid:
+
+    - Return **428** for missing header
+    - Use a feature flag / allowlist temporarily if you must migrate
+    - Add telemetry to detect clients violating the contract
+
+### Mistake 2 — Returning ETag but not enforcing it
+
+    - **Why it happens**: Teams treat ETag like caching metadata.
+    - **What it causes**: False sense of safety. Clients think they're protected; they're not.
+
+How to avoid:
+
+    - Enforcement must be mandatory on writes, not optional.
+
+### Mistake 3 — Using weak Etags incorrectly
+
+    - Weak ETags (```W/"..."```) indicate semantic equivalence for caching, not byte-identical representation.
+    - For concurrency, you typically want **strong** ETags (exact version).
+    - If you can't guarantee strong representation semantics, base ETag on a server side version field, not reponse bytes.
+    
+### Mistake 4 — Not defining what updates invalidate the ETag
+
+    If internal processes update "hidden fields", does it invalidate client writes?
+    You need a clear rule:
+
+        - If those changes can affect write correctness, ETag must change.
+        - If they're orthogonal, you might version only the "client-writable state".
+
+    Ambiguity here creates either:
+
+        - needless conflicts (too strict), or
+        - lost updates (too permissive)
+
+### Mistake 5 — Not returning enough information on 412
+
+    If you return only ```412``` with no hints, clients guess.
+    Better:
+        - Include current ETag in response header
+        - Optionally return a problem details body (RFC 7807 style) with a clear error code
+---
+
+## 8. Operational and production considerations
+
+### Observability signal you should add
+
+At minimum:
+
+    - Counter: ```http_precondition_required_total``` (428)
+    - Counter: ```http_precondition_failed_total``` (412)
+    - Rate: 412/total write attempts per endpoint
+    - Breakdown by client app/version/tenant (if multi-tenant)
+
+Why this matters:
+
+    - A spike in 428 means client regression or a new integration violating contract
+    - A spike in 412 means real concurrency contention or broken client retry logic
+    - It's a leading indicator of user pain ("my saves fail")
+
+### What degrades first
+
+    - UX: clients that don't re-fetch properly will crate "save loops"
+    - Throughput: if clients naively retry without backoff, you get retry storms
+    - Support: "random errors" unless error bodies are explicit and traceable
+
+### Backward compatibility strategy
+
+If you alread have clients in the wild:
+
+    1. Start returning ETags on reads
+    2. Add server-side logging when writes arrive without ```If-Match```
+    3. Introduce 428 enforcement behind a feature flag per client
+    4. Enforce globally once the blast radius is controlled
+
+### Client misuse you must assume
+
+    - Clients will send stale tokens
+    - Clients will cache GET responses longer than you expect
+    - Clients will retry blindly
+    - Clients will not implement merge unless forced
+
+So you API must:
+
+    - Fail deterministically (```428``` or ```412```)
+    - Provide actionable errors
+    - Avoid ambiguous "409 conflict" with no guidance
+
+### Security / proxy considerations
+
+    - Ensure ETags don't leak senstive data (don't use raw hashes of sensitive payload)
+    - Be careful with gateways/CDNs that may cache responses; set appropriate cache headers
+    - Do not rely on client-provided tokens for anything other than equality check
+
+---
+
+
+## 9. When NOT to use this
+
+Don't use ETag/If-Match enforcement when:
+
+    - The resource is **single-writer by construction** (e.g. one service owns updates and no external writes exists)
+    - Updates are expressed as **append-only commands** and you never replace state via API
+    - The entity is "write-only" and overwirtes are acceptable and explicitly designed (rare)
+    - The coast of client coordination is higher than the cost of occasional overwrites (also rare and you must say it out loud)
+
+Don’t force this blindly across all endpoints:
+
+    - Some endpoints represent idempotent operations or commands rather than state replacement.
+    - If the endpoint is not “update resource state”, version preconditions may be the wrong abstraction.
+
+---
+
+## 10. Key takeaways
+
+    - Lost updates are a **protocol-level correctness bug**, not a "UI issue".
+    - ```ETag``` is the server's version token; ```If-Match``` turns writes into **conditional updates**.
+    - If you require concurrency safety, reject missing ```If-Match``` with **428** and stale writes with **412**.
+    - Base Etags on **server-controlled version** (rowversion/version column), not on serialized JSON bytes.
+    - Decide explicitly what changes invalidate the ETag — otherwise you'll create either false conflicts or silent overwrites.
+    - Treat ```412``` rates as a production signal: tool high means either real contention or broken client behavior.
+    - Plan migration: returning ETags is easy; enforcing ```If-Match``` safely requires telemetry and rollout discipline.
+
+---
+
+## 11. High-Level Overview
 
 > Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
 
+import Light from './_assets/etag-optimistic-concurrency-light.svg';
+import Dark from './_assets/etag-optimistic-concurrency-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="ETag optimistic concurrency"
+  height={2760}
+/>
