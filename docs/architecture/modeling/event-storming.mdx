@@ -1,0 +1,436 @@
+---
+id: event-storming
+title: Event Storming Modeling
+slug: /architecture/modeling/event-storming
+description: Architecture-grade guide to Event Storming, covering domain discovery, boundaries, invariants, and trade-offs in complex business systems.
+sidebar_label: Event Storming Modeling
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document explains **Event sotrming as a domain discovery and architecture alignment technique** for complex business systems.
+
+It covers:
+
+    - **Where Event Storming fits** in system design and evolution (greenfield + brownfield)
+    - The **core modeling vocabulary** (events, commands, policies, aggregates, read models, external systems)
+    - A **step-by-step workflow** that produces actionable outputs (boundaries, ownership, intergration decisions)
+    - **Trade-offs**, failure modes, and how to run it under real enterprise contraints
+
+It does **not** cover:
+
+    - Tool-specific instructions (Miro/Mural templates, sticky-note logistics beyond semantics)
+    - A full DDD tutorial, event sourcing guide or facilitation "tips & tricks"
+    - A claim that Event Storming in mandatory or universally bettern than alternatives
+
+---
+
+## 2. Why this matters in real systems
+
+Event Storming appears when organizations hit the point where **requirements are no longer the bottleneck — shared understanding** is.
+
+Common enterprise triggers:
+
+    - **Domain ambiguity**: different teams describe "the same" process with conflicting language
+    - **Hidden complexity in legacy**: business rules exist only in code, spreadsheets or people's heads
+    - **Cross-team coordination cost**: changes require alignment across multiple services/teams
+    - **Process-driven outcomes**: business cares about lifecycle and decisions, while delivery defaults to CRUD screens
+    - **Operation pain**: incidents reveal missing invariants ("how could that state even happen?")
+    - **Integration churn**: synchronous dependencies multiply and become brittle
+
+What tends to break when this is ignored:
+
+    - Architecture is derived from databases and endpoints rather than business causality
+    - Teams build "microservices" that are actually **distributed monolith fragments**
+    - Invariants are spread across multiple components, becoming impossible to enforce consistently
+    - Ownership is political and unclear, so changes become slow and risky
+
+Why simpler approaches stop working:
+
+    - User stories fragment behavior; they don't reveal end-to-end causality
+    - Data models describe storage, not decisions
+    - Diagrams assume a shared mental model that doesn't exit yet
+
+Event Storming is how you **surface the real process** early enough to design correctly.
+
+---
+
+## 3. Core concept (mental model)
+
+Event Storming models the business as a **causal timeline of irreversible facts**.
+
+### The mental model
+
+    1. **Something happens** in the business (a fact becomes true).
+    2. That fact is captured as a **Domain Event** (past tense).
+    3. The event exists because **someone or something intended** to change state (a Command).
+    4. The command succeeds only if **invariants** are satisfied (Aggregate boundaries).
+    5. Events trigger reactions (Policies) and cross-team interactions (Bounded Contexts).
+
+If you can reason about:
+
+    - what happens,
+    - what causes it,
+    - what must be true for it to happen,
+    - and who owns each part,
+
+...you can design architecture that is aligned, scalable and evolvable.
+
+### The core discipline
+
+Event Storming forces the conversation to start with **facts (events)**, not:
+
+    - features,
+    - endpoints,
+    - tables,
+    - "we should" statements,
+    - or solution-first designs.
+
+That ordering is the leverage.
+
+---
+
+## 4. How it works (step-by-step)
+
+This is the **execution order** that reliably produces useful outcomes.
+
+### Step 0 — Set the scope and success criteria
+
+#### What happens
+
+    - Choose a single business capability or workflow (e.g., "Order to Cash", "Loan Orgination").
+    - Define a success outcome. _"We can agree on key events, ownership boundaries, and integration style."_db
+
+#### Why it exists
+
+    - Without scope, the timeline becomes a dumping ground.
+    - Without success criteria, you leave with a mural and no decisions.
+
+#### Assumptions
+
+    - You can timebox discovery (you will not "model the entire company").
+
+#### Invariant
+
+    - Scope is business-defined, not system-defined.
+
+---
+
+### Step 1 — Build the event timeline (Domain Events)
+
+#### What happens
+
+    - Capture events in **past tense**, in business language.
+    - Place them on a left-to-right timeline
+
+#### Why it exists
+
+    - Events represent shared truth. They are the least controversial anchor.
+
+#### Assumptions
+
+    - Participants can agree on what "actually happens" more easily than how to implement it.
+
+#### Invariant
+
+    - Events are facts, not intent. No "if", "should", "maybe".
+
+#### Sticky note semantics (colors)
+
+You must enforce explicit semantics. A typical , widely used mapping:
+
+    - **Orange**: Domain Event (fact, past tense)
+    - **Blue**: Command (intent, imperative)
+    - **Yellow**: Policy / automation ("when X, then do Y")
+    - **Green**: Aggregate / consistency boundary (where invariants are enforced)
+    - **Purple**: External system / third-party / legacy dependency
+    - **White**: Actor / role / persona (initiator)
+    - _(Optional but common)_ **Pink/Red**: Hotspot / risk / question / ambiguity
+    - _(Optional)_ **Light blue**: Read model / view / projection
+
+The exact palette can vary; what cannot vary is **semantic separation**.
+
+---
+
+### Step 2 — Add commands (intent and decision points)
+
+#### What happens
+
+    - For each, ask: **"What causes this?**
+    - Place commands that plausibly lead to that event.
+
+#### Why it exists
+
+    - Commands reveal where decisions and validation live.
+    - They also reveal whether the system is reactive or user-driven at each point.
+
+#### Assumptions
+
+    - Not every command results in an event (commands can fail).
+
+#### Invariant
+
+    - A command expresses intent; an event expresses outcome.
+
+---
+
+### Step 3 — Add policies (automation and coordination)
+
+#### What happens
+
+    - Identify automatic reactions: **"When Event X happens, we automatically issue Command Y."
+    - Policies connect multiple steps and often cross boundaries.
+
+#### Why it exists
+
+    - Policies surface asynchronous flows and eventual consistency.
+    - They expose orchestration vs choreography decisions early.
+
+#### Assumptions
+
+    - Many enterprise processes are policy-driven (timers, approvals, fraud checks, compliance gates).
+
+#### Invariant
+
+    - If a reaction is not explicit as a policy, it will be implemented inconsistently.
+
+---
+
+### Step 4 — Identify invariants and aggregates (consistency boundaries)
+
+#### What happens
+
+    - For each command, ask: **"What must be true for this to be allowed?"**
+    - Group rules under the entity that can enforce them atomically: the **Aggregate**.
+
+#### Why it exists
+
+    - Aggregates are not "DDD ceremony"; they are the only way to reason about correctness under concurrency.
+
+#### Assumptions
+
+    - Strong invariants require a transactional boundary somewhere.
+
+#### Invariant
+
+    - Aggregates exist to protect rules, not to mirror tables.
+
+Practial heuristic:
+
+    - If two updates must be atomic to avoid invalid state, they likely belong to the same aggregate boundary.
+    - If atomicity is not required, don't force it - model it as eventual consistency with explicit policies.
+
+---
+
+### Step 5 — Mark external systems and delays (real-world constraints)
+
+#### What happens
+
+    - Identify dependencies that introduce latency, partial failure, or non-determinism (payments, credit bureaus, email, legacy mainframes).
+
+#### Why it exists
+
+    - These shape the architecture more than diagrams do.
+    - You cannot design correctness without recognizing unreliable boundaries.
+
+#### Assumptions
+
+    - External systems fail, retry, and change behavior.
+
+#### Invariant
+
+    - Anything external must be treated as non-transactional with your core model.
+
+---
+
+### Step 6 — Draw bounded contexts (ownership and language boundaries)
+
+#### What happens
+
+    - Split the timeline where language changes or ownership conflicts appear.
+    - Define context responsibilities and the meaning of shared terms.
+
+#### Why it exists
+
+    - Bounded contexts prevent semantic drift and “shared model” delusions.
+
+#### Assumptions
+
+    - Different teams have different priorities and definitions.
+
+#### Invariant
+
+    - If you cannot define terms consistently across areas, you do not have one context.
+
+---
+
+### Step 7 — Decide integration style (contract + coupling) 
+
+#### What happens
+
+    - For interactions between context, decide:
+        - synchronous request/response
+        - asynchronous events
+        - commands across boundaries (often a smell)
+        - ACL (anti-corruption layer)
+        - published language
+
+#### Why it exists
+
+    - Context boundaries without integration decisions are architecture theater.
+
+#### Assumptions
+
+    - Integration cost dominates long-term change cost.
+
+#### Invariant
+
+    - Prefer events as the boundary contract; prefer synchronous call only when you can prove you need them.
+
+---
+
+## 5. Minimal but realistic example
+
+### Scenario: Order to Shipment (with rejection and cancellation)
+
+**Actors (white)** ⬜️
+
+    - Customer
+    - Warehouse system (external initiator in some flows)
+
+**Domain Events (orange)** 🟧  
+
+    - Order Placed
+    - Payment Authorized
+    - Payment Rejected
+    - Order Cancelled
+    - Order Shipped
+
+**Command (blue)** 🟦
+
+    - Place Order
+    - Authorize Payment
+    - Cancel Order
+    - Ship Order
+
+**Policies (yellow)** 🟨
+
+    - When **Order Placed → Authorize Payment**
+    - When **Payment Authorized → Ship Order**
+    - When **Payment Rejected → Cancel Order** _(may require customer notification / retry policy)_
+
+**External Systems (purple)** 🟪
+
+    - Payment Gateway
+
+**Aggregates (green)** 🟩
+
+    - **Order** aggregate enforces:
+        - Cannot ship if order is cancelled
+        - Cannot cancel after Shipped
+        - State transitions are valid (Placed → Paid → Shipped; Placed → Cancelled; Placed → PaymentRejected → Cancelled)
+    - **Payment** may be a separate aggregate/context if payment rules and lifecycle are owned by Billing
+
+**Bounded Contexts**
+
+    - **Sales**: customer intent, oder placement/cancellation rules
+    - **Billing**: payment authorization lifecycle and retries
+    - **Logistics**: shipment creation, warehouse coordination
+
+### Mapping bak to the concept
+
+    - Events define the factual timeline.
+    - Commands define decision points and validation surfaces.
+    - Policies define asynchronous coordination and eventual consistency.
+    - Aggregates define correctness under concurrency.
+    - Context boundaries define ownership and integration contracts.
+
+This is implementable in event-driven or CRUD-based systems; the reasoning stays valid.
+
+---
+
+## 6. Design trade-offs
+
+|Decision area               |Option A                      |Option B                         |What you gain                           |What you give up                                 |
+|----------------------------|------------------------------|---------------------------------|----------------------------------------|-------------------------------------------------|
+|Cross-context coupling      |Synchronous calls             |Asynchronous events              |Faster immediate response vs resilience |Tight coupling vs eventual consistency complexity|
+|Correctness                 |Larger aggregates             |Smaller aggregates + policies    |Strong invariants vs scalability        |Contetion vs more async states                   |
+|Modeling approach           |"One model"                   |Bounded contexts                 |Simplicity vs semantic correctness      |Hidden conflicts vs explicit boundaries          |
+|Integration contracts       |Shared schemas                |Published language + ACL         |Speed vs long-term safety               |Short-term velocity vs fewer breaking changes    |
+|Process handling            |Central orchestration         |Choreography via events          |Explicit control vs autonomy            |Single point vs harder tracing                   |
+
+Non-negotiable reality:
+
+    - Event Storming surfaces trade-offs you already have.
+    - If you avoid them in modeling, you'll pay them in production
+
+---
+
+## 7. Common mistakes and misconceptions
+
+    1. **Treating colors as decoration**
+        - Why it happens: teams want speed; semantics feel "extra"
+        - Problem caused: commands, policies and events blur; reasoning collapses
+        - Avoidance: enforce semantic separation; reject mixed meaning notes
+    2. **Writing events as technical notifications**
+        - Why: developers default to implementation language
+        - Problem: events lose business meaning; integration becomes brittle
+        - Avoidance: past tense + business language + observable meaning
+    3. **Forcing aggregates from the start**
+        - Why: data modeling habits
+        - Problem: premature boundaries; false consistency constraints
+        - Avoidance: past tense + business language + observable meaning
+    4. **Skipping policies**        
+        - Why: teams think "we'll handle that later"
+        - Problem: async behavior becomes invisible and inconsistent
+        - Avoidance: make automation explicit; model retries/timeouts as policies
+    5. **Defining bounded contexts as org chart boxes**
+        - Why: politics and ownership confusion
+        - Problem: boundaries don't match language; integration pain explodes
+        - Avoidance: boundary follows language and invariants; org aligns later
+
+---
+
+## 8. When NOT to use this
+
+Event Storming is unnecessary or harmful when:
+
+    - The domain is genuinely simple, stable and owned by one small team
+    - You need a quick CRUD admin tool with minimal business rules
+    - The organization cannot allocate the right participants (you'll model fiction)
+    - The scope is too broad and cannot be timeboxed (you'll create noise)
+    - The goal is already clear and the bottleneck is purely execution capacity
+
+If you cannot commit to producing decisions (boundaries, contracts, invariants), Event Storming becomes a mural and not a method.
+
+---
+
+## 9. Key takeaways
+
+    - Start with **facts (events)** to anchor shared truth before discussing solutions.
+    - Use **explicit semantics** (colors/type) to prevent ambiguous modeling.
+    - Commands reveal **decision surfaces**; events represent **outcomes**.
+    - Policies make **automation, async flow and eventual consistency** explicit.
+    - Aggregates exist to protect **invariants under concurrency**, not to mirror data.
+    - Bounded contexts emerge from **language and ownership**, not from diagrams.
+    - The workshop is only valuable if it produces **architectural decisions and contracts**.
+
+---
+
+## 10. High-Level Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
+import Light from './_assets/event-storming-light.svg';
+import Dark from './_assets/event-storming-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Event Storming modeling"
+  height={460}
+/>
