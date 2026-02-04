@@ -6,7 +6,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Hugo Moura',
-  tagline: 'Principal-level software architecture, hands-on',
+  tagline: 'Principal Software Engineer focused on .NET, Azure Cloud, distributed systems and system design.',
   favicon: 'img/favicon.ico',
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
@@ -25,6 +25,7 @@ const config: Config = {
   // If you aren't using GitHub pages, you don't need these.
   organizationName: 'hugodevelopr', // Usually your GitHub org/user name.
   projectName: 'hugodeveloper', // Usually your repo name.
+  
 
   onBrokenLinks: 'throw',
 
