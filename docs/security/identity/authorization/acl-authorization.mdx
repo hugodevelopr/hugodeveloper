@@ -1,0 +1,1399 @@
+---
+id: acl-authorization
+title: ACL Authorization
+slug: /security/identity/authorization/acl-authorization
+description: A production-grade guide to designing granular ACL authorization with strong consistency, auditability, and operational guarantees.
+sidebar_label: ACL Authorization
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document describes how to **design, implement and operate an enterprise-grade ACL authorization system** where 
+access decisions must be made at the **individual resource instance level**, not just at the role or coarse permission level.
+
+It applies to system where:
+
+    - RBAC and simple policy-based authorization are insufficient
+    - Access must be enforced per _object_, _record_ or _domain entity_
+    - Authorization decisions must be **deterministic, auditable and explainable**
+    - The system spans multiple services and teams over time.
+
+It does **not** apply to:
+
+    - Small systems with low authorization cardinality
+    - Applications where role-based access is stable and sufficient
+    - Environments where coarse feature-level access is acceptable
+
+---
+
+## 2. Why this matters in real systems
+
+ACL systems emerge when real systems collide with reality:
+
+    - Multiple users collaborate over the same resource instances
+    - Access must be delegated temporarily or conditionally
+    - Ownership and responsibility change over time
+    - Data spans tenants, domains, and hierarchical boundaries
+    - Compliance requires provable, reviewable least privilege
+
+These conditions are common in mature systems and cannot be addressed reliably with coarse authorization models.
+
+### Pressure points that force ACLs into existence
+
+#### RBAC explosion
+Roles multiply to encode context, scope and exceptions whey were never designed to represent.
+
+#### Over-permissioning by default
+Broad access is granted to unblock delivery and quietly becomes permanent.
+
+#### Authorization drift
+No one can explain why access exists, who granted it or whether it is still valid.
+
+#### Latency regressions on hot paths
+Authorization logic grows organically and leaks into request paths without design discipline.
+
+#### Operational paralysis
+Permission changes require redeployments, token refreshes or cross-team coordination.
+
+### Failure modes when ACLs are ignored or poorly designed
+
+When these pressures are not addressed explicitly, system fail in predictable ways:
+
+    - Security and compliance reviews block releases late in the cycle
+    - Revocations are unsafe, delayed or avoided entirely
+    - Caching introduces subtle correctness and consistency bugs
+    - Each service reimplements authorization logic differently
+
+At this stage, authorization becomes both a delivery risk and a security liability.
+
+ACLs are not an optimization or an architectural preference.
+They are a **structural response to scale, collaboration and organizational complexity**.
+    
+---
+
+## 3. Core concept (mental model)
+
+An ACL system is a **deterministic authorization decision engine** that answers a single, explicit question:
+
+**Is principal _P_ allowed to perform action _A_ on resource _R_ within context _C_ at time _T_?**
+
+Every authorization decision is evaluated against **materialized authorization facts**, not inferred rules or implicit behavior.
+
+### Mental model: authorization as fact resolution
+
+At runtime, the system resolves a set of concrete facts and determines whether **at least one valid grant exists** that satisfies all invariants.
+
+The decision space is defined by four first-class dimensions:
+
+#### Principal
+    
+A concrete security identity: user, group or service principal.
+Principals may be expanded (e.g., user → groups), but expansion is explicit and bounded.
+
+#### Resource
+    
+A specific resource instance, not a category or type.
+Authorization always targets an object with identity and ownership.
+
+#### Action
+    
+A verb from a controlled, versioned permission vocabulary
+(```read```, ```update```, ```delete```, ```approve```, etc.).
+
+#### Context
+    
+Constraints that qualify the grant:
+    - tenant boundary
+    - temporal validity
+    - delegation semantics
+    - optional scope dimensions
+
+An authorization decision is therefore the result of **fact matching**, not rule execution.
+
+### Examples of resolved authorization facts
+
+    - _User 123_ is granted **read** on _Document 4721_ within _Tenant A_
+    - _Group X_ is granted **approve** on _Invoice 9_ until _2026-03-01_
+    - _Service A_ is granted **list** on _Orders_ scoped to _Tenant T_
+
+In no fact matches the full decision tuple _(P, A, R, C, T))_, access is denied.
+
+### Explicitness as a design invariant
+
+The ACL model enforces strict explicitness:
+    
+    - No access exists unless it is granted
+    - No inheritance exits unless it is modeled
+    - No permission exists outside its defined scope and validity window
+
+I every authorization outome can be explained as a resolved, auditable fact, the ACL model is behaving correcly.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Identity and coarse context (Keycloak)
+
+[Keycloak](https://www.keycloak.org/) is responsible for establishing who the caller is and providing stable, low-cardinality context.
+
+It provides:
+
+    - Authentication (OIDC/Auth2)
+    - Stable subject identity (```sub```)
+    - Coarse grouping (```groups```, realm roles)
+    - Tenant or organizational context via claims
+
+#### Key invariant
+
+Keycloak asserts _who the caller is_, **not** _what they can access_.
+
+ACLs **must not** live in JWTs. Tokens must remain stable and small.
+
+---
+
+### Step 2 — Intent declaration in .NET services
+
+Each API endpoint declares **authorization intent**, not access logic.
+
+Examples:
+
+    - "Caller wants to ```read``` a ```Document```"
+    - "Caller wants to ```update``` an ```Account```"
+
+This is expressed via attributes, matadata or middleware markers.
+
+Endpoints never encode:
+
+    - permission joins
+    - role logic
+    - grant resolution rules
+
+This separation ensures intent remains readable, reviewable and consistent across services.
+
+---
+
+### Step 3 — Resource context resolution
+
+Before any authorization decision is made, the service resolves the **complete resource context**.
+
+This includes:
+
+    - The concrete resource identifier(s)
+    - The resource type
+    - The tenant boundary
+    - Optional hierarchical relationships or scope dimensions
+
+Resource context resolution is a **security boundary** and must happen inside the service.
+
+The authorization engine does not infer or reconstruct context.
+It receives an explcit, validated resource description.
+
+---
+
+### Step 4 — ACL evaluation against the authorization store
+
+SQL Server acts as the **authoritative source of authorization facts**.
+
+The ACL evaluator executes **query-shaped authorization**, optimized for real access patterns:
+
+    - Single-resource checks for command endpoints
+    - Set-based batch checks for list and search endpoints
+    - Hierarchical traversal only when explicitly modeled
+
+The evaluation yields a structured decision:
+
+    - Allow or deny
+    - Reason code(s)
+    - Grant source (direct, group, delegation)
+
+No implicit access exists outside what is materialized in the store.
+
+---
+
+### Step 5 — Decision enforcement, caching and observability
+
+The authorization decision is:
+
+    - Enforced synchronously in the request path
+    - Logged with structured metadata
+    - Attached to the request trace for correlation
+    - Optionally cached with explicitly defined staleness semantics
+
+At this stage, authorization is:
+
+    - deterministic
+    - explainable
+    - auditable
+    - observable under load
+
+Authorization stops being an opaque check and becomes a controlled, inspectable subsystem.
+
+---
+
+## 5. Minimal but realistic example
+
+### Permission vocabulary
+
+```
+resource_type: document
+action: read | update | delete | share
+scope: optional (tenant, department, classification)
+```
+---
+
+### Core grant table
+
+```sql
+CREATE TABLE acl_grant (
+    grant_id           BIGINT IDENTITY PRIMARY KEY,
+    tenant_id          UNIQUEIDENTIFIER NOT NULL,
+    principal_type     TINYINT NOT NULL, -- user, group, service
+    principal_id       UNIQUEIDENTIFIER NOT NULL,
+    resource_type      VARCHAR(64) NOT NULL,
+    resource_id        UNIQUEIDENTIFIER NOT NULL,
+    action             VARCHAR(32) NOT NULL,
+    valid_from         DATETIME2 NOT NULL,
+    valid_to           DATETIME2 NULL,
+    created_at         DATETIME2 NOT NULL,
+    created_by         UNIQUEIDENTIFIER NOT NULL
+);
+```
+---
+
+### Hot-path index
+
+```sql
+CREATE NONCLUSTERED INDEX ix_acl_check
+ON acl_grant (
+    tenant_id,
+    principal_id,
+    resource_type,
+    resource_id,
+    action
+)
+INCLUDE (valid_from, valid_to);
+```
+
+---
+
+### Auhtorization query (single check)
+
+```sql
+SELECT TOP 1 1
+FROM acl_grant
+WHERE tenant_id = @tenantId
+  AND principal_id IN (@principalIds)
+  AND resource_type = @resourceType
+  AND resource_id = @resourceId
+  AND action = @action
+  AND valid_from <= SYSUTCDATETIME()
+  AND (valid_to IS NULL OR valid_to >= SYSUTCDATETIME());
+```
+---
+
+### ASP.NET Core handler (simplified)
+
+```csharp
+public class AclRequirement : IAuthorizationRequirement
+{
+    public string Action { get; }
+    public string ResourceType { get; }
+
+    public AclRequirement(string action, string resourceType)
+    {
+        Action = action;
+        ResourceType = resourceType;
+    }
+}
+
+---
+
+public class AclHandler : AuthorizationHandler<AclRequirement, ResourceContext>
+{
+    protected override async Task HandleRequirementAsync(
+        AuthorizationHandlerContext context,
+        AclRequirement requirement,
+        ResourceContext resource)
+    {
+        if (await _aclEvaluator.IsAllowed(
+                context.User,
+                resource,
+                requirement))
+        {
+            context.Succeed(requirement);
+        }
+    }
+}
+```
+
+---
+
+### ResourceType, Action and Permission
+
+```csharp
+public readonly record struct ResourceType(string Value)
+{
+    public override string ToString() => Value;
+    public static implicit operator string(ResourceType t) => t.Value;
+
+    // exemplos (mantenha catalogado por domínio)
+    public static readonly ResourceType Document = new("document");
+    public static readonly ResourceType Account  = new("account");
+}
+
+public readonly record struct AclAction(string Value)
+{
+    public override string ToString() => Value;
+    public static implicit operator string(AclAction a) => a.Value;
+
+    public static readonly AclAction Read   = new("read");
+    public static readonly AclAction Update = new("update");
+    public static readonly AclAction Delete = new("delete");
+    public static readonly AclAction Share  = new("share");
+}
+
+public sealed record Permission(ResourceType ResourceType, AclAction Action)
+{
+    public string PolicyName => $"acl:{ResourceType}:{Action}";
+}
+```
+
+---
+
+### Resource Context + multi-resource (batch-friendly)
+
+```csharp
+public sealed record ResourceKey(ResourceType Type, Guid Id);
+
+public sealed record ResourceContext(
+    Guid TenantId,
+    ResourceKey Resource,
+    IReadOnlyDictionary<string, string>? Dimensions = null, // opcional: dept/classification/etc
+    ResourceKey? Parent = null // opcional: hierarquia
+);
+
+public sealed record MultiResourceContext(
+    Guid TenantId,
+    ResourceType ResourceType,
+    IReadOnlyList<Guid> ResourceIds,
+    IReadOnlyDictionary<string, string>? Dimensions = null
+);
+```
+
+---
+
+### Reason codes + decision payload
+
+```csharp
+public enum AclDecision
+{
+    Allowed = 1,
+    Denied = 2
+}
+
+public enum AclReasonCode
+{
+    GrantedDirect = 10,
+    GrantedViaGroup = 11,
+    GrantedViaDelegation = 12,
+
+    DeniedNoGrant = 20,
+    DeniedExpired = 21,
+    DeniedWrongTenant = 22,
+    DeniedInvalidPrincipal = 23
+}
+
+public sealed record AclDecisionDetails(
+    AclDecision Decision,
+    AclReasonCode Reason,
+    long? GrantId = null,
+    Guid? MatchedPrincipalId = null,
+    string? MatchedPrincipalType = null,
+    DateTimeOffset EvaluatedAtUtc = default
+);
+```
+
+---
+
+### Principal expansion: user + group + service principal
+
+#### Claims parsing (Keycloak)
+
+```csharp
+public sealed record PrincipalContext(
+    Guid SubjectId,                       // user/service principal id
+    Guid TenantId,
+    IReadOnlyList<Guid> GroupIds,         // internal group ids (mapped)
+    IReadOnlyList<Guid> AllPrincipalIds   // subject + groups (+ others)
+);
+
+public interface IPrincipalContextResolver
+{
+    PrincipalContext Resolve(ClaimsPrincipal user);
+}
+
+public sealed class KeycloakPrincipalContextResolver : IPrincipalContextResolver
+{
+    private readonly IGroupMappingStore _groupMapping; // Keycloak group string -> internal Guid mapping
+    private readonly ITenantResolver _tenantResolver;
+
+    public KeycloakPrincipalContextResolver(IGroupMappingStore groupMapping, ITenantResolver tenantResolver)
+    {
+        _groupMapping = groupMapping;
+        _tenantResolver = tenantResolver;
+    }
+
+    public PrincipalContext Resolve(ClaimsPrincipal user)
+    {
+        // 1) subject id (sub)
+        var sub = user.FindFirstValue("sub");
+        if (!Guid.TryParse(sub, out var subjectId))
+            throw new SecurityException("Invalid 'sub' claim (expected GUID).");
+
+        // 2) tenant
+        var tenantId = _tenantResolver.ResolveTenantId(user);
+
+        // 3) groups (Keycloak often puts groups in "groups" claim as string array)
+        var groupPaths = user.FindAll("groups").Select(c => c.Value).ToArray();
+        var groupIds = _groupMapping.MapToInternalGroupIds(groupPaths);
+
+        // 4) principal set
+        var all = new List<Guid>(1 + groupIds.Count) { subjectId };
+        all.AddRange(groupIds);
+
+        return new PrincipalContext(subjectId, tenantId, groupIds, all);
+    }
+}
+```
+
+```csharp
+public interface ITenantResolver
+{
+    Guid ResolveTenantId(ClaimsPrincipal user);
+}
+
+public interface IGroupMappingStore
+{
+    IReadOnlyList<Guid> MapToInternalGroupIds(IReadOnlyList<string> keycloakGroupPaths);
+}
+```
+> **Warning**: TenantId cannot come from a route trusted by the client. You resolve this via cliam or internal lookup.
+
+---
+
+### Dynamic policy provider (zero policy explosion)
+
+```[Authorize(Policy="acl:document:read")]``` without having to register each policy individually.
+
+```csharp
+public sealed class AclPolicyProvider : IAuthorizationPolicyProvider
+{
+    private readonly DefaultAuthorizationPolicyProvider _fallback;
+
+    public AclPolicyProvider(IOptions<AuthorizationOptions> options)
+        => _fallback = new DefaultAuthorizationPolicyProvider(options);
+
+    public Task<AuthorizationPolicy> GetDefaultPolicyAsync()
+        => _fallback.GetDefaultPolicyAsync();
+
+    public Task<AuthorizationPolicy?> GetFallbackPolicyAsync()
+        => _fallback.GetFallbackPolicyAsync();
+
+    public Task<AuthorizationPolicy?> GetPolicyAsync(string policyName)
+    {
+        if (policyName.StartsWith("acl:", StringComparison.OrdinalIgnoreCase))
+        {
+            // acl:{resourceType}:{action}
+            var parts = policyName.Split(':', 3);
+            if (parts.Length == 3)
+            {
+                var rt = new ResourceType(parts[1]);
+                var act = new AclAction(parts[2]);
+
+                var policy = new AuthorizationPolicyBuilder()
+                    .AddRequirements(new AclRequirement(act.Value, rt.Value))
+                    .Build();
+
+                return Task.FromResult<AuthorizationPolicy?>(policy);
+            }
+        }
+
+        return _fallback.GetPolicyAsync(policyName);
+    }
+}
+
+```
+
+---
+
+### Resource resolution: route → ResourceContext
+
+We need a consistent mechanism to extract resourceId from route/query/body and create ResourceContext
+
+```csharp
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+public sealed class AclResourceAttribute : Attribute
+{
+    public string ResourceType { get; }
+    public string RouteParam { get; } // ex: "documentId"
+    public AclResourceAttribute(string resourceType, string routeParam)
+    {
+        ResourceType = resourceType;
+        RouteParam = routeParam;
+    }
+}
+```
+
+```csharp
+public interface IResourceContextResolver
+{
+    ResourceContext Resolve(HttpContext httpContext, AclRequirement requirement);
+}
+
+public sealed class DefaultResourceContextResolver : IResourceContextResolver
+{
+    private readonly ITenantResolver _tenantResolver;
+
+    public DefaultResourceContextResolver(ITenantResolver tenantResolver)
+        => _tenantResolver = tenantResolver;
+
+    public ResourceContext Resolve(HttpContext ctx, AclRequirement req)
+    {
+        var endpoint = ctx.GetEndpoint() ?? throw new SecurityException("No endpoint metadata found.");
+        var meta = endpoint.Metadata.GetMetadata<AclResourceAttribute>()
+                   ?? throw new SecurityException("Missing [AclResource] metadata.");
+
+        var tenantId = _tenantResolver.ResolveTenantId(ctx.User);
+
+        if (!ctx.Request.RouteValues.TryGetValue(meta.RouteParam, out var raw) || raw is null)
+            throw new SecurityException($"Missing route param '{meta.RouteParam}'.");
+
+        if (!Guid.TryParse(raw.ToString(), out var resourceId))
+            throw new SecurityException($"Invalid route param '{meta.RouteParam}' (expected GUID).");
+
+        return new ResourceContext(
+            TenantId: tenantId,
+            Resource: new ResourceKey(new ResourceType(meta.ResourceType), resourceId)
+        );
+    }
+}
+```
+
+---
+
+### ACL Evaluator (single + batch) + query strategy + safety
+
+```csharp
+public interface IAclEvaluator
+{
+    Task<AclDecisionDetails> AuthorizeAsync(
+        ClaimsPrincipal user,
+        ResourceContext resource,
+        AclRequirement requirement,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyDictionary<Guid, AclDecisionDetails>> AuthorizeBatchAsync(
+        ClaimsPrincipal user,
+        MultiResourceContext resources,
+        AclAction action,
+        CancellationToken ct = default);
+}
+```
+
+```csharp
+public sealed class AclEvaluator : IAclEvaluator
+{
+    private readonly IPrincipalContextResolver _principalResolver;
+    private readonly IAclStore _store;
+    private readonly IAclClock _clock;
+
+    public AclEvaluator(IPrincipalContextResolver principalResolver, IAclStore store, IAclClock clock)
+    {
+        _principalResolver = principalResolver;
+        _store = store;
+        _clock = clock;
+    }
+
+    public async Task<AclDecisionDetails> AuthorizeAsync(
+        ClaimsPrincipal user,
+        ResourceContext resource,
+        AclRequirement requirement,
+        CancellationToken ct = default)
+    {
+        var principal = _principalResolver.Resolve(user);
+
+        // HARD tenant boundary - se o resource context vier com tenant diferente do claim, negue.
+        if (principal.TenantId != resource.TenantId)
+        {
+            return new AclDecisionDetails(
+                AclDecision.Denied,
+                AclReasonCode.DeniedWrongTenant,
+                EvaluatedAtUtc: _clock.UtcNow
+            );
+        }
+
+        var now = _clock.UtcNow;
+
+        var result = await _store.CheckAsync(new AclCheckRequest(
+            TenantId: resource.TenantId,
+            PrincipalIds: principal.AllPrincipalIds,
+            ResourceType: resource.Resource.Type.Value,
+            ResourceId: resource.Resource.Id,
+            Action: requirement.Action,
+            NowUtc: now
+        ), ct);
+
+        return result;
+    }
+
+    public async Task<IReadOnlyDictionary<Guid, AclDecisionDetails>> AuthorizeBatchAsync(
+        ClaimsPrincipal user,
+        MultiResourceContext resources,
+        AclAction action,
+        CancellationToken ct = default)
+    {
+        var principal = _principalResolver.Resolve(user);
+
+        if (principal.TenantId != resources.TenantId)
+        {
+            return resources.ResourceIds.ToDictionary(
+                id => id,
+                _ => new AclDecisionDetails(AclDecision.Denied, AclReasonCode.DeniedWrongTenant, EvaluatedAtUtc: _clock.UtcNow)
+            );
+        }
+
+        var now = _clock.UtcNow;
+
+        return await _store.CheckBatchAsync(new AclBatchCheckRequest(
+            TenantId: resources.TenantId,
+            PrincipalIds: principal.AllPrincipalIds,
+            ResourceType: resources.ResourceType.Value,
+            ResourceIds: resources.ResourceIds,
+            Action: action.Value,
+            NowUtc: now
+        ), ct);
+    }
+}
+```
+
+```csharp
+public interface IAclClock { DateTimeOffset UtcNow { get; } }
+public sealed class SystemAclClock : IAclClock { public DateTimeOffset UtcNow => DateTimeOffset.UtcNow; }
+```
+
+---
+
+### Store layer (SQL Server) + batch (TVP)
+
+```csharp
+public sealed record AclCheckRequest(
+    Guid TenantId,
+    IReadOnlyList<Guid> PrincipalIds,
+    string ResourceType,
+    Guid ResourceId,
+    string Action,
+    DateTimeOffset NowUtc
+);
+
+public sealed record AclBatchCheckRequest(
+    Guid TenantId,
+    IReadOnlyList<Guid> PrincipalIds,
+    string ResourceType,
+    IReadOnlyList<Guid> ResourceIds,
+    string Action,
+    DateTimeOffset NowUtc
+);
+
+public interface IAclStore
+{
+    Task<AclDecisionDetails> CheckAsync(AclCheckRequest req, CancellationToken ct);
+    Task<IReadOnlyDictionary<Guid, AclDecisionDetails>> CheckBatchAsync(AclBatchCheckRequest req, CancellationToken ct);
+}
+```
+---
+
+### TVP types (SQL)
+
+```sql
+CREATE TYPE dbo.GuidList AS TABLE (Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY);
+```
+---
+
+### Store Dapper
+
+```csharp
+public sealed class SqlServerAclStore : IAclStore
+{
+    private readonly Func<IDbConnection> _connFactory;
+
+    public SqlServerAclStore(Func<IDbConnection> connFactory) => _connFactory = connFactory;
+
+    public async Task<AclDecisionDetails> CheckAsync(AclCheckRequest req, CancellationToken ct)
+    {
+        using var conn = _connFactory();
+
+        // Principals -> TVP
+        var tvp = new DataTable();
+        tvp.Columns.Add("Id", typeof(Guid));
+        foreach (var p in req.PrincipalIds) tvp.Rows.Add(p);
+
+        var pParam = new DynamicParameters();
+        pParam.Add("@tenant_id", req.TenantId);
+        pParam.Add("@resource_type", req.ResourceType);
+        pParam.Add("@resource_id", req.ResourceId);
+        pParam.Add("@action", req.Action);
+        pParam.Add("@now_utc", req.NowUtc.UtcDateTime);
+
+        pParam.Add("@principal_ids", tvp.AsTableValuedParameter("dbo.GuidList"));
+
+        // Stored procedure ou query inline (prefira SP para plan stability)
+        var row = await conn.QueryFirstOrDefaultAsync<AclCheckRow>(
+            new CommandDefinition(
+                "dbo.acl_check_single",
+                pParam,
+                commandType: CommandType.StoredProcedure,
+                cancellationToken: ct));
+
+        if (row is null)
+            return new AclDecisionDetails(AclDecision.Denied, AclReasonCode.DeniedNoGrant, EvaluatedAtUtc: req.NowUtc);
+
+        return new AclDecisionDetails(
+            AclDecision.Allowed,
+            row.ReasonCode,
+            GrantId: row.GrantId,
+            MatchedPrincipalId: row.MatchedPrincipalId,
+            MatchedPrincipalType: row.MatchedPrincipalType,
+            EvaluatedAtUtc: req.NowUtc
+        );
+    }
+
+    public async Task<IReadOnlyDictionary<Guid, AclDecisionDetails>> CheckBatchAsync(AclBatchCheckRequest req, CancellationToken ct)
+    {
+        using var conn = _connFactory();
+
+        var principalTvp = new DataTable();
+        principalTvp.Columns.Add("Id", typeof(Guid));
+        foreach (var p in req.PrincipalIds) principalTvp.Rows.Add(p);
+
+        var resourceTvp = new DataTable();
+        resourceTvp.Columns.Add("Id", typeof(Guid));
+        foreach (var r in req.ResourceIds) resourceTvp.Rows.Add(r);
+
+        var pParam = new DynamicParameters();
+        pParam.Add("@tenant_id", req.TenantId);
+        pParam.Add("@resource_type", req.ResourceType);
+        pParam.Add("@action", req.Action);
+        pParam.Add("@now_utc", req.NowUtc.UtcDateTime);
+        pParam.Add("@principal_ids", principalTvp.AsTableValuedParameter("dbo.GuidList"));
+        pParam.Add("@resource_ids", resourceTvp.AsTableValuedParameter("dbo.GuidList"));
+
+        var rows = (await conn.QueryAsync<AclBatchRow>(
+            new CommandDefinition(
+                "dbo.acl_check_batch",
+                pParam,
+                commandType: CommandType.StoredProcedure,
+                cancellationToken: ct)))
+            .ToList();
+
+        // default deny
+        var result = req.ResourceIds.ToDictionary(
+            id => id,
+            id => new AclDecisionDetails(AclDecision.Denied, AclReasonCode.DeniedNoGrant, EvaluatedAtUtc: req.NowUtc)
+        );
+
+        foreach (var row in rows)
+        {
+            result[row.ResourceId] = new AclDecisionDetails(
+                AclDecision.Allowed,
+                row.ReasonCode,
+                GrantId: row.GrantId,
+                MatchedPrincipalId: row.MatchedPrincipalId,
+                MatchedPrincipalType: row.MatchedPrincipalType,
+                EvaluatedAtUtc: req.NowUtc
+            );
+        }
+
+        return result;
+    }
+
+    private sealed class AclCheckRow
+    {
+        public long GrantId { get; init; }
+        public AclReasonCode ReasonCode { get; init; }
+        public Guid MatchedPrincipalId { get; init; } // quem “bateu”
+        public string MatchedPrincipalType { get; init; } = default!;
+    }
+
+    private sealed class AclBatchRow : AclCheckRow
+    {
+        public Guid ResourceId { get; init; }
+    }
+}
+
+```
+---
+
+### Store procedures (Single)
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.acl_check_single
+    @tenant_id UNIQUEIDENTIFIER,
+    @principal_ids dbo.GuidList READONLY,
+    @resource_type VARCHAR(64),
+    @resource_id UNIQUEIDENTIFIER,
+    @action VARCHAR(32),
+    @now_utc DATETIME2
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT TOP 1
+        g.grant_id     AS GrantId,
+        CAST(10 AS INT) AS ReasonCode, -- GrantedDirect/Group etc (você decide por join)
+        g.principal_id AS MatchedPrincipalId,
+        CAST('principal' AS VARCHAR(16)) AS MatchedPrincipalType
+    FROM acl_grant g
+    JOIN @principal_ids p ON p.Id = g.principal_id
+    WHERE g.tenant_id = @tenant_id
+      AND g.resource_type = @resource_type
+      AND g.resource_id = @resource_id
+      AND g.action = @action
+      AND g.valid_from <= @now_utc
+      AND (g.valid_to IS NULL OR g.valid_to >= @now_utc)
+    ORDER BY g.grant_id DESC;
+END
+```
+---
+
+### Store procedures (Batch)
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.acl_check_batch
+    @tenant_id UNIQUEIDENTIFIER,
+    @principal_ids dbo.GuidList READONLY,
+    @resource_ids dbo.GuidList READONLY,
+    @resource_type VARCHAR(64),
+    @action VARCHAR(32),
+    @now_utc DATETIME2
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    ;WITH matches AS (
+        SELECT
+            g.resource_id,
+            g.grant_id,
+            g.principal_id
+        FROM acl_grant g
+        JOIN @principal_ids p ON p.Id = g.principal_id
+        JOIN @resource_ids r ON r.Id = g.resource_id
+        WHERE g.tenant_id = @tenant_id
+          AND g.resource_type = @resource_type
+          AND g.action = @action
+          AND g.valid_from <= @now_utc
+          AND (g.valid_to IS NULL OR g.valid_to >= @now_utc)
+    )
+    SELECT
+        m.resource_id AS ResourceId,
+        m.grant_id    AS GrantId,
+        CAST(10 AS INT) AS ReasonCode,
+        m.principal_id AS MatchedPrincipalId,
+        CAST('principal' AS VARCHAR(16)) AS MatchedPrincipalType
+    FROM matches m;
+END
+```
+
+---
+
+### Integrating into the AuthorizationHandler with ResourceContextResolver
+
+```csharp
+public sealed class AclHandler : AuthorizationHandler<AclRequirement>
+{
+    private readonly IHttpContextAccessor _http;
+    private readonly IResourceContextResolver _resourceResolver;
+    private readonly IAclEvaluator _evaluator;
+
+    public AclHandler(
+        IHttpContextAccessor http,
+        IResourceContextResolver resourceResolver,
+        IAclEvaluator evaluator)
+    {
+        _http = http;
+        _resourceResolver = resourceResolver;
+        _evaluator = evaluator;
+    }
+
+    protected override async Task HandleRequirementAsync(
+        AuthorizationHandlerContext context,
+        AclRequirement requirement)
+    {
+        var http = _http.HttpContext;
+        if (http is null) return;
+
+        var resource = _resourceResolver.Resolve(http, requirement);
+        var decision = await _evaluator.AuthorizeAsync(context.User, resource, requirement, http.RequestAborted);
+
+        if (decision.Decision == AclDecision.Allowed)
+            context.Succeed(requirement);
+
+        // opcional: anexar decisão no HttpContext para log/trace
+        http.Items["acl.decision"] = decision;
+    }
+}
+```
+
+---
+
+### Cache + invalidation
+
+#### Recommended Semantics
+
+    - **Local memory cache**: short TTL (e.g., 30-120s) 
+    - **Event-driven invalidation**: when grant/revoke occurs, publishes the event AclChanged(```tenant```, ```principalId```, ```resourceType```, ```resourceId?```)
+    - **Bounded staleness**: explicit by action risk (e.g., ```delete``` with shorter TTL)
+
+
+```csharp
+public interface IAclCache
+{
+    bool TryGet(string key, out AclDecisionDetails value);
+    void Set(string key, AclDecisionDetails value, TimeSpan ttl);
+    void InvalidateByPrefix(string prefix); // simples; ou por tags
+}
+```
+
+```csharp
+public sealed class CachedAclEvaluator : IAclEvaluator
+{
+    private readonly IAclEvaluator _inner;
+    private readonly IAclCache _cache;
+
+    public CachedAclEvaluator(IAclEvaluator inner, IAclCache cache)
+    {
+        _inner = inner;
+        _cache = cache;
+    }
+
+    public async Task<AclDecisionDetails> AuthorizeAsync(
+        ClaimsPrincipal user,
+        ResourceContext resource,
+        AclRequirement requirement,
+        CancellationToken ct = default)
+    {
+        var key = $"t:{resource.TenantId}:rt:{resource.Resource.Type}:rid:{resource.Resource.Id}:a:{requirement.Action}:p:{user.FindFirstValue("sub")}";
+        if (_cache.TryGet(key, out var cached)) return cached;
+
+        var decision = await _inner.AuthorizeAsync(user, resource, requirement, ct);
+
+        var ttl = requirement.Action switch
+        {
+            "delete" => TimeSpan.FromSeconds(15),
+            "update" => TimeSpan.FromSeconds(30),
+            _        => TimeSpan.FromSeconds(60),
+        };
+
+        _cache.Set(key, decision, ttl);
+        return decision;
+    }
+
+    public Task<IReadOnlyDictionary<Guid, AclDecisionDetails>> AuthorizeBatchAsync(
+        ClaimsPrincipal user,
+        MultiResourceContext resources,
+        AclAction action,
+        CancellationToken ct = default)
+    {
+        // geralmente cachear batch dá mais complexidade (fragmenta cache e eleva cardinalidade).
+        // recomendo cachear apenas single e otimizar batch via SQL/TVP.
+        return _inner.AuthorizeBatchAsync(user, resources, action, ct);
+    }
+}
+```
+---
+
+### Observability: reason codes + tracing + logs
+
+```csharp
+public sealed class AclDecisionLoggingMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger<AclDecisionLoggingMiddleware> _logger;
+
+    public AclDecisionLoggingMiddleware(RequestDelegate next, ILogger<AclDecisionLoggingMiddleware> logger)
+    {
+        _next = next;
+        _logger = logger;
+    }
+
+    public async Task Invoke(HttpContext ctx)
+    {
+        await _next(ctx);
+
+        if (ctx.Items.TryGetValue("acl.decision", out var value) && value is AclDecisionDetails d)
+        {
+            _logger.LogInformation("ACL decision {Decision} reason {Reason} grantId {GrantId}",
+                d.Decision, d.Reason, d.GrantId);
+        }
+    }
+}
+```
+
+### DI wiring
+
+```csharp
+builder.Services.AddHttpContextAccessor();
+
+builder.Services.AddAuthorization();
+builder.Services.AddSingleton<IAuthorizationPolicyProvider, AclPolicyProvider>();
+
+builder.Services.AddScoped<IResourceContextResolver, DefaultResourceContextResolver>();
+builder.Services.AddScoped<IPrincipalContextResolver, KeycloakPrincipalContextResolver>();
+
+builder.Services.AddSingleton<IAclClock, SystemAclClock>();
+
+builder.Services.AddScoped<IAclStore, SqlServerAclStore>(sp =>
+{
+    var cs = builder.Configuration.GetConnectionString("AuthorizationDb")!;
+    return new SqlServerAclStore(() => new SqlConnection(cs));
+});
+
+builder.Services.AddScoped<IAclEvaluator, AclEvaluator>();
+builder.Services.Decorate<IAclEvaluator, CachedAclEvaluator>(); // se usar Scrutor
+
+builder.Services.AddSingleton<IAclCache, MemoryAclCache>(); // implemente via IMemoryCache
+
+builder.Services.AddScoped<IAuthorizationHandler, AclHandler>();
+
+app.UseMiddleware<AclDecisionLoggingMiddleware>();
+```
+
+### Endpoint usage
+
+```csharp
+[HttpGet("/tenants/{tenantId}/documents/{documentId:guid}")]
+[AclResource("document", "documentId")]
+[Authorize(Policy = "acl:document:read")]
+public async Task<IActionResult> GetDocument(Guid documentId) { ... }
+```
+
+---
+
+## 6. Design trade-offs
+
+| Approach | Gain | Give up |
+|----------|------|---------|
+|RBAC only |Simplicity | No object-level control |
+|ACL in JWT|Zero DB this | Token bloat, revocation bugs |
+|Central auth service | Consistency | Latency, availability coupling |
+|Local enforcement (this model) | Determinism, scale | Schema and query complexity |
+|Strong caching | Latency | Revocation lag |
+
+Every ACL system chooses **where complexity lives**.
+This design pushes complexity into **schema and queries**, not runtime branching.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### "We can store permissions in roles"
+
+#### Why it happens:
+RBAC is familar, easy to explain and supported out of the box by most IAM tools.
+
+#### Problem:
+Roles are forced to encode contextual information they were never designed to represent:
+
+    - resource ownership
+    - delegation
+    - temporal constraints
+    - tenant-specific nuance
+
+Over time, roles explode combinatorially and become impossible to reason about or evolve safely.
+
+#### Avoidance:
+
+Separate concerns strictly:
+
+    - identity and coarse grouping belong to IAM
+    - authorization facts belong to an ACL store
+    - roles may grant _capabilities_, never _object-level access_
+
+---
+
+### "We'll cache forever and invalidate later"
+
+#### Why it happens:
+
+Authorization checks sit on latency-sensitive paths, and caching feels like the easiest fix.
+
+#### Problem:
+
+    - Revocations become unsafe or delayed
+    - Security prosture depends on cache correctness
+    - No clear semantics about what may be stale
+
+The system silently trades correctness for performance without explicit acceptance.
+
+#### Avoidance:
+
+Define cache semantics explicitly:
+
+    - short, bounded TTLs
+    - event-driven invalidation
+    - different staleness budgets per action risk Authorization caching must be **designed**, not improvised.
+
+---
+
+### "We only need one grant table"
+
+#### Why it happens:
+
+Early implementations optimize for minimal schema complexity.
+
+#### Problem:
+
+A single-table model cannot express:
+
+    - delegation
+    - inheritance
+    - audit trails
+    - access reviews
+
+As requirements grow, teams bolt metadata onto rows until queries become unmaintainable.
+
+#### Avoidance:
+
+Model intent explicitly:
+
+    - separate grant, delegation, inheritance and audit concerns
+    - accept schema complexity early to avoid logic complexity later
+
+---
+
+### "Authorization belongs in middleware only"
+
+#### Why it happens:
+
+Centralization feels safer and more maintainable.
+
+#### Problem:
+
+Middleware lacks sufficient resource context:
+
+    - no parent-child relationships
+    - no domain-specific resolution
+    - no batch semantics
+
+Authorization decision become either incorrect or overly permissive.
+
+#### Avoidance:
+
+Split responsibilities:
+
+    - intent declared at the edge (attribute / metadata)
+    - context resolved inside the service
+    - decisions made by a dedicated evaluator with full data
+
+---
+
+### "We trust resource identifier coming from the request"
+
+#### Why it happens:
+
+Route parameters look explicit and validated.
+
+#### Problem:
+
+Authorization is evaluated against **unverified context**, enabling:
+
+    - ID tampering
+    - cross-tenant access
+    - confused-deputy scenarios
+
+#### Avoidance:
+
+Treat resource resolution as part of authorization:
+
+    - validate tenant ownership explicitly
+    - never trust client-supplied identifiers as authorization truth
+    - bind resource identity server-side before evaluation
+
+---
+
+### "A deny result does not need to be explainable"
+
+#### Why it happens:
+
+Teams optimize for allow-path performance and ignore diagnostics.
+
+#### Problem:
+
+    - No auditability
+    - No access reviews
+    - Engineers cannot distinguish misconfiguration from abuse
+
+Denials become opaque and operationally toxix
+
+#### Avoidance:
+
+Authorization decisions must emit structured metadata:
+
+    - reason codes
+    - matched principal
+    - grant source (direct, group, delegation)
+
+If you cannot explain a decision, you do not control it.
+
+---
+
+### "We should put all permissions into the JWT token"
+
+#### Why it happens:
+
+Token-based authorization feels fast, stateless and elegant.
+
+#### Problem:
+
+    - Token bloat and size limits
+    - Revocation becomes impossible or delayed
+    - Permission churn forces token refresh storms
+    - ACL evolution breaks backward compatibility
+
+The token becomes a fragile, high-cardinality permission cache.
+
+#### Avoidance:
+
+Keep JWTs lean:
+
+    - identity
+    - tenant
+    - coarse grouping
+
+All fine-grained authorization must be resolved at request time against an authoritative store.
+
+---
+
+### “Authorization logic can evolve without governance”
+
+#### Why it happens:
+
+Permissions feel like application details rather than contracts.
+
+#### Problem:
+
+    - breaking changes to permission names
+    - silent access loss or escalation
+    - cross-service inconsistency
+
+Over time, authorization becomes tribal knowledge.
+
+#### Avoidance:
+
+Treat permission vocabulary as an API:
+
+    - versioned
+    - reviewed
+    - backward-compatible
+
+Permission evolution must be intentional and auditable.
+
+---
+
+### "Group expasion is free and harmless"
+
+#### Why it happens:
+
+IAM systems make groups look cheap and convenient.
+
+#### Problem:
+
+    - Transitive group expansion explodes cardinality
+    - Authorization checks slow down unpredictably
+    - Cycles and nesting create correctness risks
+
+What worked for dozens of users fails at thousands.
+
+#### Avoidance:
+
+Control group expansion explicitly:
+
+    - flatten groups into internal principals
+    - cache expansion results with bounded TTL
+    - avoid deep or unbounded hierarchies
+
+---
+
+## 8. Operational and production considerations
+
+### Observability
+
+    - Decision outcome counters (allow/deny)
+    - Reason code cardinality
+    - Cache hit/miss ratios
+    - p95 authorization latency
+
+### Auditing
+
+    - Immutable grant history
+    - Access reviews by principal or resource
+    - "Why does user X have access Y?"
+
+### Failure modes
+
+    - DB pressure from list endpoints
+    - Parameter sniffing causing scans
+    - Cache stampedes on invalidation
+
+--- 
+
+## 9. When NOT use this
+
+Do not build this system if:
+
+    - Roles map cleanly to access
+    - Resources are not individually sensitive
+    - Authorization curn is low
+    - Auditability is not required
+    - Team size and system lifespan are small
+
+ACLs are power tools. They can hurt you if unncessary.
+
+---
+
+## 10. Key takeaways
+
+    - **ACL systems operate on explicit authorization facts, not inferred roles or rules**
+        - Every access decision must be traceable to a concrete grant.
+    - **Identity establishes _who_ the caller is; authorization determines _what_ they may do**
+        - Blurring this boundary creates token bloat, revocation risk and governance failure.
+    - **Your authorization schema is part of your security boundary**
+        - Table design, indexes and query shapes directly impact correctness, latency and auditability.
+    - **Authorization decisions must be explainable by construction**
+        - If a decision cannot produce a reason code and a source, it is operationally incomplete.
+    - **Caching is correctness problem before it is a performance optimization**
+        - Staleness, invalidation and action risk must be explicitly modeled and accepted.
+    - **Every permission must have ownership, scope and lifecycle semantics**
+        - Grants without an owner, purpose or expiry inevitably violate least privilege.
+    - **If authorization state cannot be reviewed, reconstructed and audited it is not under control**
+        - Security that cannot be inspected is indistinguishable from security that does not exist.
+
+---
+
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
+import Light from './_assets/acl-autorization-light.svg';
+import Dark from './_assets/acl-autorization-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="ACL authorization"
+  height={560}
+/>
