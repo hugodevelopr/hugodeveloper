@@ -1,0 +1,606 @@
+---
+id: azure-search-documents
+title: Azure AI Search
+slug: /infra/cloud/azure/azure-search-documents
+description: Architectural use of Azure AI Search for large document indexing and exact retrieval, covering analyzers, chunking, relevance control, and operations.
+sidebar_label: Azure AI Search
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document explains how to **design, implement and operate Azure AI Search as a managed search plataform** for **exact document retrieval** 
+over very large textual artifacts.
+
+The focus is not on search features or SDK usage in isolation, but on **how Azure AI Search behaves as infrastructure** when used to 
+index and query large documents such as policies, contracts, manuals, specifications, audit evidence, tickets and internal knowledge bases.
+
+The document covers:
+
+    - How **Azure AI Search** indexes and executes queries over large text
+    - What the plataform does and _explicitly does not do_
+    - Where application-level responsibility begins
+    - How to preserve correctness, determinism and explainability under scale
+
+This document applies when:
+
+    - Azure AI Search is used as **primary retrieval system**
+    - Documents are large, structured and business-critical
+    - Exact term and phrase presence matters
+    - False positives have legal, compliance, or operational cost
+    - Missed matches are unacceptable
+
+This document does **not** apply when:
+
+    - Search is exploratory or discovery-oriented
+    - Approximate or fuzzy matches are sufficient
+    - Documents are small and trivially scannable
+    - Search correctness is not a first-order concern
+
+---
+
+## 2. Why this matters in real systems
+
+This problem does not appear early
+
+It emerges once Azure AI Search moves from a supporting feature to **an infrastructural dependency**, when 
+search results start influencing:
+
+    - Legal interpretation
+    - Compliance audits
+    - Incident investigations
+    - Customer disputes
+    - Automated downstream decision
+
+In early stages, teams often rely on:
+
+    - Database full-text search
+    - Naive blob scanning
+    - Saas search with default analyzers
+    - Semantic search optimized for discovery
+
+These approaches work only while the **cost of being wrong is low**.
+
+### What break first under real pressure
+
+Failures appear gradually:
+
+    - **Exact matches silently disappear** due to analyzer normalization, stremming, or stop-work removal
+    - **Large documents exceed practical limits** of analyzers and field, causing truncation or partial indexing
+    - **Ranking becomes opaque**, drifting as indexes grow, partitions rebalance or analyzers evolve
+    - **Index rebuilds become high-risk operations**, not runtime maintenance
+    - **Latency loses predictability**, especially at p95/p99 under concurrency
+
+None of these failures trigger alarms by default
+
+Together, they erode trust in the system.
+
+### Why simpler approaches stop working
+
+Because **exactness and scale are antagonistic unless designer together**.
+
+    - Exactness requires:
+        - Control over tokenization
+        - Stable text boundaries
+        - Deterministic analyzers
+        - Explicit query semantics
+    - Scale requires:
+        - Partitioning and sharding
+        - Parallel ingestion and querying
+        - Distributed scoring and execution
+
+Parallelism destroys document-level garantees **unless reconstruction is explicit**.
+
+At this point, Azure AI Search stops beging "a search feature" and becomes **plataform infrastructure**.
+
+---
+
+## 3. Core concept (mental model)
+
+
+Azure AI Search should not be understood as "searching documents".
+
+That framing is misleading.
+
+A more accurate mental model is:
+
+> **Azure AI Search is a managed, distributed inverted index over immutable text fragments, governed by explicit 
+indexing, relevance and reconstruction contracts**.
+
+The critical shift:
+
+    - You are **not indexing documents**
+    - You are indexing **addressable, independently searchable text units**
+    - "Documents" exist only as an **application-level abstraction**
+
+### Why this matters in Azure AI Search
+
+Azure AI Search:
+
+    - Has no native notion of large-document continuity
+    - Applies analyzers at field level with strict limits
+    - Executes queries across partitions independently
+    - Returns index documents, not reconstructed artifacts
+
+If you treat documents as atomic units, the platform will violate that assumption **silently**.
+
+### The real execution model
+
+    1. Documents are ingested as raw source material
+    2. Documents are split into **deterministic chunks**
+    3. Each chunk is indexed and scored independently by Azure AI Search
+    4. Exactness is enforced explicitly at:
+        - Analyzer configuration
+        - Query construction
+        - Scoring constraints
+    5. Documents are reassembled **outside the platform**, at query time
+
+Chunking is not an optimization.
+
+**Chunking is the unit of correctness**.
+
+If chunking is implicit, correctness is accidental.
+
+---
+
+## 4. How it works (step-by-step)
+
+This section describes the execution flow **as it must exist in production**, explicitly separating **Azure responsibilities** from 
+**application responsibilities**.
+
+---
+
+### Step 1 — Document ingestion
+
+#### What happens
+
+Document are persisted in Azure Blob Storage as the **authoritative source of truth**.
+
+#### Why it exists
+
+Azure AI Search indexes are derived and disposable. Documents are not
+
+#### Assumptions / invariants
+
+    - Stable document identity
+    - Versioning or content hashing enabled
+    - Re-indexing is idempotent by design
+    - Every indexed fragment is traceable to a document version
+
+If traceability is lost here, it cannot be recovered later
+
+---
+
+### Step 2 — Deterministic chunking
+
+#### What happens
+
+Documents are split using stable, explicit rules:
+
+    - Token-based sizing (never characters)
+    - Boundary-aware segmentation
+    - Controlled overlap for phrase continuity
+
+Example invariants:
+
+    - Chunk size: 800-1200 tokens
+    - Overlap: 100-200 tokens
+    - ChunkID: ```DocumentId : Version : Sequence```
+
+#### Why it exists
+
+    - Azure AI Search field and analyzer limits
+    - Phrase integrity across boundaries
+    - Highlighting accuracy
+    - Auditability
+
+This responsibility **belongs to the application layer**.
+
+Azure AI Search does not provide safe, controllable chunking for large texts.
+
+Chunking rules must never change silently.
+
+---
+
+### Step 3 — Index schema design
+
+Each chunk becomes a **first-class index document** in Azure AI Search.
+
+```json
+{
+  "name": "document-chunks",
+  "fields": [
+    { "name": "chunkId", "type": "Edm.String", "key": true },
+    { "name": "documentId", "type": "Edm.String", "filterable": true },
+    { "name": "tenantId", "type": "Edm.String", "filterable": true },
+    { "name": "content", "type": "Edm.String", "searchable": true },
+    { "name": "chunkOrder", "type": "Edm.Int32", "sortable": true },
+    { "name": "language", "type": "Edm.String", "filterable": true },
+    { "name": "checksum", "type": "Edm.String", "filterable": true }
+  ]
+}
+```
+
+#### Why it exists
+
+    - Precision through fragment-level indexing
+    - Security enforced before relevance
+    - Deterministic document reconstruction
+    - Drift detection and safe reindexing
+
+---
+
+### Step 4 — Analyzer strategy
+
+Default analyzers are dangerous for exact retrieval.
+
+#### Guiding rule
+
+> If you did not choose the analyzer explicitly, you accepted its linguistic and semantic bias.
+
+#### Recommended approach
+
+    - Use language analyzers only when linguistic variance is required
+    - Prefer ```standard.lucene``` or ```keyword``` for legal and techinical content
+    - Avoid stemming, synonym expansion, and aggressive normalization
+
+#### Invariant
+
+Exactness > recall.
+
+False negatives are silent failures.
+
+Analyzer changes in Azure AI Search **require full reindexing** and must be treated as breaking changes.
+
+---
+
+### Step 5 — Query construction
+
+Exact retrieval is not free-text search
+
+```csharp
+// Build search options explicitly.
+// Nothing here is accidental.
+var options = new SearchOptions
+{
+    // Enforce strict matching semantics
+    SearchMode = SearchMode.All,
+    QueryType  = SearchQueryType.Full,
+
+    // Hard security boundary — applied before relevance
+    Filter = $"tenantId eq '{tenantId}'",
+
+    // Limit fan-out deterministically
+    Size = 20,
+
+    // Explicitly request highlights for explainability
+    HighlightFields = { "content" },
+
+    // Optional but recommended: control highlight behavior
+    HighlightPreTag  = "<mark>",
+    HighlightPostTag = "</mark>"
+};
+
+// Optional: explicitly select only required fields
+options.Select.Add("chunkId");
+options.Select.Add("documentId");
+options.Select.Add("chunkOrder");
+options.Select.Add("content");
+
+// Optional: deterministic ordering inside equal-score groups
+options.OrderBy.Add("documentId");
+options.OrderBy.Add("chunkOrder");
+
+// Exact phrase query — quoted on purpose
+var query = $"\"{phrase}\"";
+
+// Execute search
+var response = await searchClient.SearchAsync<SearchDocument>(
+    query,
+    options,
+    cancellationToken
+);
+
+// Consume results
+await foreach (var result in response.Value.GetResultsAsync())
+{
+    var document = result.Document;
+
+    var chunkId     = document.GetString("chunkId");
+    var documentId  = document.GetString("documentId");
+    var chunkOrder  = document.GetInt32("chunkOrder");
+    var content     = document.GetString("content");
+
+    // Highlight handling is explicit and defensive
+    if (result.Highlights != null &&
+        result.Highlights.TryGetValue("content", out var highlights))
+    {
+        foreach (var snippet in highlights)
+        {
+            // snippet contains the exact matched region
+            // with highlight tags applied
+            Console.WriteLine($"[{documentId}:{chunkOrder}] {snippet}");
+        }
+    }
+    else
+    {
+        // Fallback when highlighting is not returned
+        Console.WriteLine($"[{documentId}:{chunkOrder}] {content}");
+    }
+}
+
+```
+
+Why this matters
+
+    - Strict matching semantics
+    - Phrase adjancency preserved
+    - Filters enforced before scoring
+
+Azure AI Search executes queries per partition.
+
+Correctness must be encoded in the query itself.
+
+---
+
+### Step 6 — Result assembly
+
+Azure AI Search returns **index documents**, not documents.
+
+This is intentional.
+
+The application must:
+
+    - Group result by ```documentId```
+    - Order by ```chunkOrder```
+    - Merge highlights into coherent context
+    - Preserve provenance for audits
+
+Search retrieves fragments.
+
+Application reconstruct meaning.
+
+---
+
+## 5. Minimal but realistic example
+
+```csharp
+// Assumptions (explicit on purpose):
+// - document.Id, document.TenantId, document.Version, document.Language exist
+// - document.Content is the full extracted text for indexing
+// - chunk.Sequence is deterministic and stable per document version
+// - chunk.Text is the chunk payload
+// - chunk.Checksum is stable for the chunk text (e.g., SHA256 of chunk.Text)
+
+// Build a batch with bounded size. Don't let one document create a single giant request.
+// Tune these based on real limits and observed failures.
+const int maxActionsPerBatch = 500;
+const int maxChunkChars = 6_000;       // keep it conservative; exact number depends on your content
+const int overlapChars = 400;          // example overlap for phrase continuity
+
+var batch = IndexDocumentsBatch.Create<SearchDocument>();
+
+// Optional (but common): before indexing a new version, delete old chunks for this document.
+// This prevents stale chunks staying searchable after updates.
+//
+// NOTE: This is a separate operation because Azure Search doesn't do "replace document set" natively.
+// In practice you would do: delete by filter or track chunk IDs from previous version.
+// Here we show explicit deletes by deterministic key prefix logic (illustrative).
+//
+// If you already version chunkId (you do), you can safely leave old versions if queries always filter by version.
+// But if queries do NOT filter by version, you must delete old chunks to prevent false positives.
+var deleteOldVersions = true;
+
+// If you decide to delete, you need the previous version. If unknown, you typically keep a registry in SQL/Cosmos.
+// We'll assume you have it available as `previousVersion` when applicable.
+if (deleteOldVersions && document.PreviousVersion != null)
+{
+    // Deterministic keys allow targeted deletion.
+    // If you don't have keys, you cannot delete precisely.
+    for (var seq = 0; seq < document.PreviousChunkCount; seq++)
+    {
+        var oldChunkId = $"{document.Id}:{document.PreviousVersion}:{seq}";
+        var deleteDoc = new SearchDocument { ["chunkId"] = oldChunkId };
+        batch.Actions.Add(IndexDocumentsAction.Delete(deleteDoc));
+
+        if (batch.Actions.Count >= maxActionsPerBatch)
+        {
+            await FlushBatchAsync(indexClient, batch, cancellationToken);
+            batch = IndexDocumentsBatch.Create<SearchDocument>();
+        }
+    }
+}
+
+// Split the document into chunks inline (no extra classes).
+// This is intentionally simple: character-based chunking with overlap.
+// In production you should prefer token-based chunking, but the structure is the important part here.
+var text = document.Content ?? string.Empty;
+var position = 0;
+var sequence = 0;
+
+while (position < text.Length)
+{
+    var length = Math.Min(maxChunkChars, text.Length - position);
+    var chunkText = text.Substring(position, length);
+
+    var chunkId = $"{document.Id}:{document.Version}:{sequence}";
+    var checksum = ComputeSha256Hex(chunkText); // local function below
+
+    var searchDocument = new SearchDocument
+    {
+        // Identity & traceability
+        ["chunkId"]    = chunkId,
+        ["documentId"] = document.Id,
+        ["tenantId"]   = document.TenantId,
+
+        // Searchable payload
+        ["content"]    = chunkText,
+
+        // Reconstruction & control
+        ["chunkOrder"] = sequence,
+        ["language"]   = document.Language,
+
+        // Drift detection
+        ["checksum"]   = checksum
+    };
+
+    // Use MergeOrUpload to keep indexing idempotent and safe for retries.
+    batch.Actions.Add(IndexDocumentsAction.MergeOrUpload(searchDocument));
+
+    // Flush when the batch grows too large
+    if (batch.Actions.Count >= maxActionsPerBatch)
+    {
+        await FlushBatchAsync(indexClient, batch, cancellationToken);
+        batch = IndexDocumentsBatch.Create<SearchDocument>();
+    }
+
+    // Advance with overlap
+    position += (maxChunkChars - overlapChars);
+    if (position < 0) position = 0; // defensive
+    sequence++;
+}
+
+// Flush any remaining actions
+if (batch.Actions.Count > 0)
+{
+    await FlushBatchAsync(indexClient, batch, cancellationToken);
+}
+
+// ---------------------------
+// Local helper: flush batch
+// ---------------------------
+static async Task FlushBatchAsync(SearchIndexClient indexClient, IndexDocumentsBatch<SearchDocument> batch, CancellationToken ct)
+{
+    try
+    {
+        var result = await indexClient.IndexDocumentsAsync(batch, cancellationToken: ct);
+
+        // Minimal observability. In real code, emit structured logs + metrics.
+        Console.WriteLine($"Indexed batch: {batch.Actions.Count} actions.");
+    }
+    catch (IndexDocumentsException ex)
+    {
+        // This exception is common: partial failures in a batch.
+        // You must treat it as a first-class operational reality.
+        Console.WriteLine($"Indexing batch had failures. Failed keys: {string.Join(", ", ex.IndexingResults.Where(r => !r.Succeeded).Select(r => r.Key))}");
+
+        // In production, you typically:
+        // - retry only failed documents
+        // - apply backoff for throttling
+        // - route poison docs to a dead-letter mechanism
+        // Here we just rethrow to keep the example minimal but honest.
+        throw;
+    }
+}
+
+// ---------------------------
+// Local helper: checksum
+// ---------------------------
+static string ComputeSha256Hex(string value)
+{
+    using var sha = System.Security.Cryptography.SHA256.Create();
+    var bytes = System.Text.Encoding.UTF8.GetBytes(value);
+    var hash = sha.ComputeHash(bytes);
+    return Convert.ToHexString(hash); // .NET 5+
+}
+```
+
+#### How this maps to the platform model
+
+    - Chunking is explicit and reproducible
+    - Identity is deterministic and version-aware
+    - Indexing is idempotent
+    - The Azure AI Search index is fully disposable
+
+Nothing here is accidental.
+
+---
+
+## 6. Design trade-offs
+
+|Decision                      |Gain                     |Cost                        |Accepted Risk                                  |
+|:-----------------------------|:------------------------|:---------------------------|:----------------------------------------------|
+|Chunk-level indexing          |Precision, scale         |Larger index                |Reassembly complexity                          |
+|Strict analyzers              |Determinism              |Lower recall                |User precision required                        |
+|Phrase queries                |Correctness              |Higher latency              |Query cost                                     |
+|Filters first                 |Security                 |Query complexity            |None                                           |
+|No semantic primary ranking   |Predictability           |Less discovery              |Manual relevance design                        |
+|Azure-managed scaling         |Simplicity               |Cost opacity                |Limited shard control                          |
+
+
+---
+
+## 7. Common mistakes and misconceptions
+
+    - Treating semantic search as a correctness upgrade
+    - Indexing one document as one entry
+    - Relying on default analyzers
+    - Assuming Azure AI Search preserves document semantics
+
+
+All share the same root cause:
+
+> **Implicit platform behavior defining correctness**
+
+---
+
+## 8. Operational and production considerations
+
+Monitor:
+
+    - Index size growth per tenant
+    - p95 / p99 query latency
+    - Indexing throttling events
+    - Reindex duration and frequency
+
+Expect degration in:
+
+    - Highlight accuracy
+    - Phrase queries across boundaries
+    - Cost predictability as chunk count grows
+
+Azure AI Search failures are **gradual**, not loud.
+
+---
+
+## 9. When NOT to use this
+
+Do not use this approach when:
+
+    - Approximate answers are acceptable
+    - Search is exploratory
+    - Documents are small
+    - Operational simplicity outweighs correctness
+
+This architecture is intentionally heavy
+
+---
+
+## 10. Key takeaways
+
+    - Azure AI Search is infrastructure, not a feature
+    - Exact retrieval must be designed, not tuned
+    - Chunking defines correctness boundaries
+    - Analyzer choice defines what exists
+    - Determinism scales bettern than intelligence
+    - Indexes are derived state
+    - Operational cost follows fragmentation, not raw data size
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end Azure AI Search flow, highlighting deterministic chunking, explicit analyzers, exact phrase querying, and application-level result reconstruction.
+
+import Light from './_assets/azure-search-documents-light.svg';
+import Dark from './_assets/azure-search-documents-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Azure AI Search documents"
+  height={560}
+/>
