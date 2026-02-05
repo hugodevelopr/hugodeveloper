@@ -1,0 +1,1579 @@
+---
+id: expression-decision-tables
+title: Expression Decision Tables SQL Server
+slug: /data/storage/relational/expression-decision-tables
+description: "Production blueprint for expression-based decision tables in SQL Server and .NET: versioning, validation, caching, auditing, and runtime safety."
+sidebar_label: Expression Decision Tables
+sidebar_position: 20
+---
+
+
+## 1. What this document is about
+
+This document explains **Expression Decision Tables** as a mehanism for modeling and executing 
+policy-oriented business decisions where rules are expressed as bounded, evaluable expressions, 
+stored as data  and executed by the application at runtime.
+
+It focuses on:
+
+    - Externalizing volatile decision policies from application code, not replacing domain logic
+    - Executing conditional decision logic via controlled expression evaluation rather than hard-coded branching
+    - Using SQL Server as the system of record for rule definition, versioning, and auditability, 
+    while keeping execution and safety guarantees in the application layer
+    - Delegating expression parsing, validation, and execution to .NET to preserve runtime control, determinism, and observability
+    - This approach applies to systems where decision policies evolve faster than deployment cycles and where auditability, 
+    explainability, and controlled change are non-negotiable.
+
+It does not apply to:
+
+    - Core domain invariants or state transitions that require compile-time guarantees
+    - Simple, static decision logic with low change frequency
+    - Latency-critical inner loops where dynamic evaluation is unacceptable
+    - Systems that cannot tolerate runtime rule misconfiguration without strong validation, testing and rollback mechanisms
+
+---
+
+## 2. Why this matters in real systems
+
+**Expression Decision Tables** emerge when systems reach a point where **hard-coded conditional logic becomes a liability**.
+
+Typical pressures include:
+
+    - Business rules changing independently of application releases
+    - Multiple dimensions of decision criteria interacting combinatorially
+    - Regulatory requirements demanding tracebility and explanation
+    - Multiple teams contributing rules without owning the full codebase
+
+What tends to break when this is ignored:
+
+    - Conditional logic sprawls across services and layers
+    - Releases become blocked by "small rule changes"
+    - Engineers become de facto rule managers
+    - Audits require reverse-engineering production code
+
+Why simpler approaches stop working:
+
+    - ```if/else``` trees do not scale cognitively
+    - Features flags are not expressive enough
+    - Configuration-based switches collapse under combinatorial growth
+
+Ai this point, **decisions must become data**.
+
+---
+
+## 3. Core concept (mental model)
+
+An Expression Decision Table is best understood as **a deterministic evaluation pipeline**:
+
+> **Input facts → rule selection → expression evaluation → outcome**
+
+Each row in the table represents **a candidate decision**, defined by:
+
+    - A condition expression that determines applicability
+    - One or more outcome expressions that produce results
+    - Metadata that governs ordering, versioning and lifecycle
+
+The system evaluates rules **in a controlled sequence**, selecting the first (or all) matching expressions and producing a result 
+that is explainable and repeatable.
+
+This is not a rules engine magic box.
+
+It is **structured indirection**.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Inputs are normalized
+
+Incoming data is projected into a stable, known shape.
+
+Why:
+
+    - Expression must not depend on raw transport formats
+    - Input shape stability is an invariant
+
+---
+
+### Step 2 — Candidate rules are selected
+
+Rules are filtered by context (domain, type, version, validity window).
+
+Why:
+
+    - Prevents accidental cross-domain rule leakage
+    - Enables safe coexistence of versions
+
+---
+
+### Step 3 — Conditions are evaluated
+
+Each rule's condition expression is evaluated against the input.
+
+Assumptions:
+
+    - Expressions are side-effect free
+    - Evaluation is deterministic
+
+---
+
+### Step 4 — Rule ordering is enforced
+
+Priority, salience or explicit ordering resolves conflicts.
+
+Why:
+
+    - Avoids ambiguous outcomes
+    - Makes behavior predictable and auditable
+
+---
+
+### Step 5 — Outcomes are produces
+
+The selected rule's outcome expressions are evaluated.
+
+Invariant:
+
+    - Outcomes must be explainable as a function of inputs + rule definition
+
+---
+
+### Step 6 — Decision is recorded 
+
+Inputs, rule ID and outputs are persisted (optional).
+
+Why:
+
+    - Auditability
+    - Debugging
+    - Regulatory compliance
+
+---
+
+## 5. Minimal concrete example 
+
+### 5.1 — SQL Server
+
+#### 5.1.1 — Ruleset lifecycle
+
+```sql
+CREATE SCHEMA decision AUTHORIZATION dbo;
+GO
+
+CREATE TABLE decision.RuleSet (
+    RuleSetId      INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    Name           NVARCHAR(120) NOT NULL,
+    Version        INT NOT NULL,
+    Status         VARCHAR(20) NOT NULL,         -- Draft | Published | Deprecated
+    Description    NVARCHAR(500) NULL,
+    CreatedAtUtc   DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy      NVARCHAR(120) NOT NULL,
+    PublishedAtUtc DATETIME2(3) NULL,
+    PublishedBy    NVARCHAR(120) NULL,
+    CONSTRAINT UQ_RuleSet_Name_Version UNIQUE(Name, Version),
+    CONSTRAINT CK_RuleSet_Status CHECK (Status IN ('Draft','Published','Deprecated'))
+);
+GO
+
+-- Fast pointer to current published version (per ruleset name)
+CREATE TABLE decision.RuleSetPointer (
+    Name              NVARCHAR(120) NOT NULL PRIMARY KEY,
+    PublishedVersion  INT NOT NULL,
+    UpdatedAtUtc      DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME()
+);
+GO
+```
+
+#### 5.1.2 — Rules (expressions + JSON outcomes)
+
+```sql
+CREATE TABLE decision.Rule (
+    RuleId         BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    RuleSetId      INT NOT NULL,
+    Priority       INT NOT NULL,                 -- lower executes first
+    StopOnMatch    BIT NOT NULL DEFAULT 1,       -- 1 = first-match; 0 = multi-hit
+    IsActive       BIT NOT NULL DEFAULT 1,
+
+    ConditionExpr  NVARCHAR(MAX) NOT NULL,       -- must evaluate to boolean
+    OutcomeJson    NVARCHAR(MAX) NOT NULL,       -- effects + reasons (JSON)
+
+    ValidFromUtc   DATETIME2(3) NULL,
+    ValidToUtc     DATETIME2(3) NULL,
+
+    -- Hash (tamper detection + audit correlation)
+    ExprHash       VARBINARY(32) NOT NULL,
+
+    CreatedAtUtc   DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy      NVARCHAR(120) NOT NULL,
+
+    CONSTRAINT FK_Rule_RuleSet FOREIGN KEY (RuleSetId) REFERENCES decision.RuleSet(RuleSetId),
+    CONSTRAINT CK_Rule_Validity CHECK (ValidToUtc IS NULL OR ValidFromUtc IS NULL OR ValidToUtc > ValidFromUtc)
+);
+GO
+
+CREATE INDEX IX_Rule_Execution
+ON decision.Rule (RuleSetId, IsActive, Priority, RuleId)
+INCLUDE (StopOnMatch, ValidFromUtc, ValidToUtc);
+GO
+```
+
+#### 5.1.3 — Decision audit log
+
+```sql
+CREATE TABLE decision.DecisionLog (
+    DecisionId        UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+    RuleSetName       NVARCHAR(120) NOT NULL,
+    RuleSetVersion    INT NOT NULL,
+
+    RequestedAtUtc    DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    DurationMs        INT NOT NULL,
+
+    InputJson         NVARCHAR(MAX) NOT NULL,
+    OutputJson        NVARCHAR(MAX) NOT NULL,
+
+    AppliedRuleIdsJson NVARCHAR(MAX) NOT NULL,  -- e.g. [1010,1020,1099]
+    TraceJson          NVARCHAR(MAX) NULL,      -- optional evaluation trace
+
+    -- useful correlation fields
+    CorrelationId     NVARCHAR(100) NULL,
+    TenantId          NVARCHAR(80) NULL
+);
+GO
+```
+
+#### 5.1.4 — Test vector (publish-time gate)
+
+```sql
+CREATE TABLE decision.RuleSetTest (
+    TestId        BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    RuleSetId     INT NOT NULL,
+    Name          NVARCHAR(200) NOT NULL,
+    InputJson     NVARCHAR(MAX) NOT NULL,
+    ExpectedJson  NVARCHAR(MAX) NOT NULL,       -- expected outputs (subset allowed)
+    IsActive      BIT NOT NULL DEFAULT 1,
+    CreatedAtUtc  DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+    CreatedBy     NVARCHAR(120) NOT NULL,
+    CONSTRAINT FK_RuleSetTest_RuleSet FOREIGN KEY (RuleSetId) REFERENCES decision.RuleSet(RuleSetId)
+);
+GO
+```
+
+---
+
+### 5.2 — SQL Server core stored procedures
+
+#### 5.2.1 — Create a new draft version
+
+```sql
+CREATE OR ALTER PROCEDURE decision.CreateDraftRuleSet
+    @Name NVARCHAR(120),
+    @Description NVARCHAR(500) = NULL,
+    @CreatedBy NVARCHAR(120),
+    @NewVersion INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @NextVersion INT = ISNULL(
+        (SELECT MAX(Version) FROM decision.RuleSet WHERE Name = @Name), 0
+    ) + 1;
+
+    INSERT INTO decision.RuleSet (Name, Version, Status, Description, CreatedBy)
+    VALUES (@Name, @NextVersion, 'Draft', @Description, @CreatedBy);
+
+    SET @NewVersion = @NextVersion;
+END
+GO
+```
+
+#### 5.2.2 — Insert rule into a draft
+
+We hash the expressions at insert-time (still validated by .NET).
+
+```sql
+CREATE OR ALTER PROCEDURE decision.AddRule
+    @RuleSetName NVARCHAR(120),
+    @RuleSetVersion INT,
+    @Priority INT,
+    @StopOnMatch BIT,
+    @ConditionExpr NVARCHAR(MAX),
+    @OutcomeJson NVARCHAR(MAX),
+    @CreatedBy NVARCHAR(120),
+    @ValidFromUtc DATETIME2(3) = NULL,
+    @ValidToUtc DATETIME2(3) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @RuleSetId INT;
+
+    SELECT @RuleSetId = RuleSetId
+    FROM decision.RuleSet
+    WHERE Name = @RuleSetName AND Version = @RuleSetVersion AND Status = 'Draft';
+
+    IF @RuleSetId IS NULL
+        THROW 50010, 'Draft ruleset not found.', 1;
+
+    DECLARE @ExprHash VARBINARY(32) =
+        HASHBYTES('SHA2_256', CONCAT(@ConditionExpr, CHAR(10), @OutcomeJson));
+
+    INSERT INTO decision.Rule (RuleSetId, Priority, StopOnMatch, ConditionExpr, OutcomeJson, ExprHash, CreatedBy, ValidFromUtc, ValidToUtc)
+    VALUES (@RuleSetId, @Priority, @StopOnMatch, @ConditionExpr, @OutcomeJson, @ExprHash, @CreatedBy, @ValidFromUtc, @ValidToUtc);
+END
+GO
+```
+
+#### 5.2.3 — Get published rules (deterministic selection)
+
+```sql
+CREATE OR ALTER PROCEDURE decision.GetPublishedRules
+    @RuleSetName NVARCHAR(120)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Version INT =
+        (SELECT PublishedVersion FROM decision.RuleSetPointer WHERE Name = @RuleSetName);
+
+    IF @Version IS NULL
+        THROW 50001, 'No published ruleset version found.', 1;
+
+    DECLARE @RuleSetId INT =
+        (SELECT RuleSetId FROM decision.RuleSet WHERE Name = @RuleSetName AND Version = @Version AND Status = 'Published');
+
+    IF @RuleSetId IS NULL
+        THROW 50002, 'Published ruleset not found or pointer inconsistent.', 1;
+
+    SELECT
+        r.RuleId,
+        rs.Name AS RuleSetName,
+        rs.Version AS RuleSetVersion,
+        r.Priority,
+        r.StopOnMatch,
+        r.ConditionExpr,
+        r.OutcomeJson,
+        r.ExprHash
+    FROM decision.Rule r
+    JOIN decision.RuleSet rs ON rs.RuleSetId = r.RuleSetId
+    WHERE r.RuleSetId = @RuleSetId
+      AND r.IsActive = 1
+      AND (r.ValidFromUtc IS NULL OR r.ValidFromUtc <= SYSUTCDATETIME())
+      AND (r.ValidToUtc   IS NULL OR r.ValidToUtc   >  SYSUTCDATETIME())
+    ORDER BY r.Priority ASC, r.RuleId ASC;
+END
+GO
+```
+
+#### 5.2.4 — Publish a draft version (atomic pointer update)
+
+**Important**: this procedure assumes .NET already validated + tested. SQL only enforces lifecycle.
+
+```sql
+CREATE OR ALTER PROCEDURE decision.PublishRuleSet
+    @RuleSetName NVARCHAR(120),
+    @RuleSetVersion INT,
+    @PublishedBy NVARCHAR(120)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    BEGIN TRAN;
+
+    -- Lock the draft row
+    UPDATE decision.RuleSet
+    SET Status = Status
+    WHERE Name = @RuleSetName AND Version = @RuleSetVersion AND Status = 'Draft';
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+        ROLLBACK;
+        THROW 50020, 'Draft ruleset not found or not in Draft status.', 1;
+    END
+
+    -- Mark as Published
+    UPDATE decision.RuleSet
+    SET Status = 'Published',
+        PublishedAtUtc = SYSUTCDATETIME(),
+        PublishedBy = @PublishedBy
+    WHERE Name = @RuleSetName AND Version = @RuleSetVersion;
+
+    -- Update pointer (upsert)
+    MERGE decision.RuleSetPointer AS t
+    USING (SELECT @RuleSetName AS Name, @RuleSetVersion AS PublishedVersion) AS s
+    ON (t.Name = s.Name)
+    WHEN MATCHED THEN
+        UPDATE SET PublishedVersion = s.PublishedVersion, UpdatedAtUtc = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+        INSERT (Name, PublishedVersion) VALUES (s.Name, s.PublishedVersion);
+
+    COMMIT;
+END
+GO
+```
+
+#### 5.2.5 — Rollback
+
+```sql
+CREATE OR ALTER PROCEDURE decision.RollbackRuleSetPointer
+    @RuleSetName NVARCHAR(120),
+    @ToVersion INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM decision.RuleSet
+        WHERE Name = @RuleSetName AND Version = @ToVersion AND Status = 'Published'
+    )
+        THROW 50030, 'Target version is not published.', 1;
+
+    UPDATE decision.RuleSetPointer
+    SET PublishedVersion = @ToVersion,
+        UpdatedAtUtc = SYSUTCDATETIME()
+    WHERE Name = @RuleSetName;
+
+    IF @@ROWCOUNT = 0
+        INSERT INTO decision.RuleSetPointer (Name, PublishedVersion) VALUES (@RuleSetName, @ToVersion);
+END
+GO
+```
+
+---
+
+### 5.3 — Expression language (bounded DSL contract)
+
+This needs to be **explicit** and enforced.
+
+#### 5.3.1 — Supported constructs
+
+    - Identifiers: ```customer.type```, ```customer.kycLevel```, ```risk.score```, ```order.amount```, ```partner.tir```, ```order.channel```
+    - Boolean operators: ```&&```, ```||```, ```!```
+    - Comparasion: ```==```, ```!=```, ```>```, ```>=```, ```<```, ```<=```
+    - Literals: string ```'VIP'```, numbers ```812```, booleans ```true/false```, null ```null```
+    - Functions (example set):
+        - ```colesce(a, b)```
+        - ```max(a, b)```
+        - ```in(x, a, b, c)``` (optional)
+
+#### 5.3.2 — Forbidden constructs
+
+    - Method calls outside allowlist
+    - Reflection/dynamic invocation
+    - Object creation
+    - Any IO/side effects
+
+---
+
+### 5.4 — .NET complete runtime
+
+#### 5.4.1 — Contracts
+
+```csharp
+public sealed record DecisionRequest(
+    Guid DecisionId,
+    string RuleSetName,
+    IReadOnlyDictionary<string, object?> Facts,
+    string? CorrelationId = null,
+    string? TenantId = null);
+
+public sealed record DecisionResult(
+    Guid DecisionId,
+    string RuleSetName,
+    int RuleSetVersion,
+    IReadOnlyDictionary<string, object?> Outputs,
+    IReadOnlyList<string> Reasons,
+    IReadOnlyList<long> AppliedRuleIds,
+    int DurationMs,
+    string? TraceJson);
+```
+
+#### 5.4.2 — Rule DTO from SQL
+
+```csharp
+public sealed record RuleRow(
+    long RuleId,
+    string RuleSetName,
+    int RuleSetVersion,
+    int Priority,
+    bool StopOnMatch,
+    string ConditionExpr,
+    string OutcomeJson,
+    byte[] ExprHash);
+```
+
+#### 5.4.3 — Repository (Dapper)
+
+```csharp
+using System.Data;
+using Dapper;
+
+public interface IRuleRepository
+{
+    Task<IReadOnlyList<RuleRow>> GetPublishedRulesAsync(string ruleSetName, CancellationToken ct);
+}
+
+public sealed class SqlRuleRepository : IRuleRepository
+{
+    private readonly Func<IDbConnection> _connectionFactory;
+
+    public SqlRuleRepository(Func<IDbConnection> connectionFactory)
+        => _connectionFactory = connectionFactory;
+
+    public async Task<IReadOnlyList<RuleRow>> GetPublishedRulesAsync(string ruleSetName, CancellationToken ct)
+    {
+        using var con = _connectionFactory();
+        var rows = await con.QueryAsync<RuleRow>(
+            new CommandDefinition(
+                "decision.GetPublishedRules",
+                new { RuleSetName = ruleSetName },
+                commandType: CommandType.StoredProcedure,
+                cancellationToken: ct));
+
+        return rows.AsList();
+    }
+}
+```
+
+#### 5.4.4 — Cache key (versioned)
+
+We cache complited delegats by ```(RuleSetName, RuleSetVersion)```. The version comes from the rule rows.
+
+```csharp
+public readonly record struct RuleSetCacheKey(string Name, int Version);
+```
+
+#### 5.4.5 — Compiled rule (cached unit)
+
+```csharp
+public sealed record CompiledRule(
+    long RuleId,
+    bool StopOnMatch,
+    Func<EvalContext, bool> Condition,
+    Action<EvalContext> ApplyOutcome,
+    byte[] ExprHash);
+```
+
+#### 5.4.6 — Evaluation context + trace
+
+```csharp
+using System.Text.Json;
+
+public sealed class EvalContext
+{
+    public IReadOnlyDictionary<string, object?> Facts { get; }
+    public IDictionary<string, object?> Outputs { get; } = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+    public List<string> Reasons { get; } = new();
+    public List<object> Trace { get; } = new();
+
+    public EvalContext(IReadOnlyDictionary<string, object?> facts)
+        => Facts = facts;
+
+    public object? GetValue(string name)
+    {
+        // allow reading outputs as variables as well (for stacking rules)
+        if (Outputs.TryGetValue(name, out var o)) return o;
+        if (Facts.TryGetValue(name, out var f)) return f;
+        return null;
+    }
+
+    public void SetOutput(string key, object? value) => Outputs[key] = value;
+}
+```
+---
+
+### 5.5 — Safe expression evalution
+
+#### 5.5.1 — Allowlist registry
+
+```csharp
+public sealed class ExpressionPolicy
+{
+    public HashSet<string> AllowedIdentifiers { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, Delegate> AllowedFunctions { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public ExpressionPolicy AllowIdentifier(params string[] names)
+    {
+        foreach (var n in names) AllowedIdentifiers.Add(n);
+        return this;
+    }
+
+    public ExpressionPolicy AllowFunction(string name, Delegate fn)
+    {
+        AllowedFunctions[name] = fn;
+        return this;
+    }
+
+    public static ExpressionPolicy Default()
+        => new ExpressionPolicy()
+            .AllowIdentifier(
+                "customer.type",
+                "customer.kycLevel",
+                "customer.hasPriorDefault",
+                "customer.country",
+                "risk.score",
+                "order.amount",
+                "order.channel",
+                "partner.tier",
+                // outputs can be read too:
+                "discountRate",
+                "riskTier",
+                "eligible",
+                "denyReason",
+                "pricingStrategy")
+            .AllowFunction("coalesce", (Func<object?, object?, object?>)((a, b) => a ?? b))
+            .AllowFunction("max", (Func<decimal, decimal, decimal>)((a, b) => Math.Max(a, b)));
+}
+```
+
+#### 5.5.2 — Expression compiler interface
+
+```csharp
+public interface IExpressionCompiler
+{
+    Func<EvalContext, bool> CompileCondition(string expr);
+    Action<EvalContext> CompileOutcome(string outcomeJson);
+    void ValidateCondition(string expr);
+    void ValidateOutcomeJson(string outcomeJson);
+}
+```
+
+#### 5.5.3 — Compiler implementation (validation + compilation + sandbox)
+
+```csharp
+using System.Text.Json;
+using DynamicExpresso;
+
+public sealed class SafeExpressionCompiler : IExpressionCompiler
+{
+    private readonly ExpressionPolicy _policy;
+
+    public SafeExpressionCompiler(ExpressionPolicy policy)
+        => _policy = policy;
+
+    public void ValidateCondition(string expr)
+    {
+        // parse without executing, validate tokens/identifiers
+        _ = BuildInterpreterForValidation();
+        ValidateIdentifiers(expr);
+        // optionally: parse expression to ensure syntactic correctness
+        var interpreter = BuildInterpreterForValidation();
+        interpreter.Parse(expr, typeof(bool));
+    }
+
+    public void ValidateOutcomeJson(string outcomeJson)
+    {
+        using var doc = JsonDocument.Parse(outcomeJson);
+
+        if (!doc.RootElement.TryGetProperty("outputs", out var outputs) || outputs.ValueKind != JsonValueKind.Object)
+            throw new InvalidOperationException("OutcomeJson must contain 'outputs' object.");
+
+        if (doc.RootElement.TryGetProperty("reasons", out var reasons) &&
+            reasons.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("'reasons' must be an array when present.");
+
+        // Validate every expression string inside outputs/reasons
+        foreach (var p in outputs.EnumerateObject())
+        {
+            if (p.Value.ValueKind != JsonValueKind.String)
+                throw new InvalidOperationException($"Output '{p.Name}' must be a string expression.");
+
+            ValidateIdentifiers(p.Value.GetString()!);
+            BuildInterpreterForValidation().Parse(p.Value.GetString()!, typeof(object));
+        }
+
+        if (doc.RootElement.TryGetProperty("reasons", out var rr) && rr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var r in rr.EnumerateArray())
+            {
+                if (r.ValueKind != JsonValueKind.String)
+                    throw new InvalidOperationException("Each reason must be a string expression.");
+
+                ValidateIdentifiers(r.GetString()!);
+                BuildInterpreterForValidation().Parse(r.GetString()!, typeof(object));
+            }
+        }
+    }
+
+    public Func<EvalContext, bool> CompileCondition(string expr)
+    {
+        ValidateCondition(expr);
+
+        return ctx =>
+        {
+            var interpreter = BuildInterpreter(ctx);
+
+            var lambda = interpreter.Parse(expr, typeof(bool));
+            var value = lambda.Invoke();
+
+            return value is bool b && b;
+        };
+    }
+
+    public Action<EvalContext> CompileOutcome(string outcomeJson)
+    {
+        ValidateOutcomeJson(outcomeJson);
+
+        using var doc = JsonDocument.Parse(outcomeJson);
+
+        var outputs = doc.RootElement.GetProperty("outputs");
+        var outputAssignments = outputs.EnumerateObject()
+            .Select(p => (Key: p.Name, Expr: p.Value.GetString()!))
+            .ToList();
+
+        var reasonsExpr = new List<string>();
+        if (doc.RootElement.TryGetProperty("reasons", out var rr) && rr.ValueKind == JsonValueKind.Array)
+            reasonsExpr = rr.EnumerateArray().Select(x => x.GetString()!).ToList()!;
+
+        return ctx =>
+        {
+            var interpreter = BuildInterpreter(ctx);
+
+            foreach (var (key, expr) in outputAssignments)
+            {
+                var lambda = interpreter.Parse(expr, typeof(object));
+                var v = lambda.Invoke();
+                ctx.SetOutput(key, NormalizeJsonScalar(v));
+            }
+
+            foreach (var rexpr in reasonsExpr)
+            {
+                var lambda = interpreter.Parse(rexpr, typeof(object));
+                var v = lambda.Invoke();
+                if (v != null) ctx.Reasons.Add(v.ToString()!);
+            }
+        };
+    }
+
+    private Interpreter BuildInterpreter(EvalContext ctx)
+    {
+        var interpreter = new Interpreter(InterpreterOptions.Default);
+
+        // Expose a single "get" function to access facts/outputs by name
+        interpreter.SetFunction("get", (Func<string, object?>)(name => ctx.GetValue(name)));
+
+        // Bind allowed identifiers as variables resolved via get(name)
+        foreach (var id in _policy.AllowedIdentifiers)
+        {
+            // Variables become calls to get("id")
+            // We'll inject them as parameters by setting variables dynamically:
+            interpreter.SetVariable(id, ctx.GetValue(id));
+        }
+
+        // Bind allowed functions
+        foreach (var (name, fn) in _policy.AllowedFunctions)
+            interpreter.SetFunction(name, fn);
+
+        return interpreter;
+    }
+
+    private Interpreter BuildInterpreterForValidation()
+    {
+        var interpreter = new Interpreter(InterpreterOptions.Default);
+
+        // allow parsing of identifiers and functions only
+        foreach (var id in _policy.AllowedIdentifiers)
+            interpreter.SetVariable(id, null);
+
+        foreach (var (name, fn) in _policy.AllowedFunctions)
+            interpreter.SetFunction(name, fn);
+
+        interpreter.SetFunction("get", (Func<string, object?>)(_ => null));
+
+        return interpreter;
+    }
+
+    private void ValidateIdentifiers(string expr)
+    {
+        // This is intentionally conservative.
+        // Strategy: scan for tokens that look like identifiers with dots: foo.bar
+        // Then enforce allowlist.
+        // In a stricter system, you'd parse AST and walk identifier nodes.
+        var candidates = ExtractIdentifierCandidates(expr);
+
+        foreach (var c in candidates)
+        {
+            // Functions like max(...) are handled separately; ignore if function name.
+            if (_policy.AllowedFunctions.ContainsKey(c)) continue;
+
+            if (!_policy.AllowedIdentifiers.Contains(c) &&
+                !IsLiteralOrKeyword(c))
+                throw new InvalidOperationException($"Identifier '{c}' is not allowed by policy.");
+        }
+    }
+
+    private static IReadOnlyList<string> ExtractIdentifierCandidates(string expr)
+    {
+        // minimal tokenizer: extract sequences of [a-zA-Z0-9_.]
+        // and keep those containing at least one dot (customer.type)
+        var list = new List<string>();
+        var token = new System.Text.StringBuilder();
+
+        void flush()
+        {
+            if (token.Length == 0) return;
+            var t = token.ToString();
+            token.Clear();
+
+            if (t.Contains('.') && t.Any(char.IsLetter))
+                list.Add(t);
+        }
+
+        foreach (var ch in expr)
+        {
+            if (char.IsLetterOrDigit(ch) || ch == '_' || ch == '.')
+                token.Append(ch);
+            else
+                flush();
+        }
+        flush();
+
+        return list;
+    }
+
+    private static bool IsLiteralOrKeyword(string t)
+        => t.Equals("true", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("false", StringComparison.OrdinalIgnoreCase)
+        || t.Equals("null", StringComparison.OrdinalIgnoreCase);
+
+    private static object? NormalizeJsonScalar(object? v)
+    {
+        // Normalize common scalar types to predictable JSON-friendly types
+        return v switch
+        {
+            null => null,
+            int or long or short or byte => Convert.ToInt64(v),
+            float or double or decimal => Convert.ToDecimal(v),
+            bool => v,
+            string => v,
+            _ => v.ToString()
+        };
+    }
+}
+```
+---
+
+### 5.6 — Compilation + caching (compiled delegates per published version)
+
+```csharp
+using Microsoft.Extensions.Caching.Memory;
+using System.Text.Json;
+
+public sealed class CompiledRuleSet
+{
+    public string RuleSetName { get; init; } = default!;
+    public int RuleSetVersion { get; init; }
+    public IReadOnlyList<CompiledRule> Rules { get; init; } = Array.Empty<CompiledRule>();
+}
+
+public interface IRuleSetCompiler
+{
+    CompiledRuleSet Compile(IReadOnlyList<RuleRow> rows);
+}
+
+public sealed class RuleSetCompiler : IRuleSetCompiler
+{
+    private readonly IExpressionCompiler _compiler;
+
+    public RuleSetCompiler(IExpressionCompiler compiler) => _compiler = compiler;
+
+    public CompiledRuleSet Compile(IReadOnlyList<RuleRow> rows)
+    {
+        if (rows.Count == 0)
+            throw new InvalidOperationException("No rules returned for published ruleset.");
+
+        var name = rows[0].RuleSetName;
+        var version = rows[0].RuleSetVersion;
+
+        var compiled = rows
+            .OrderBy(r => r.Priority).ThenBy(r => r.RuleId)
+            .Select(r => new CompiledRule(
+                r.RuleId,
+                r.StopOnMatch,
+                _compiler.CompileCondition(r.ConditionExpr),
+                _compiler.CompileOutcome(r.OutcomeJson),
+                r.ExprHash))
+            .ToList();
+
+        return new CompiledRuleSet
+        {
+            RuleSetName = name,
+            RuleSetVersion = version,
+            Rules = compiled
+        };
+    }
+}
+```
+---
+
+### 5.7 — Decision Engine (complete orchestrator + trace + audit)
+
+```csharp
+using System.Diagnostics;
+using System.Text.Json;
+
+public interface IDecisionLogger
+{
+    Task LogAsync(DecisionRequest req, DecisionResult res, CancellationToken ct);
+}
+
+public sealed class DecisionEngine
+{
+    private readonly IRuleRepository _repo;
+    private readonly IRuleSetCompiler _compiler;
+    private readonly IMemoryCache _cache;
+    private readonly IDecisionLogger _logger;
+
+    public DecisionEngine(IRuleRepository repo, IRuleSetCompiler compiler, IMemoryCache cache, IDecisionLogger logger)
+    {
+        _repo = repo;
+        _compiler = compiler;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public async Task<DecisionResult> EvaluateAsync(DecisionRequest request, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+
+        var rows = await _repo.GetPublishedRulesAsync(request.RuleSetName, ct);
+        var ruleSetName = rows[0].RuleSetName;
+        var version = rows[0].RuleSetVersion;
+
+        var cacheKey = new RuleSetCacheKey(ruleSetName, version);
+
+        // Cache compiled delegates per published version
+        var compiled = _cache.GetOrCreate(cacheKey, entry =>
+        {
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);
+            entry.SlidingExpiration = TimeSpan.FromMinutes(2);
+            return _compiler.Compile(rows);
+        })!;
+
+        var ctx = new EvalContext(request.Facts);
+        var applied = new List<long>();
+
+        foreach (var rule in compiled.Rules)
+        {
+            bool matched;
+            try
+            {
+                matched = rule.Condition(ctx);
+            }
+            catch (Exception ex)
+            {
+                // hard fail (policy decision): invalid runtime evaluation is an incident
+                ctx.Trace.Add(new { ruleId = rule.RuleId, matched = (bool?)null, error = ex.GetType().Name });
+                throw;
+            }
+
+            ctx.Trace.Add(new { ruleId = rule.RuleId, matched });
+
+            if (!matched) continue;
+
+            rule.ApplyOutcome(ctx);
+            applied.Add(rule.RuleId);
+
+            if (rule.StopOnMatch) break;
+        }
+
+        sw.Stop();
+
+        var output = new Dictionary<string, object?>(ctx.Outputs, StringComparer.OrdinalIgnoreCase);
+        var reasons = ctx.Reasons.AsReadOnly();
+
+        var result = new DecisionResult(
+            request.DecisionId,
+            compiled.RuleSetName,
+            compiled.RuleSetVersion,
+            output,
+            reasons,
+            applied.AsReadOnly(),
+            (int)sw.ElapsedMilliseconds,
+            TraceJson: JsonSerializer.Serialize(ctx.Trace));
+
+        await _logger.LogAsync(request, result, ct);
+        return result;
+    }
+}
+```
+
+---
+
+### 5.8 — Decision Logger (persist audit log)
+
+```csharp
+using System.Data;
+using Dapper;
+using System.Text.Json;
+
+public sealed class SqlDecisionLogger : IDecisionLogger
+{
+    private readonly Func<IDbConnection> _connectionFactory;
+
+    public SqlDecisionLogger(Func<IDbConnection> connectionFactory)
+        => _connectionFactory = connectionFactory;
+
+    public async Task LogAsync(DecisionRequest req, DecisionResult res, CancellationToken ct)
+    {
+        using var con = _connectionFactory();
+
+        var inputJson = JsonSerializer.Serialize(req.Facts);
+        var outputJson = JsonSerializer.Serialize(new
+        {
+            outputs = res.Outputs,
+            reasons = res.Reasons
+        });
+
+        var appliedJson = JsonSerializer.Serialize(res.AppliedRuleIds);
+
+        const string sql = @"
+INSERT INTO decision.DecisionLog
+(DecisionId, RuleSetName, RuleSetVersion, RequestedAtUtc, DurationMs, InputJson, OutputJson, AppliedRuleIdsJson, TraceJson, CorrelationId, TenantId)
+VALUES
+(@DecisionId, @RuleSetName, @RuleSetVersion, SYSUTCDATETIME(), @DurationMs, @InputJson, @OutputJson, @AppliedRuleIdsJson, @TraceJson, @CorrelationId, @TenantId);";
+
+        await con.ExecuteAsync(new CommandDefinition(sql, new
+        {
+            DecisionId = res.DecisionId,
+            RuleSetName = res.RuleSetName,
+            RuleSetVersion = res.RuleSetVersion,
+            DurationMs = res.DurationMs,
+            InputJson = inputJson,
+            OutputJson = outputJson,
+            AppliedRuleIdsJson = appliedJson,
+            TraceJson = res.TraceJson,
+            CorrelationId = req.CorrelationId,
+            TenantId = req.TenantId
+        }, cancellationToken: ct));
+    }
+}
+```
+
+---
+
+### 5.9 — Publish-time gate (validation + test vectors)
+
+A publish pipeline **must** reject broken rules.
+
+#### 5.9.1 — Publish workflow 
+
+    1. Load draft ruleset rules
+    2. Validate every ```ConditionExpr```
+    3. Validate every ```OutcomeJson```
+    4. Execute all active tests (```RuleSetTest```)
+    5. If all pass:
+        - call ```decision.PublishRuleSet```
+
+#### 5.9.2 — .NET publish service 
+
+```csharp
+using System.Text.Json;
+using Dapper;
+using System.Data;
+
+public sealed class RuleSetPublisher
+{
+    private readonly Func<IDbConnection> _conFactory;
+    private readonly SafeExpressionCompiler _compiler;
+    private readonly DecisionEngine _engine;
+
+    public RuleSetPublisher(Func<IDbConnection> conFactory, SafeExpressionCompiler compiler, DecisionEngine engine)
+    {
+        _conFactory = conFactory;
+        _compiler = compiler;
+        _engine = engine;
+    }
+
+    public async Task PublishAsync(string ruleSetName, int version, string publishedBy, CancellationToken ct)
+    {
+        // 1) load draft rules
+        var draftRules = await LoadDraftRulesAsync(ruleSetName, version, ct);
+
+        // 2) validate expressions
+        foreach (var r in draftRules)
+        {
+            _compiler.ValidateCondition(r.ConditionExpr);
+            _compiler.ValidateOutcomeJson(r.OutcomeJson);
+        }
+
+        // 3) run test vectors
+        var tests = await LoadTestsAsync(ruleSetName, version, ct);
+        foreach (var t in tests)
+        {
+            var req = new DecisionRequest(
+                DecisionId: Guid.NewGuid(),
+                RuleSetName: ruleSetName,
+                Facts: t.Facts,
+                CorrelationId: $"publish-test:{t.TestId}");
+
+            var result = await _engine.EvaluateAsync(req, ct);
+
+            if (!MatchesExpectedSubset(result.Outputs, result.Reasons, t.Expected))
+                throw new InvalidOperationException($"Publish blocked: test '{t.Name}' failed (TestId={t.TestId}).");
+        }
+
+        // 4) publish in SQL (atomic pointer update)
+        using var con = _conFactory();
+        await con.ExecuteAsync(new CommandDefinition(
+            "decision.PublishRuleSet",
+            new { RuleSetName = ruleSetName, RuleSetVersion = version, PublishedBy = publishedBy },
+            commandType: CommandType.StoredProcedure,
+            cancellationToken: ct));
+    }
+
+    private static bool MatchesExpectedSubset(
+        IReadOnlyDictionary<string, object?> outputs,
+        IReadOnlyList<string> reasons,
+        ExpectedDecision expected)
+    {
+        // ExpectedJson is treated as subset:
+        // - expected.outputs must match (if present)
+        // - expected.reasons must be contained (if present)
+        foreach (var (k, v) in expected.ExpectedOutputs)
+        {
+            if (!outputs.TryGetValue(k, out var actual)) return false;
+            if (!Equals(Normalize(actual), Normalize(v))) return false;
+        }
+
+        foreach (var r in expected.ExpectedReasons)
+            if (!reasons.Contains(r)) return false;
+
+        return true;
+    }
+
+    private static object? Normalize(object? x)
+        => x switch
+        {
+            JsonElement je => je.ToString(),
+            _ => x
+        };
+
+    private async Task<IReadOnlyList<RuleRow>> LoadDraftRulesAsync(string name, int version, CancellationToken ct)
+    {
+        using var con = _conFactory();
+        const string sql = @"
+SELECT
+  r.RuleId,
+  rs.Name AS RuleSetName,
+  rs.Version AS RuleSetVersion,
+  r.Priority,
+  r.StopOnMatch,
+  r.ConditionExpr,
+  r.OutcomeJson,
+  r.ExprHash
+FROM decision.Rule r
+JOIN decision.RuleSet rs ON rs.RuleSetId = r.RuleSetId
+WHERE rs.Name = @Name AND rs.Version = @Version AND rs.Status = 'Draft'
+ORDER BY r.Priority ASC, r.RuleId ASC;";
+
+        var rows = await con.QueryAsync<RuleRow>(new CommandDefinition(sql, new { Name = name, Version = version }, cancellationToken: ct));
+        return rows.AsList();
+    }
+
+    private async Task<IReadOnlyList<TestVector>> LoadTestsAsync(string name, int version, CancellationToken ct)
+    {
+        using var con = _conFactory();
+        const string sql = @"
+SELECT t.TestId, t.Name, t.InputJson, t.ExpectedJson
+FROM decision.RuleSetTest t
+JOIN decision.RuleSet rs ON rs.RuleSetId = t.RuleSetId
+WHERE rs.Name = @Name AND rs.Version = @Version AND rs.Status = 'Draft'
+  AND t.IsActive = 1;";
+
+        var raw = await con.QueryAsync(new CommandDefinition(sql, new { Name = name, Version = version }, cancellationToken: ct));
+
+        var list = new List<TestVector>();
+        foreach (var r in raw)
+        {
+            var facts = JsonSerializer.Deserialize<Dictionary<string, object?>>( (string)r.InputJson )!;
+            var expected = JsonSerializer.Deserialize<ExpectedDecision>( (string)r.ExpectedJson )!;
+            list.Add(new TestVector((long)r.TestId, (string)r.Name, facts, expected));
+        }
+        return list;
+    }
+}
+
+public sealed record ExpectedDecision(
+    Dictionary<string, object?> ExpectedOutputs,
+    List<string> ExpectedReasons);
+
+public sealed record TestVector(long TestId, string Name, Dictionary<string, object?> Facts, ExpectedDecision Expected);
+```
+
+---
+
+### 5.10 — Example (Eligibility + Pricing)
+
+#### 5.10.1 — Facts (normalized)
+
+```json
+{
+  "customer.type": "VIP",
+  "customer.kycLevel": "FULL",
+  "customer.hasPriorDefault": false,
+  "risk.score": 812,
+  "order.amount": 15500.00,
+  "order.channel": "WEB",
+  "partner.tier": "GOLD"
+}
+```
+
+#### 5.10.2 — RuleSet name
+
+    - ```RuleSetName = 'EligibilityAndPricing'```
+    - published pointer points to e.g. ```Version = 42```
+
+#### 5.10.3 — Rule inserted
+
+**Rule 1001 — deny is KYC not FULL (hard stop)**
+
+Condition:
+
+```json
+customer.kycLevel != 'FULL'
+```
+
+Outcome:
+
+```json
+{
+  "outputs": {
+    "eligible": "false",
+    "denyReason": "'KYC_INSUFFICIENT'",
+    "riskTier": "null",
+    "discountRate": "0.0",
+    "pricingStrategy": "'DENY'"
+  },
+  "reasons": [
+    "'ELIGIBILITY_DENIED'",
+    "'KYC_REQUIRED'"
+  ]
+}
+```
+
+**Rule 1010 — VIP high-score base pricing (multi-hit)**
+
+Condition:
+
+```json
+customer.type == 'VIP' && risk.score >= 800 && order.amount >= 10000
+```
+
+Outcome:
+
+```json
+{
+  "outputs": {
+    "eligible": "true",
+    "riskTier": "'A'",
+    "discountRate": "0.10",
+    "pricingStrategy": "'VIP_HIGH_SCORE'"
+  },
+  "reasons": [
+    "'VIP_CUSTOMER'",
+    "'HIGH_RISK_SCORE'",
+    "'HIGH_AMOUNT'"
+  ]
+}
+```
+**Rule 1020 — GOLD partner web override (multi-hit, stacks)
+
+Condition:
+
+```json
+partner.tier == 'GOLD' && order.channel == 'WEB'
+```
+
+Outcome:
+
+```json
+{
+  "outputs": {
+    "discountRate": "max((decimal)get('discountRate'), 0.12)",
+    "partnerBenefit": "'GOLD_WEB_BONUS'"
+  },
+  "reasons": [
+    "'PARTNER_TIER_GOLD'",
+    "'WEB_CHANNEL_BONUS'"
+  ]
+}
+```
+
+**Rule 1099 — default fallback finalize (stop)**
+
+Condition:
+
+```json
+true
+```
+
+Outcome:
+
+```json
+{
+  "outputs": {
+    "eligible": "coalesce(get('eligible'), true)",
+    "riskTier": "coalesce(get('riskTier'), 'B')",
+    "discountRate": "coalesce((decimal)get('discountRate'), 0.00)",
+    "pricingStrategy": "coalesce(get('pricingStrategy'), 'DEFAULT')"
+  },
+  "reasons": [
+    "'DEFAULT_FALLBACK'"
+  ]
+}
+```
+
+---
+
+#### 5.10.4 — Expected runtime output
+
+Given the facts above, the expected output is:
+
+```json
+{
+  "eligible": true,
+  "riskTier": "A",
+  "discountRate": 0.12,
+  "pricingStrategy": "VIP_HIGH_SCORE",
+  "partnerBenefit": "GOLD_WEB_BONUS",
+  "reasons": [
+    "VIP_CUSTOMER",
+    "HIGH_RISK_SCORE",
+    "HIGH_AMOUNT",
+    "PARTNER_TIER_GOLD",
+    "WEB_CHANNEL_BONUS",
+    "DEFAULT_FALLBACK"
+  ],
+  "appliedRuleIds": [1010, 1020, 1099]
+}
+```
+
+And ```DecisionLog.TraceJson``` will resemble:
+
+```json
+[
+  { "ruleId": 1001, "matched": false },
+  { "ruleId": 1010, "matched": true },
+  { "ruleId": 1020, "matched": true },
+  { "ruleId": 1099, "matched": true }
+]
+```
+
+---
+
+## 6. Design trade-offs
+
+|Aspect                             |Expression Decision Tables                           | Hardcoded Logic |
+|:----------------------------------|:----------------------------------------------------|:----------------|
+|Flexibility                        |High                                                 |Low              |
+|Runtime Safety                     |Medium (must be enforced)                            |High             |
+|Change Velocity                    |High                                                 |Low              |
+|Debug Complexity                   |Higher                                               |Lower            |
+|Auditability                       |First-class                                          |Emergent         |
+
+#### What you gain:
+
+    - Decoupled decision evolution
+    - Centralized rule visibility
+    - Faster business response
+
+#### What you give up:
+
+    - Compile-time guarantees
+    - Simplicity of static code paths
+
+#### What you implicitly accept:
+
+    - Runtime validation responsibility
+    - Operational discipline requirements
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### “Expressions are just config”
+
+Why it happens:
+
+    - Underestimation of execution power
+
+Problem:
+
+    - Unvalidated expressions become production code
+
+Avoidance:
+
+    - Treat expressions as code: validate, test, version
+
+---
+
+### “SQL should evaluate everything”
+
+Why it happens:
+
+    - Desire to keep logic close to data
+
+Problem:
+
+    - Dynamic SQL evaluation becomes unsafe and opaque
+
+Avoidance:
+
+    - Use SQL for selection, not arbitrary execution
+
+---
+
+### “Anyone can edit rules”
+
+Why it happens:
+
+    - Business enablement pressure
+
+Problem:
+
+    - Production outages caused by invalid logic
+
+Avoidance:
+
+    - Gate rule changes through validation pipelines
+
+---
+
+## 8. Operational and production considerations
+
+Once deployed:
+
+    - **Monitor**
+        - Rule evaluation failures
+        - Evaluation latency
+        - Rule hit distribution
+    - **Degrades first**
+        - CPU due to expression compilation
+        - Cache churn when rules change frequently
+    - **Becomes expensive**
+        - Overly granular rules
+        - Excessive expression complexity
+
+     Operational risks:
+        - Expression injection
+        - Version drift
+        - Silent rule shadowing
+
+    Observability signals:
+        - RuleId in logs
+        - Input snapshot hashes
+        - Outcome traces
+
+---
+
+## 9. When NOT to use this
+
+Do not use Expression Decision Tables when:
+
+    - Decision logic is stable and rarely changes
+    - Latency budgets are sub-millisecond
+    - Failures must be caught at compile time
+    - The team lacks operational maturity
+
+---
+
+## 10. Key takeaways
+
+    - Treat decisions as data only when change velocity justifies it
+    - Expression power must be matched with strict validation
+    - SQL is a registry and selector, not an execution engine
+    - Ordering and versioning are non-negotiable
+    - Auditability should be designed, not retrofitted
+    - Dynamic rules shift risk from build-time to runtime
+    - Operational discipline determines success more than syntax
+
+---
+
+## 11. Extra
+
+### "_Do Expression Decision Tables replace business rules?_"
+
+No. **Expression Decision Tables do not replace domain business rules**.
+They relocate **volatile decision policies** out of code and define **how those policies are governed**.
+
+They eliminate:
+
+    - Scattered ```if/else``` for volatile rules
+    - Redeployments for policy changes
+    - Hidden decision without audit or explanation
+
+They do **not** replace domain invariants, state transitions or core processes.
+
+---
+
+#### The correct mental model
+
+
+> **Domain code protects invariants and processes.**
+>
+> **Decision Tables govern policies and decisions.**
+
+Expression Decision Tables are a **policy mechanism**, not domain model.
+
+---
+
+### A simple decision heuristic
+
+Ask three questions:
+
+    1. **If this rule changes tomorrow, would I accept a redeploy?**
+        - If **no**, it's a candidate.
+    2. **If this rule is misconfigured, can the system become inconsistent?**
+        - If **yes**, keep in the domain or behind strong guardrails.
+    3. **Is this a pure decision** (```facts → outputs```)**?**
+        - If **yes**, it's a good fit.
+
+---
+
+### Decision Framework: Should this be an Expression Decision Table?
+
+#### Table-fit score (0–10)
+
+Add the points:
+
+**Volatility & governance**
+
+    - Changes without redeploys (+2)
+    - Needs fast rollback (+1)
+    - Requires explainability (+2)
+
+**Logic shape**
+
+    - Pure decision (+2)
+    - High combinatorial complexity (+1)
+    - Expressible via bounded DSL (+1)
+
+**Operational risk**
+
+    - Error tolerable with fallback (+1)
+    - Error breaks invariants (−3)
+
+**Interpretation**
+
+    - ≥7 → strong candidate
+    - 4–6 → hybrid
+    - ≤3 → domain code
+ 
+---
+
+## 12. High-Level Overview
+
+> Visual representation of Expression Decision Tables, emphasizing bounded evaluation, versioned policies, deterministic execution, and auditability.
+
+import Light from './_assets/expression-decision-table-mssql-light.svg';
+import Dark from './_assets/expression-decision-table-mssql-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Expression Decision Table SQL Server high-level overview"
+  height={460}
+/>
+
