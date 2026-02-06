@@ -48,7 +48,7 @@ In early systems, sharing models feels efficient.
 
 At scale, it becomes a liability.
 
-### Typical pressures that force bounded contexts
+### Typical pressures that force bounded contexts:
 
     - Multiple teams acting on the same core concepts with different goals
     - External authorities imposing schemas and lifecycles you do not control
@@ -56,7 +56,7 @@ At scale, it becomes a liability.
     - The need to ship independently without synchronized releases
     - Diverging performance and consistency requirements for the same data
 
-### What breaks when bounded contexts are ignored
+### What breaks when bounded contexts are ignored:
 
     - **Semantic drift**: the same term ("Contract", "Customer", "Approval") slowly acculates incompatible rules
     - **Invariant erosion**: rules are bypassed because "another service updated the table"
@@ -64,7 +64,7 @@ At scale, it becomes a liability.
     - **Authorization leakage**: access rules are duplicated inconsistently
     - **Fear-driven development**: teams stop improving models to avoid breaking others
 
-### Why simpler approaches stop working
+### Why simpler approaches stop working:
 
     - Layered architecture controls _dependencies_, not _meaning_
     - Modular folders do not enforce ownership

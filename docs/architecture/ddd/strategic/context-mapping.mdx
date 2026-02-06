@@ -1,0 +1,406 @@
+---
+id: context-mapping
+title: Context Mapping
+slug: /architecture/ddd/strategic/context-mapping
+description: Formalizing context mapping decisions as versioned, enforceable architecture records to govern integration, ownership, and evolution in distributed systems.
+sidebar_label: Context Mapping
+keywords: [context mapping, bounded context, architecture desion records, distributed systems architecture, domain-driven design]
+sidebar_position: 20
+---
+
+## 1. What this document is about
+
+This document covers **Context Mapping Desicion Records (CMDR)** as a formal mechanism to **design, 
+govern, and evolve relationships between [bounded contexts](./bounded-contexts.mdx)** over time.
+
+It explains:
+
+    - How context mapping decisions emerge in real systems
+    - Why informal context maps inevitably decay
+    - How to capture, version, review, and operate context relationships as architectural decisions
+    - How those decisions influence APIs, events, schemas, ownership, and team autonomy
+    - How CMDR acts as a bridge between ***DDD strategic design** and **operational governance**
+
+This document applies to:
+
+    - Multi-team systems with independent deployment
+    - Long-lived enterprise platforms
+    - Systems with non-trivial integration surfaces (APIs, events, data contracts)
+    - Environments where contracts and ownership change over time
+
+This document does **not** apply to:
+
+    - Single-team or short-lived systems
+    - Greenfield systems without external integrations
+    - Systems where all components evolve in lockstep
+    - Teams not willing to enforce decisions operationally
+
+---
+
+## 2. Why this matters in real systems
+
+Context mapping problems do not appear at design time.
+
+They appear **months or years later**, under pressure
+
+### Typical pressures:
+
+    - Teams ship independently and optimize locally
+    - Domain language evolves unevenly
+    - Integrations accumulate without global visibility
+    - Ownership becomes implicit instead of explicit
+    - Contracts change faster than consumers adapt
+
+### What breaks when context mapping is ignored:
+
+    - Hidden coupling through shared concepts
+    - APIs that slowly become “least common denominator” models
+    - Events that leak internal domain concepts
+    - Teams unsure who owns a rule, a concept, or a decision
+    - Production incidents caused by incompatible assumptions
+
+### Why simpler approaches stop working:
+
+    - Static context maps become outdated immediately
+    - Wiki diagrams don’t capture _why_ a relationship exists
+    - ADRs document decisions, but not **inter-context semantics**
+    - Governance happens socially (meetings) instead of technically (constraints)
+
+CMDR emerges when teams realize that **the cost of unclear context relationships exceeds the cost of formalizing them**.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of CMDR as a **versioned contract for how two bounded contexts are allowed to interact**.
+
+Not just _that_ they interact — but:
+
+    - **Why** they interact
+    - **How** they interact
+    - **Who** owns what
+    - **What is stable**
+    - **What is allowed to change**
+    - **Under which assumptions**
+
+### Mental model: lifecycle of a context relationship
+
+    1. A need for collaboration emerges
+    2. A relationship is chossen (e.g. Customer-Supplier)
+    3. An integration style is selected (API, events, translation)
+    4. Responsibilities and ownership are defined
+    5. Constraints are declare (stability, versioning, SLAs)
+    6. The decision is recorded and versioned
+    7. The decision is enforced in code and pipelines
+    8. The relationship evolves or is retired
+
+By the end of this lifecycle, the relationship itself becomes a **first-class architectural artifact**.
+
+If you can reason about the relationship without reading code, CMDR is doing its job.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Identify the bounded contexts involved
+
+What happens:
+
+    - Explicitly name the contexts involved
+    - Declare their boundaries and primary responsibilities
+
+Why it exists:
+
+    - Context ambiguity is the root cause of coupling
+
+Assumptions:
+
+    - Contexts have clear ownership
+    - Teams agree on boundaries (even if imperfect)
+
+Invariant:
+
+    - A context owns its model internally
+
+---
+
+### Step 2 — Choose the relationship type
+
+Examples:
+
+    - Customer-Supplier
+    - Conformist
+    - Anti-Corruption Layer
+    - Partnership
+    - Open Host Service
+
+Why it exists:
+
+    - Relationship type define power, stability and change cost
+
+Assumptions:
+
+    - Power asymmetry is acknowledged, not hidden
+
+Invariant:
+
+    - The upstream/downstream direction must be explicit
+
+---
+
+### Step 3 — Select the integration style
+
+Options include:
+
+    - synchronous API
+    - Asynchronous events
+    - Data replication
+    - Translation layer
+
+Why it exists:
+
+    - Integration style determines latency, coupling and failure modes
+
+Assumptions:
+
+    - Teams understand eventual consistency implications
+
+Invariant:
+
+    - Integration style aligns with business criticality
+
+---
+
+### Step 4 — Define ownership and responsibilities
+
+Explicitly define:
+
+    - Who owns the contract
+    - Who bears breaking-change cost
+    - Who adapts to whom
+
+Why it extis:
+
+    - Ownership ambiguity causes production incidents
+
+Invariant:
+
+    - Ownership is never shared implicitly
+
+---
+
+### Step 5 — Capture constraints and evolution rules
+
+Examples:
+
+    - Backward compatibility rules
+    - Versioning strategy
+    - Deprecation windows
+    - Stability guarantees
+
+Why it exists:
+
+    - Evolution without rules equals entropy
+
+Invariant:
+
+    - Constraints are enforceable, not aspirational
+
+---
+
+### Step 6 — Record as a CMDR
+
+A CMDR includes:
+
+    - Contexts involved
+    - Relationship type
+    - Integration style
+    - Rationale
+    - Alternatives considered
+    - Trade-offs
+    - Constrains
+    - Status (active, superseded, retired)
+
+This is not documentation for documentation's sake.
+
+It is a **decision artifact**.
+
+---
+
+## 5. Minimal but realistic example 
+
+
+### Scenario
+
+    - ```Billing``` context depends on ```CustomerProfile```
+    - ```CustomerProfile``` evolves frequently
+    - Billing requires stable customer identifiers, not full models
+
+### CMDR 
+
+```
+CMDR-004: Billing → CustomerProfile Relationship
+
+Relationship: Customer–Supplier
+Integration Style: Asynchronous Events
+Ownership: CustomerProfile owns schema, Billing adapts
+Stability: Identifier fields are stable; attributes are not
+Constraints:
+- Events must be backward compatible
+- Breaking changes require 90-day deprecation
+Status: Active
+```
+
+### C# consumer example
+
+```csharp
+public sealed record CustomerIdentityChanged(
+    Guid CustomerId,
+    string ExternalReference,
+    int SchemaVersion
+);
+
+public sealed class BillingCustomerProjection
+{
+    public void Apply(CustomerIdentityChanged @event)
+    {
+        // Only consume explicitly allowed fields
+        UpdateCustomerReference(
+            @event.CustomerId,
+            @event.ExternalReference
+        );
+    }
+}
+```
+
+Mapping to the concept:
+
+    - Billing does not consume the full Customer model
+    - Schema versioning aligns with CMDR constraints
+    - Consumer responsibility is explicit
+
+---
+
+## 6. Design trade-offs
+
+|Aspect                    |CMDR                    |Informal Context Mapping            |
+|:-------------------------|:-----------------------|:-----------------------------------|
+|Decision visibility       |High                    |Low                                 |
+|Evolution control         |Explicit                |Ad-hoc                              |
+|Governance cost           |Higher upfront          |Paid later in incidents             |
+|Flexibility               |Constrained             |Illusory                            |
+|Operational safety        |High                    |Fragile                             |
+
+What you gain:
+
+    - Predictable evolution
+    - Reduced integration entropy
+    - Clear ownership
+
+What you give up:
+
+    - Speed of informal decisions
+    - Freedom to "just integrate"
+
+What you implicitly accept:
+
+    - Architecture is a socio-technical system
+    - Decisions have operational cost
+
+---
+
+## 7. Common mistakes and misconceptions
+
+
+### "This is just documentation”
+
+Why it happens:
+
+    - Engineers associate records with bureaucracy
+
+Problem:
+
+    - Decisions aren’t enforced
+
+Avoid by:
+
+    - Tie CMDRs to pipelines and contracts
+
+---
+
+### "We already have ADRs"
+
+Why it happens:
+
+    - ADRs feel sufficient
+
+Problem:
+
+    - ADRs lack semantic relationship modeling
+
+Avoid by:
+
+    - Treat CMDR as complementary, not redundant
+
+---
+
+### "We can decide this later"
+
+Why it happens:
+
+    - Pressure to ship
+
+Problem:
+
+    - Implicit decisions harden into constraints
+
+Avoid by:
+
+    - Record provisional CMDRs early
+
+---
+
+
+## 8. When NOT to use this
+
+Do not use CMDR when:
+
+    - One team owns everything
+    - Integration lifespan is short
+    - Context boundaries are still experimental
+    - Enforcement mechanisms don't exists
+    - Teams are unwilling to honor constraints
+
+CMDR adds friction by design.
+
+It friction is not your problem, don't add it.
+
+---
+
+## 9. Key takeaways
+
+    - Context relationships are architectural decisions, not diagrams
+    - Unrecorded decisions still exist — they’re just invisible
+    - Ownership must be explicit or it will be assumed
+    - Evolution without constraints creates hidden coupling
+    - CMDR shifts cost from incidents to design time
+    - Governance must be executable to be real
+    - Strategic design only matters if it survives contact with production
+
+---
+
+## 10. High-Level Overview
+
+> Visual representation of context mapping, highlighting explicit relationships between bounded contexts, integration patterns, semantic ownership, and controlled evolution without tight coupling.
+
+import Light from './_assets/context-mapping-light.svg';
+import Dark from './_assets/context-mapping-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Context mapping"
+  height={400}
+/>
