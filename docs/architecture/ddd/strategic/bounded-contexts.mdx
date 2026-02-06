@@ -1,0 +1,403 @@
+---
+id: bounded-contexts
+title: Bounded Contexts
+slug: /architecture/ddd/strategic/bounded-contexts
+description: Guide to designing bounded contexts in enterprise systems, covering ownership, integration contracts, evolution, and real-world constraints.
+sidebar_label: Bounded Contexts
+keywords: [bounded contexts, domain-driven design, service boundaries, enterprise architecture, integration contracts]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document covers **Bounded Contex** as a **first-class architectural boundary** used to control semantic complexity, ownership 
+and evolution in large-scale enterprise systems.
+
+It explains:
+
+    - How bounded contexts emerge from **real system pressures**, not theory
+    - How they define **ownership of meaning, data and change**
+    - How they are **enforced technically (code, data, runtime, integration)
+    - How they **fail in production** when treated as a modeling exercise only
+
+This document applies to:
+
+    - Multi-team, long-lived systems
+    - Regulated domains with audit and compliance constraints
+    - Modular monoliths and distrbuted systems
+    - Platforms evolving under constant integration pressure
+
+This document does **not** apply to:
+
+    - Small, stable systems with a single team
+    - CRUD-centric applications with no semantic tension
+    - Short-lived products where long-term evolution is irrelevant
+
+Bounded Contexts exist to **preserve autonomy under growth**.
+
+If growth is not a concern, this is unnecessary structure.
+
+---
+
+## 2. Why this matters in real systems
+
+Bounded Contexts appear when **semantic ambiguity becomes operational risk**.
+
+In early systems, sharing models feels efficient.
+
+At scale, it becomes a liability.
+
+### Typical pressures that force bounded contexts
+
+    - Multiple teams acting on the same core concepts with different goals
+    - External authorities imposing schemas and lifecycles you do not control
+    - Regulatory rules that apply to _same_ workflows but not others
+    - The need to ship independently without synchronized releases
+    - Diverging performance and consistency requirements for the same data
+
+### What breaks when bounded contexts are ignored
+
+    - **Semantic drift**: the same term ("Contract", "Customer", "Approval") slowly acculates incompatible rules
+    - **Invariant erosion**: rules are bypassed because "another service updated the table"
+    - **Release coupling**: changes require cross-team coordination and freeze windows
+    - **Authorization leakage**: access rules are duplicated inconsistently
+    - **Fear-driven development**: teams stop improving models to avoid breaking others
+
+### Why simpler approaches stop working
+
+    - Layered architecture controls _dependencies_, not _meaning_
+    - Modular folders do not enforce ownership
+    - Shared databases optimize for convenience, not correctness
+    - "We'll just be careful" collapses under team turnover and time pressure
+
+Bounded Contexts are the **only scalable mechanism** for containing meaning while allowing independent change.
+
+---
+
+## 3. Core concept (mental model)
+
+A bounded context is a **jurisdiction of meaning and authority**.
+
+Inside a bounded context:
+
+    - Teams have **exact definitions**
+    - Invariants are **locally enforceable**
+    - Data mutations are **owned**
+    - Change decisions are **internal**
+
+Across bounded contexts:
+
+    - Meaning is **translated**, never shared
+    - Consistency is **eventual and negotiated**
+    - Integration is **explicit and versioned**
+    - Failures are **contained by design**
+
+A boundary is real only if it exists simultaneously in three dimensions:
+
+    1. **Semantic boundary** — a distinct ubiquitous language
+    2. **Ownership boundary** — a clear team accountable for change and incidents
+    3. **Data boundary** — exclusive control over writes and invariants
+
+If one of these is missing, the boundary is cosmetic.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Detect semantic pressure
+
+Look for signals, not diagrams:
+
+    - Same entity name with different attributes or lifecycles
+    - Tables with many nullable columns "for other use cases"
+    - Events that grow endlessly to satisfy all consumers
+    - Cross-team pull requests that feel like negotiations
+    - Authorization rules duplicated in multiple places
+
+High-signal diagnostic question:
+
+> "If we change this rule, who breaks?"
+
+Multiple answers mean shared meaning — and therefore no boundary.
+
+---
+
+### Step 2 — Define bounded context explicitly
+
+A bounded context must be **declared**, not inferred.
+
+Minumum definition:
+
+    - Purpose and responsibilities
+    - Ubiquitous Language (teams + precise definitions)
+    - Owned invariants
+    - Owned data (tables, streams)
+    - Inbound contracts (commands, queries)
+    - Outbound contracts (events, APIs)
+    - Explicit non-responsibilities
+
+Non-responsibilities are critical.
+
+Most boundary violations start as "just this one exception".
+
+--
+
+### Step 3 — Enforce ownership in code
+
+Ownership must be technically enforceable.
+
+Minumum enforcement rules:
+
+    - No cross-context domain references
+    - No shared ORM entities
+    - No direct database writes across contexts
+    - Integration only via contracts (DTOs, events)
+
+If violating a boundary is easy, it will happen under pressure.
+
+---
+
+### Step 4 — Integrate via translation, not reuse
+
+Integration always implies **semantic translation**.
+
+Acceptable mechanisms:
+
+    - Published Language DTOs
+    - Event-driven projections
+    - Anti-Corruption Layers
+    - API composition at the edge
+
+Unacceptable mechanisms:
+
+    - Shared domain models
+    - Shared persistence
+    - Read-only shortcuts that later become writes
+
+---
+
+### Step 5 — Enable independent evolution
+
+A bounded context is successful when it can:
+
+    - Change internal models without coordination
+    - Version contracts without breaking consumers
+    - Fail without cascading corruption
+    - Be extracted or rewritten if needed
+
+If deployment, schema or rule require synchronized teams, the boundary is already broken.
+
+---
+
+## 5. Minimal but realistic example 
+
+### Scenario
+
+A regulated financial platform with two bounded contexts:
+
+    - **Contract Management**
+    - **Risk & Compliance**
+
+Both deal with "Contract", but with incompatible semantics.
+
+---
+
+### Contract Management Context
+
+```csharp
+// ContractManagement.Domain
+
+public sealed class Contract
+{
+    public ContractId Id { get; }
+    public TenantId TenantId { get; }
+    public ContractStatus Status { get; private set; }
+    public Money PrincipalAmount { get; }
+    public DateOnly SignedAt { get; }
+
+    public void Activate()
+    {
+        if (Status != ContractStatus.Draft)
+            throw new DomainException("Only draft contracts can be activated.");
+
+        Status = ContractStatus.Active;
+    }
+}
+```
+
+This context owns:
+
+    - Contract lifecycles
+    - Financial invariants
+    - Legal activation rules
+
+---
+
+### Risk & Compliance Context
+
+```csharp
+// RiskCompliance.Domain
+
+public sealed class RiskExposure
+{
+    public ExposureId Id { get; }
+    public ExternalContractReference ContractRef { get; }
+    public RiskScore Score { get; private set; }
+    public DateTime AssessedAt { get; private set; }
+
+    public void Recalculate(RiskFactors factors)
+    {
+        Score = RiskScore.Calculate(factors);
+        AssessedAt = DateTime.UtcNow;
+    }
+}
+```
+
+This context does **not** model contracts.
+
+It models **risk exposuse**, derived from contracts.
+
+---
+
+### Integration via event
+
+```csharp
+public record ContractActivated(
+    string ContractId,
+    string TenantId,
+    decimal PrincipalAmount,
+    DateOnly SignedAt,
+    int SchemaVersion
+);
+```
+
+The Risk context projects what it needs.
+
+No shared entities. No shared invariants.
+
+---
+
+## 6. Design trade-offs
+
+|Decision                    |What you gain                     |What you give up                    |What you accept                    |
+|:---------------------------|:---------------------------------|:-----------------------------------|:----------------------------------|
+|Strong boundaries           |Independent evolution             |Duplication                         |Translation cost                   |
+|Separate models             |Clear ownership                   |More code                           |Semantic drift risk                |
+|Async integration           |Resilience                        |Latency                             |Stale reads                        |
+|Schema isolation            |Safety                            |Infra cost                          |Operational overhead               |
+
+Bounded Contexts trade **local simplicity** for **system survivability**.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+
+### "We'll share the entity byt respect boundaries"
+
+Why it happens:
+
+    - convenience
+
+Problem:
+
+    - semantic coupling
+
+Avoid by:
+
+    - forbidding shared write models
+
+---
+
+### "Bounded Context equals microserve"
+
+Why it happens:
+
+    - tooling bias
+
+Problem:
+
+    - premature distribution
+
+Avoid by:
+
+    - enforcing boundaries inside a modular monolith first
+
+---
+
+### "Read models are safe to share"
+
+Why it happens:
+
+    - performance shortcuts
+
+Problem:
+
+    - invisble coupling
+
+Avoid by:
+
+    - duplicating projections intentionally
+
+---
+
+### "The database is the source of truth"
+
+Why it happens:
+
+    - legacy mindset
+
+Problem:
+
+    - invariants bypassed
+
+Avoid by:
+
+    - treating the domain model as the authority
+
+---
+
+## 8. When NOT to use this
+
+Do not use bounded context when:
+
+    - One team owns the entire system
+    - The domain language is stable and trivial
+    - Data has no lifecycle complexity
+    - Delivery speed matters more than long-term correctness
+    - You are unwilling to enforce boundaries consistently
+
+Bounded Contexts introduce **intentional friction**.
+
+Without payoff, that friction is waste.
+
+---
+
+## 9. Key takeaways
+
+    - A bounded context is a **semantic and ownership boundary**, not a deployment unit
+    - Shared meaning without shared ownership is the root of coupling
+    - Integration is translation; resuse is coupling
+    - Data ownership defines invariant authority
+    - Versioning policies are mandatory at scale
+    - Modular monoliths with strong boundaries outperform weak microservices
+    - If teams cannot evolve independently, the boundary is broken
+
+---
+
+## 10. High-Level Overview
+
+> Visual representation of bounded contexts, highlighting semantic ownership, enforced boundaries, contract-based integration, and independent evolution across domains.
+
+import Light from './_assets/bounded-contexts-light.svg';
+import Dark from './_assets/bounded-contexts-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Bounded Contexts"
+  height={660}
+/>
