@@ -1,19 +1,20 @@
-facebook:
-  label: Facebook
-  permalink: /facebook
-  description: Facebook tag description
+devops:
+  label: DevOps
+  description: Engineering practices for building, deploying, and operating software at scale.
 
-hello:
-  label: Hello
-  permalink: /hello
-  description: Hello tag description
+continuous-delivery:
+  label: Continuous Delivery
+  description: Techniques and pipelines for safely delivering software to production continuously.
 
-docusaurus:
-  label: Docusaurus
-  permalink: /docusaurus
-  description: Docusaurus tag description
+sre:
+  label: Site Reliability Engineering
+  description: Applying software engineering principles to operations and system reliability.
 
-hola:
-  label: Hola
-  permalink: /hola
-  description: Hola tag description
+cicd:
+  label: CI/CD
+  description: Continuous Integration and Continuous Deployment pipelines and automation.
+
+production:
+  label: Production Systems
+  description: Real-world concerns of running and operating software in production environments.
+

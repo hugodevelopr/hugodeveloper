@@ -1,0 +1,518 @@
+---
+title: How We Ship Software Every Day (And Sleep at Night)
+date: 2026-02-05
+slug: /shipping-software-every-day
+description: A real-world look at how mature engineering teams ship software daily using automation, safety nets, and production-grade DevOps practices.
+tags: [devops, continuous-delivery, sre, cicd, production]
+---
+
+Shipping software every day isn’t about speed or heroics.
+It’s about designing systems that allow engineers to build, deploy, fail, recover, and learn without fear.
+
+This post walks through a normal day in a production-grade DevOps environment — including the moments when everything goes wrong.
+
+<!-- truncate -->
+
+
+## 🧑‍💻 Monday, 09:12 — I start my day
+
+I have a clear requirement:
+
+**Add a new rule validation to the contract flow."**
+
+I create a branch
+
+```bash
+git checkout -b feat/contract-rule-validation
+```
+
+I Start coding.
+
+While writing the code:
+
+    - the rule is isolated in the domain layer
+    - unit tests cover both the happy path and edge cases
+    - I'm not thinking about the pipeline — **the system already expects me to do the bare minimum propertly**
+
+When I'm done:
+
+```bash
+git commit -m "feat(domain): add contract rule validation"
+git push
+```
+
+---
+
+## ⚙️ 09:26 — branch pipeline kicks in (without getting in my way)
+
+While I grab a coffee, the pipeline runs:
+
+    - cached build
+    - unit tests
+    - linting
+    - fast SAST scan
+    - breaking change detection (API contracts)
+
+In **4 minutes**, I get the result:
+
+✅ all green
+
+No blocked environments.
+No queues.
+No waiting
+
+---
+
+## 🔀 09:35 — I open the Pull Request
+
+I open the PR.
+
+    - the PR pipeline starts
+    - **an ephemeral environment is created automatically**
+
+No approvals.
+No requests.
+No Slack messages.
+
+I get an automated comment on the PR:
+
+> **Ephemeral environment ready**:
+>
+> https://pr-842.dev.company.com
+
+---
+
+## 🌍 09:45 — my code is already running
+
+In that environment:
+
+    - a container with my code
+    - an isolated database
+    - mocked dependencies
+    - logs, metrics and distributed traces fully wired
+
+QA validates the real flow.
+
+Product click through the feature.
+
+Another engineer tests an edge case.
+
+
+Meanwhile, in parallel:
+
+    - integration tests are running
+    - contract tests are running
+    - selective E2E tests are running
+
+Everything happens concurrently.
+
+---
+
+## 👀 10:30 — real human review
+
+A tech lead joins the PR.
+
+He **doesn't comment on formatting.**
+
+He **doesn't argue about naming.**
+
+He **doesn't ask for basic tests.**
+
+<br/>
+
+Instead, he asks:
+
+> "Should this rule live here, or in bounded context X?"
+
+We discuss.
+
+I adjust the design.
+
+I push another commit:
+
+```bash
+refactor(domain): align rule with contract context
+```
+
+The pipeline runs agains.
+
+The ephemeral environment updates automatically.
+
+---
+
+## ✅ 11:15 — PR approved and merged
+
+I merge into ```main```.
+
+There's no ceremony.
+
+No one "authorizes" a deployment.
+
+---
+
+## 🏗️ 11:16 — an immutable artifact is born
+
+The main pipeline does the following:
+
+    - final build
+    - full test suite
+    - SBOM generation
+    - container vulnerability scanning
+    - artifact signing
+    - automatic versioning (e.g. ```1.12.0```)
+
+This container is now **the law**.
+
+The same artifact will go all the way to production.
+
+---
+
+## 🚀 11:25 — automatic deployment to DEV
+
+Without me asking for anything:
+
+    - the artifact is deployed to DEV
+    - smoke tests run
+    - metrics start flowing
+
+DEV is noisy.
+
+It's continuous integration of everything.
+
+---
+
+## 🎭 13:00 — automatic promotion to STAGING
+
+The system decides — not a human.
+
+Since everything passed:
+
+    - the same container is promoted to STAGING
+    - realistic database
+    - near-production data
+    - full E2E suite
+    - DAST
+    - performance sanity checks
+
+I move on to another task.
+
+I'm not "waiting for staging."
+
+---
+
+## 🚦 16:40 — ready for production
+
+STAGING is green.
+
+Release notes are already generated.
+
+Versioning is locked.
+
+No on asks in Slack:
+
+> "Can we deploy?"
+
+The pipeline creates a **release candidate** marked as _ready_.
+
+---
+
+## 🕊 Tuesday, 10:00 — production, no drama
+
+The release is a single click
+
+(or fully automated depending on the product).
+
+Production rollout starts like this:
+
+    - 5% of pods receive traffic (canary)
+    - metrics under observation:
+        - error rate
+        - latency
+        - saturation
+        - critical logs
+
+After 10 minutes:
+
+    - all good → 25%
+    - then 50%
+    - then 100%
+
+If anything goes wrong:
+
+    - automatic rollback
+    - no one wakes up at 3 AM
+
+---
+
+# 🔥 The day everything went wrong
+
+---
+
+## 🕘 Tuesday, 10:07 — production starts burning
+
+The deployment started as usual:
+
+    - 5% canary
+    - green metrics in the first minutes
+
+Then:
+
+    - HTTP 500s start rising
+    - P95 latency doubles
+    - a specific flow explodes
+
+No one "noticed by chance."
+
+---
+
+## 🚨 10:08 — the system notices before a human
+
+Alerts fire automatically:
+
+    - error rate > SLO
+    - correlation with version ```1.12.0```
+    - canary tag detected
+
+Slack receives:
+
+>   **Canary degradation detected**
+>   Service: contract-api
+>   Version: 1.12.0
+>   Action: rollback initiated
+
+No one decides.
+**The system acts.**
+
+---
+
+## 🔄 10:09 — automatic rollback
+
+The pipeline:
+
+    - cuts traffic to the canary
+    - rolls back to version ```1.11.3``` (last healthy)
+    - keeps old pods warm
+    - traffic stabilizes
+
+Impact:
+
+    - ~1-2 minutes of partial errors
+    - zero full downtime
+    - most users never notice
+
+---
+
+## 🧠 10:11 — now the real work begins
+
+The failure is contained.
+
+Nos it's engineering 
+
+An incident channel is created automatically:
+
+```
+#incident-contract-api-2026-02-05
+```
+
+Initial automated message includes:
+
+    - start time
+    - affected version
+    - impacted metrics
+    - rollback executed
+    - current status: stabilized
+
+---
+
+## 🔍 10:15 — investigation with data, not guesses
+
+I join the channel
+
+First thing I do:
+
+    - open distributed traces
+    - filter by version ```1.12.0```
+    - follow the failing request
+
+What I see is clear:
+
+    - the new rule
+    - a specific input
+    - an unhandled condition
+    - an unhandled exception
+
+This is not a mystery.
+
+Not intermittent.
+
+It's a real bug.
+
+---
+
+## 📌 10:25 — hypothesis confirmed
+
+I correlate data:
+
+    - structured logs
+    - error metrics per route
+    - correlation with feature flag (enabled in prod)
+
+Conclusion:
+
+> The new rule assumes a field that doesn't exist in ~2% of legacy contracts.
+
+The pipeline didn't fail
+
+Tests didn't cover a historical edge case.
+
+This happens.
+
+The system absorbed the impact.
+
+---
+
+## 🛠️ 10:35 — fix starts calmy, without bureaucracy
+
+I create a branch:
+
+```bash
+git checkout -b fix/contract-rule-null-case
+```
+
+I fix the issue:
+
+    - handle the legacy scenario
+    - add a unit test
+    - add a specific integration test
+
+Commit:
+
+```bash
+git commit -m "fix(domain): handle legacy contract edge case"
+```
+
+Push.
+
+---
+
+## ⚙️ 10:45 — fast pipeline (hotfix path)
+
+Because it's a ```fix```:
+
+    - prioritize pipeline
+    - focused test subset
+    - less generic E2E
+    - heavy focus on the broken regression path
+
+An ephemeral environment spins up **with masked real data**.
+
+I validate the broken flow.
+
+QA validates.
+
+The lead validates quickly.
+
+---
+
+## 🚀 11:30 — merge and new artifact
+
+Merged into ```main```
+
+New verison:
+
+```
+1.12.1
+```
+
+Pipeline runs:
+
+    - build
+    - tests
+    - scans
+    - signing
+
+---
+
+## 🎯 11:40 — production again, with extra caution
+
+This time:
+
+    - 1% canary
+    - metrics observed for longer
+    - tighter alert thresholds
+
+Everything stays green.
+
+Traffic ramps up:
+
+    - 5%
+    - 25%
+    - 100%
+
+No rollback.
+
+No Drama.
+
+---
+
+## 📝 12:10 — post-mortem (no blame, no theater)
+
+The system automatically creates:
+
+    - a post-mortem draft
+    - a populated timeline
+    - attached metrics
+    - linked commits
+
+Short meeting (30-45 minutes).
+
+Conclusion:
+
+    - legitimate failure
+    - historical data not represented in tests
+    - pipeline reacted correctly
+    - automatic rollback saved the day
+
+Action items:
+
+    - new dataset for legacy contract testing
+    - new preventive metric
+    - adjusted canary thresholds for this service
+
+---
+
+## The mature truth 
+
+At the end of the day, this wasn't a special week or an exceptional incident.
+
+**It was just another normal cycle of building, shipping, operating and learning.**
+
+Some days everything flows smoothly.
+
+Other days production reminds you that real systems are messy,  full of history and impossible to fully simulate.
+
+
+The difference isn't whether things break — they always will.
+
+The difference is whether you delivery system turns those moments into stress and heroics, or into something routing and manageable.
+
+<br/>
+
+In this story, no one had to stop the world to fix production.
+
+Work didn't halt.
+
+Trust in the system didn't disappear.
+
+The pipeline absorbed the impact, created space for investigation, and allowed the fix to move forward with the same discipline as any other change.
+
+That's what maturity looks like in practice.
+
+Not perfection, not speed for its own sake — but the ability to ship continuously, recover quickly and learn without fear.
+
+
+That's how we ship software every day.
+
+And that's why we can afford to sleep at night.
+
+---
