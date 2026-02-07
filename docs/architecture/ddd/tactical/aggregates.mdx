@@ -1,0 +1,716 @@
+---
+id: aggregates
+title: Aggregates
+slug: /architecture/ddd/tactical/aggregates
+description: Deep technical guide on designing and implementing DDD Aggregates in C#, focusing on consistency boundaries, invariants, concurrency, and real production trade-offs.
+sidebar_label: Aggregates
+keywords: [domain-driven design, ddd aggregates, aggregate root, transactional consistency, csharp architecture]
+sidebar_position: 10
+---
+
+## 1. What this document is about
+
+This document explains **Aggregates** as the primary mechanism for enforcing **domain consistency boundaries** in Domain-Driven Design.
+
+It focuses on:
+
+    - how aggregates define **transactional and consistency limits**
+    - how business invariants are enforcec **by construction**, not convention
+    - how aggregates behave under **concurrency, scale and evolution
+    - how to implement aggregates correctly in C# / .NET without leaking infrastructure converns
+
+This document applies when:
+
+    - business rules require **strong consistency**
+    - multiple domain objects must change **atomically**
+    - the sytem experiences **concurrent writes**
+    - correctness matterns more than raw throughput
+
+This document does **not** apply when:
+
+    - the domain is CRUD-only
+    - invariants are trivial or nonexistent
+    - eventual consistency is acceptable everywhere
+    - the system is real-heavy with rare writes
+
+---
+
+## 2. Why this matters in real systems
+
+Aggregates appear when **simple models stop working**.
+
+Typical pressures that force aggregates to exist:
+
+    - **Concurrent updates** to related data
+    - **Partial failures** leaving the system  in invalid states
+    - **Distributed workflows** that span multiple services
+    - **Schema and rule evolution** over time
+    - **Regulatory or financial correctness**
+
+What breaks when aggregates are ignores:
+
+    - invariants enforced "in the service layer"
+    - rules duplicated across handlers
+    - race conditions hidden behind ORM abstractions
+    - data that is _technically valid but business-invalid_
+    - retries that corrupt state instead of fixing it
+
+Why simpler approaches fail:
+
+    - CRUD models assume independence
+    - ORMs do not understand business rules
+    - transactions alone do not encode intent
+    - validation outside the model is optional — and will be skipped
+
+Aggregates exist because **the database cannot protect the domain for you**.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of an aggregate as:
+
+> **A consistency bubble enforced by code**
+
+Inside the bubble:
+
+    - invariant must _always_ hold
+    - changes are atomic
+    - rules are synchronous and deterministic
+
+Outside the bubble:
+
+    - everything is eventually consistent
+    - other aggregates are referenced by identity only
+    - coordination happens asynchronously
+
+### Metal model: the gatekeeper
+
+    - The **Aggregate Root** is the _only gate_
+    - All state changes pass through it
+    - If a rule is violated, the change is rejected
+    - No external code is trusted to "do the right thing"
+
+If something must be consistent **now**, it lives in the same aggregate.
+
+If it can be consistent **later**, it does not.
+
+---
+
+## 4. How it works (step-by-step)
+
+    1. **Define the invariant**
+        - What must _never_ be broken?
+        - What combinations of stage are illegal?
+
+    2. **Choose the aggregate boundary**
+        - Smallest possible set of entities required to enforce invariants
+        - Anything else is explicitly outside
+
+    3. **Expose behavior, not setters**
+        - State changes only via methods
+        - Methods express domain intent
+
+    4. **Validate invariants synchronously**
+        - Fail fast
+        - No partial success
+
+    5. **Persist the aggregate atomically**
+        - One transaction
+        - One aggregate instance
+
+    6. **Communicate changes outward**
+        - Domain events
+        - Integration events
+        - Never direct cross-aggregate mutation
+
+### Assumptions and invariants
+
+    - An aggregate is modified by **one transaction at a time**
+    - External consistency is **eventual**
+    - Invariants are **non-negotiable**
+    - Performance trade-offs are accepted consciously
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+### Domain primitives (Entity / AggregateRoot / Exceptions)
+
+```csharp
+using System.Collections.ObjectModel;
+
+public abstract class Entity<TId>
+    where TId : notnull
+{
+    public TId Id { get; protected set; } = default!;
+
+    // Identity-based equality
+    public override bool Equals(object? obj)
+        => obj is Entity<TId> other &&
+           EqualityComparer<TId>.Default.Equals(Id, other.Id);
+
+    public override int GetHashCode()
+        => Id?.GetHashCode() ?? 0;
+}
+
+public abstract class AggregateRoot<TId> : Entity<TId>
+    where TId : notnull
+{
+    private readonly List<IDomainEvent> _domainEvents = new();
+
+    // Optimistic concurrency version. EF will map it as a concurrency token.
+    public int Version { get; private set; } = 0;
+
+    public IReadOnlyCollection<IDomainEvent> DomainEvents
+        => new ReadOnlyCollection<IDomainEvent>(_domainEvents);
+
+    protected void AddDomainEvent(IDomainEvent @event)
+        => _domainEvents.Add(@event);
+
+    public void ClearDomainEvents()
+        => _domainEvents.Clear();
+
+    // Called by infrastructure after successful persistence
+    public void BumpVersion()
+        => Version++;
+}
+
+public sealed class DomainException : Exception
+{
+    public DomainException(string message) : base(message) { }
+}
+
+public interface IDomainEvent
+{
+    DateTimeOffset OccurredAt { get; }
+}
+```
+
+---
+
+### Value Objects (AccountId, Money)
+
+```csharp
+public readonly record struct AccountId(Guid Value)
+{
+    public static AccountId New() => new(Guid.NewGuid());
+    public override string ToString() => Value.ToString("N");
+}
+
+public readonly record struct Money(decimal Amount)
+{
+    public static Money Zero => new(0m);
+
+    public static Money operator +(Money a, Money b) => new(a.Amount + b.Amount);
+    public static Money operator -(Money a, Money b) => new(a.Amount - b.Amount);
+
+    public static bool operator <(Money a, Money b) => a.Amount < b.Amount;
+    public static bool operator >(Money a, Money b) => a.Amount > b.Amount;
+    public static bool operator <=(Money a, Money b) => a.Amount <= b.Amount;
+    public static bool operator >=(Money a, Money b) => a.Amount >= b.Amount;
+
+    public override string ToString() => Amount.ToString("0.00");
+}
+```
+
+### Domain Events
+
+```csharp
+public sealed record FundsDeposited(AccountId AccountId, Money Amount, DateTimeOffset OccurredAt) : IDomainEvent;
+
+public sealed record FundsWithdrawn(AccountId AccountId, Money Amount, DateTimeOffset OccurredAt) : IDomainEvent;
+
+public sealed record AccountFrozen(AccountId AccountId, DateTimeOffset OccurredAt) : IDomainEvent;
+```
+
+---
+
+### Internal Entity of the Aggregate: Transaction
+
+```csharp
+public sealed class Transaction : Entity<Guid>
+{
+    public DateTimeOffset Timestamp { get; private set; }
+    public Money Amount { get; private set; }
+    public TransactionType Type { get; private set; }
+
+    private Transaction() { } // EF
+
+    private Transaction(Guid id, TransactionType type, Money amount, DateTimeOffset timestamp)
+    {
+        Id = id;
+        Type = type;
+        Amount = amount;
+        Timestamp = timestamp;
+    }
+
+    public static Transaction Deposit(Money amount, DateTimeOffset now)
+        => new(Guid.NewGuid(), TransactionType.Deposit, amount, now);
+
+    public static Transaction Withdrawal(Money amount, DateTimeOffset now)
+        => new(Guid.NewGuid(), TransactionType.Withdrawal, amount, now);
+}
+
+public enum TransactionType
+{
+    Deposit = 1,
+    Withdrawal = 2
+}
+```
+
+---
+
+### The Aggregate Root: Bank Account
+
+Key points:
+
+    - Method express **intent**
+    - Invariants are guaranteed **in the same place**
+    - The ```_transactions``` collection is **private** and exposed as read-only
+    - External references (if any) would be by **ID**, never by object
+
+```csharp
+public sealed class BankAccount : AggregateRoot<AccountId>
+{
+    private readonly List<Transaction> _transactions = new();
+
+    public Money Balance { get; private set; }
+    public bool IsFrozen { get; private set; }
+
+    public IReadOnlyCollection<Transaction> Transactions
+        => new ReadOnlyCollection<Transaction>(_transactions);
+
+    private BankAccount() { } // EF
+
+    public BankAccount(AccountId id)
+    {
+        Id = id;
+        Balance = Money.Zero;
+        IsFrozen = false;
+    }
+
+    public void Deposit(Money amount, DateTimeOffset now)
+    {
+        EnsureNotFrozen();
+        EnsurePositive(amount);
+
+        Balance += amount;
+        _transactions.Add(Transaction.Deposit(amount, now));
+
+        AddDomainEvent(new FundsDeposited(Id, amount, now));
+    }
+
+    public void Withdraw(Money amount, DateTimeOffset now)
+    {
+        EnsureNotFrozen();
+        EnsurePositive(amount);
+
+        if (Balance < amount)
+            throw new DomainException("Insufficient funds.");
+
+        Balance -= amount;
+        _transactions.Add(Transaction.Withdrawal(amount, now));
+
+        AddDomainEvent(new FundsWithdrawn(Id, amount, now));
+    }
+
+    public void Freeze(DateTimeOffset now)
+    {
+        if (IsFrozen) return;
+
+        IsFrozen = true;
+        AddDomainEvent(new AccountFrozen(Id, now));
+    }
+
+    private void EnsureNotFrozen()
+    {
+        if (IsFrozen)
+            throw new DomainException("Account is frozen.");
+    }
+
+    private static void EnsurePositive(Money amount)
+    {
+        if (amount <= Money.Zero)
+            throw new DomainException("Amount must be positive.");
+    }
+}
+```
+
+---
+
+### Persistence (EF Core + SQL Server)
+
+#### DbContext
+
+    - Map ```AccountId``` and ```Money``` (conversions or owned types)
+    - Map ```_transactions``` via backing field
+    - ```Version``` as concurrency token (optimistic concurrency)
+    - Ensure EF does not bypass encapsulation (field access)
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+public sealed class BankingDbContext : DbContext
+{
+    public DbSet<BankAccount> Accounts => Set<BankAccount>();
+
+    public BankingDbContext(DbContextOptions<BankingDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.ApplyConfiguration(new BankAccountMap());
+        modelBuilder.ApplyConfiguration(new TransactionMap());
+    }
+}
+
+internal sealed class BankAccountMap : IEntityTypeConfiguration<BankAccount>
+{
+    public void Configure(EntityTypeBuilder<BankAccount> b)
+    {
+        b.ToTable("BankAccounts");
+
+        // AccountId value object mapping
+        b.HasKey(x => x.Id);
+
+        b.Property(x => x.Id)
+            .HasConversion(
+                id => id.Value,
+                value => new AccountId(value))
+            .ValueGeneratedNever();
+
+        // Money mapping
+        b.Property(x => x.Balance)
+            .HasConversion(
+                m => m.Amount,
+                value => new Money(value))
+            .HasColumnType("decimal(18,2)")
+            .IsRequired();
+
+        b.Property(x => x.IsFrozen)
+            .IsRequired();
+
+        // Optimistic concurrency token
+        b.Property(x => x.Version)
+            .IsConcurrencyToken();
+
+        // Backing field mapping for Transactions collection
+        b.Metadata.FindNavigation(nameof(BankAccount.Transactions))!
+            .SetPropertyAccessMode(PropertyAccessMode.Field);
+
+        b.HasMany<Transaction>("_transactions")
+            .WithOne()
+            .HasForeignKey("AccountId") // shadow FK
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+
+internal sealed class TransactionMap : IEntityTypeConfiguration<Transaction>
+{
+    public void Configure(EntityTypeBuilder<Transaction> b)
+    {
+        b.ToTable("AccountTransactions");
+
+        b.HasKey(x => x.Id);
+
+        b.Property(x => x.Amount)
+            .HasConversion(
+                m => m.Amount,
+                value => new Money(value))
+            .HasColumnType("decimal(18,2)")
+            .IsRequired();
+
+        b.Property(x => x.Timestamp).IsRequired();
+        b.Property(x => x.Type).IsRequired();
+    }
+}
+```
+
+---
+
+### Repository (load/save aggregate as a unit)
+
+The rule is: **repository works with aggregate root**.
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+public interface IBankAccountRepository
+{
+    Task<BankAccount?> GetAsync(AccountId id, CancellationToken ct);
+    void Add(BankAccount account);
+}
+
+public sealed class BankAccountRepository : IBankAccountRepository
+{
+    private readonly BankingDbContext _db;
+
+    public BankAccountRepository(BankingDbContext db) => _db = db;
+
+    public async Task<BankAccount?> GetAsync(AccountId id, CancellationToken ct)
+        => await _db.Accounts
+            .Include(a => a.Transactions) // materializa via navigation; backing field still protects writes
+            .SingleOrDefaultAsync(a => a.Id == id, ct);
+
+    public void Add(BankAccount account) => _db.Accounts.Add(account);
+}
+``` 
+
+> Note: ```Include(a => a.Transactions)``` uses the read-only property. 
+> The mapping configured ```Field``` access for writing, so you maintain encapsulation **without becoming a hostage of EF**.
+
+---
+
+### SaveChanges + Domain Events dispatch
+
+We need a strategy. Here's a simple and honest way:
+
+    - Save the transaction
+    - If saved, increment the version and clear domain events.
+    - Publish events outside the domain (infrastructure).
+    - If you need to guarantee delivery: this evolves into [Outbox Pattern](/docs/architecture/patterns/outbox-pattern/)
+
+```csharp
+public interface IDomainEventDispatcher
+{
+    Task DispatchAsync(IEnumerable<IDomainEvent> events, CancellationToken ct);
+}
+
+public sealed class UnitOfWork
+{
+    private readonly BankingDbContext _db;
+    private readonly IDomainEventDispatcher _dispatcher;
+
+    public UnitOfWork(BankingDbContext db, IDomainEventDispatcher dispatcher)
+    {
+        _db = db;
+        _dispatcher = dispatcher;
+    }
+
+    public async Task CommitAsync(CancellationToken ct)
+    {
+        // Gather events before SaveChanges (they exist in memory)
+        var aggregates = _db.ChangeTracker
+            .Entries()
+            .Where(e => e.Entity is AggregateRoot<AccountId> || e.Entity.GetType().BaseType?.IsGenericType == true)
+            .Select(e => e.Entity)
+            .OfType<dynamic>() // keep sample small
+            .ToList();
+
+        var events = aggregates
+            .SelectMany(a => (IEnumerable<IDomainEvent>)a.DomainEvents)
+            .ToList();
+
+        // Save with optimistic concurrency
+        await _db.SaveChangesAsync(ct);
+
+        // Post-persistence bookkeeping
+        foreach (var a in aggregates)
+        {
+            a.BumpVersion();
+            a.ClearDomainEvents();
+        }
+
+        await _dispatcher.DispatchAsync(events, ct);
+    }
+}
+```
+
+---
+
+### Example usage (application layer)
+
+```csharp
+public sealed class WithdrawFundsHandler
+{
+    private readonly IBankAccountRepository _repo;
+    private readonly UnitOfWork _uow;
+    private readonly TimeProvider _clock;
+
+    public WithdrawFundsHandler(IBankAccountRepository repo, UnitOfWork uow, TimeProvider clock)
+    {
+        _repo = repo;
+        _uow = uow;
+        _clock = clock;
+    }
+
+    public async Task Handle(AccountId accountId, Money amount, CancellationToken ct)
+    {
+        var account = await _repo.GetAsync(accountId, ct)
+            ?? throw new DomainException("Account not found.");
+
+        account.Withdraw(amount, _clock.GetUtcNow());
+
+        await _uow.CommitAsync(ct);
+    }
+}
+```
+
+---
+
+### Mapping to the concept (updated)
+
+    - ```BankAccount``` **is the Entity and the Aggregate Root**
+    - Transaction is an Entity inside the aggregate, not a root
+    - Invariants are enforced **only in the root**
+    - Persistence treats the aggregate as a unit:
+        - one load boundary (```GetAsync```)
+        - one save boundary (```CommitAsync```)
+        - concurrency detected via ```Version``` token
+    - Domain events capture “what happened” without coupling the domain to infrastructure
+
+---
+
+## 6. Design trade-offs
+
+
+| Choice                         | Gain                   | Cost                              |
+|:-------------------------------|------------------------|-----------------------------------|
+|Small aggregates                |Scalability, concurrency|More async coordination            |
+|Large aggregates                |Strong consistency      |Write contention                   | 
+|Synchronous invariants          |Correctness             |Latency                            | 
+|Eventual consistency            |Throughput              |Complexity                         | 
+|ORM mapping                     |Productivity            |Risk of leakage                    | 
+
+Implicitly accepted:
+
+    - distributed transactions are avoided
+    - not all reads are strongly consistent
+    - complexity moves into the domain model
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### "Aggregates should be large to match the domain"
+
+**Why it happends**:
+    - conceptual modeling without concurrency thinking
+
+**Problem**:
+    - write contention, deadlocks
+
+**Avoidance**:
+    - size aggregates by **consistency needs**, not nouns
+
+---
+
+### "Repositories can update child entities directly"
+
+**Why it happends**:
+    - ORM convenience
+
+**Problem**:
+    - invariants bypassed
+
+**Avoidance**:
+    - repository only loads and saves aggregate roots
+
+---
+
+### "Validation in services is enough"
+
+**Why it happends**:
+    - anemic models
+
+**Problem**:
+    - rules skipped, duplicated, or reordered
+
+**Avoidance**:
+    - invariants live _inside_ the aggregate
+
+---
+
+### "Aggregates should reference other aggregates"
+
+**Why it happends**:
+    - object graph thinking
+
+**Problem**:
+    - hidden coupling
+
+**Avoidance**:
+    - reference by ID only
+
+---
+
+## 8. Operational and production considerations
+
+#### Things to monitor:
+
+    - optimistic concurrency failures
+    - retry rates
+    - aggregate load times
+    - deadlocks and transaction duration
+
+#### What degrades first:
+
+    - write throughput
+    - tail latency under contention
+
+#### What becomes expensive:
+
+    - large aggregates with frequent writes
+    - chatty domain events
+    - over-eager eager loading
+
+#### Operational risks:
+
+    - incorrect boundaries locking scaling paths
+    - silent invariant violations via migrations
+    - ORM misconfiguration bypassing encapsulation
+
+#### Observability signals:
+
+    - version conflicts
+    - domain exception rates
+    - event publication lag
+
+---
+
+## 9. When NOT to use this
+
+Do not use aggregates when:
+
+    - data is independent
+    - rules are trivial
+    - writes are rare and non-conflicting
+    - the system is analytics-only
+    - eventual consistency is acceptable everywhere
+
+Using aggregates here is **harmful**:
+
+    - unncessary complexity
+    - reduced performance
+    - false sense of safety
+
+---
+
+## 10. Key takeaways
+
+    - Aggregates exist to protect **business invariants**, not data structure
+    - Size aggregates by **consistency**, not by entity count
+    - All state changes go through the **aggregate root**
+    - Transactions enforce **atomicity**, aggregates enforce **correctness**
+    - Cross-aggregate consistency is always **eventual**
+    - ORM convenience is a liability if not controlled
+    - If it must be correct _now_, it belongs inside the aggregate
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of aggregate boundaries, highlighting enforced invariants, transactional consistency within the root, and eventual consistency across integration boundaries.
+
+import Light from './_assets/aggregates-light.svg';
+import Dark from './_assets/aggregates-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Aggregates DDD"
+  height={500}
+/>
