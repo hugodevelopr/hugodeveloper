@@ -153,14 +153,19 @@ if (profile != null)
 }
 
 return profile;
+```
 
 **Why expiration exists**: Data in the cache can become stale. Expiration forces periodic refresh from the authoritative source (database). 
 The TTL (time-to-live) reflects how much staleness the application tolerate.
+
+---
 
 ### Step 4 — Subsequent requests from any instance
 
 Another application instance receives a request for the same user. If checks Redis and finds the cached value.
 No database query occurs. This works because all instances share the same Redis cluster.
+
+---
 
 ### Step 5 — Eviction and invalidation
 
