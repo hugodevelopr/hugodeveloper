@@ -1,0 +1,437 @@
+---
+id: hangfire-jobs
+title: Hangfire Jobs
+slug: /systems/batch/hangfire/hangfire-jobs
+description: Deep technical reference on reliable background job processing with Hangfire, covering execution model, failures, scaling, and production trade-offs.
+sidebar_label: Hangfire Jobs
+keywords: [hangfire, background jobs, dotnet batch processing, job scheduling, reliable async processing]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document addresses the design and operation of **reliable background job processing** in .NET applications using Hangfire — a 
+persistence-backed job scheduler that coordinates asynchronous work across distributed workers.
+
+Where it applies:
+
+    - Systems that need to defer work outside the request-response cycle
+    - Operations requiring retry semantic and durability guarantees
+    - Workloads that benefit from horizontal scaling across multiple workers
+    - Applications already using relational databases (SQL Server, PostgresSQL, MySQL)
+
+Where it does **not** apply:
+
+    - Sub-second latency requirements (use in-memory queues)
+    - Purely ephemeral tasks with no retry needs (use ```Task.Run``` or hosted services)
+    - Event streaming architectures (use message brokers like Azure Service Bus, Kafka, RabbitMQ)
+    - Systems where database writes per job are prohibitively expensive
+
+---
+
+## 2. Why this matters in real systems
+
+Background jobs emerge when the cost or duration of an operation exceeds what you can reasonably do inline with a user request. Common triggers:
+
+#### Scale pressure:
+
+    - Sending 10,000 emails per order confirmation
+    - Generating PDFs from user-uploaded data
+    - Resizing images across multiple formats
+    - Caling third-party APIs with unpredictable latency
+
+#### Reliability requirements:
+
+    - Payment processing webhooks that must be retried on failure
+    - Data synchronization between systems that can't afford data loss
+    - Cleanup operations that need to complete even if the web server restarts
+
+#### Evolution pressure:
+
+    - A feature that started as "just send one email" now sends 50
+    - An integration that was "always available" now times out 2% of the time
+    - A cron job running on a single server that needs to survive deployments
+
+#### What breaks when ignored:
+
+    - Request timeouts causing user-facing errors
+    - Lost work when processes restart
+    - Manual intervention to retry failed operations
+    - Unpredictable system load during traffic spikes
+    - Silient data inconsistencies when operations fail midway
+
+Hanfire enters the picture when you need **durability, retries, and visibility** without building your own job infrastructure.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of Hangfire as a **persistent work queue with a scheduler and executor runtime**.
+
+#### The lifecycle:
+
+```
+[Enqueue] → [Persist to DB] → [Worker polls] → [Execute] → [Mark complete/failed]
+     ↓            ↓                ↓              ↓              ↓
+  Your code    SQL table      Background       Your code    Update state
+                              process                       + retry logic
+```
+
+#### Key invariants:
+
+    1. **Jobs are data, not code**. When you enqueue a job, Hangfire serializes the method signature and arguments into a database row.
+    The actual code runs later, on a worker process.
+
+    2. **Workers are stateless**. Multiple processes poll the same database for work. Any worker can execute any job. This enables horizontal 
+    scaling but introduces coordination overhead.
+
+    3. **Al-least-once semantics**. Jobs may execute multiple times due to crashes, timeout, or retries. Your job logic must handle this.
+
+    4. **The database is the source of truth**. Job state, scheduling, and locking all live in SQL tables. This makes Hangfire durable 
+    but couples performance to your database.
+
+By the end of this mental model, you should understand: **Hanfire is a persistent task queue that trades database writes for reliability.** 
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Enqueue
+
+When you call ```BackgroundJob.Enqueue(() => SendEmail(orderId))```:
+
+    - Hangfire serializes the method (```SendEmail```) and arguments (```orderId```) to JSON
+    - Inserts a row into ```HangfireJob``` table with state ```Enqueued```
+    - Returns immediately — no execution happens yet
+
+**Why this exists**: Decouples request handling from job execution. The web request completes in milliseconds.
+
+**Assumption**: The method and arguments are serializable. Complex objects or closures will fail.
+
+---
+
+### Step 2 — Worker polling
+
+Background workers (separate processes or threads) continuously poll the database:
+
+```sql
+SELECT TOP 1 * FROM HangfireJob 
+WHERE State = 'Enqueued' 
+ORDER BY CreatedAt
+```
+
+**Why this exists**: Distributed coordination without a message broker. Any worker can claim any job.
+
+**Invariant**: Polling creates database load proportional to worker count × poll frequency.
+
+---
+
+### Step 3 — Job locking
+
+When a worker finds a job:
+
+    - Updates job state from ```Enqueued``` to ```Processing``` with a worker identifier
+    - Uses database transactions or row-level locks to prevent duplicate execution
+    - If the lock fails (another worker grabbed it), moves to the next job
+
+**Why this exists**: Prevents two workers from executing the same job simultaneously.
+
+**Assumption**: Database locking works correctly. Deadlocks or long transactions degrade throughput.
+
+---
+
+### Step 4 — Execution
+
+The worker:
+
+    - Deserializes the method and arguments
+    - Invokes the method in the current process
+    - Captures exceptions if thrown
+
+**Why it exists**: This is where your actual business logic runs.
+
+**Invariant**: The method must be available in the worker's assembly. Refactors that rename or move methods break queued jobs.
+
+---
+
+### Step 5 — Completion or retry
+
+On success:
+
+    - Updates state to ```Succeeded```
+    - Writes completion timestamp
+
+On failure:
+
+    - Increments retry counter
+    - Updates state to ```Scheduled``` with exponential backoff timestamp
+    - After max retries, moves to ```Failed```
+
+**Why this exists**: Automatic retry handles transient failures (network blips, database timeouts).
+
+**Assumption**: Retries are safe. Non-idempotent jobs(e.g. charging a credit card) can cause duplicate side effects.
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+```csharp
+// Program.cs
+services.AddHangfire(config => config
+    .UseSqlServerStorage("Server=.;Database=MyApp;Integrated Security=true;"));
+
+services.AddHangfireServer(options =>
+{
+    options.WorkerCount = 10; // Concurrent job execution threads
+    options.Queues = new[] { "critical", "default", "low-priority" };
+});
+
+// OrderService.cs
+public class OrderService
+{
+    private readonly IEmailSender _emailSender;
+    
+    public async Task PlaceOrder(Order order)
+    {
+        // Save order synchronously
+        await _db.SaveAsync(order);
+        
+        // Enqueue email asynchronously
+        BackgroundJob.Enqueue<EmailService>(
+            x => x.SendOrderConfirmation(order.Id));
+        
+        // Request completes immediately
+    }
+}
+
+// EmailService.cs
+public class EmailService
+{
+    [AutomaticRetry(Attempts = 5, DelaysInSeconds = new[] { 60, 300, 900 })]
+    public async Task SendOrderConfirmation(int orderId)
+    {
+        var order = await _db.Orders.FindAsync(orderId);
+        if (order.ConfirmationSentAt != null)
+            return; // Idempotency check
+        
+        await _emailSender.SendAsync(order.CustomerEmail, "Order Confirmed", ...);
+        
+        order.ConfirmationSentAt = DateTime.UtcNow;
+        await _db.SaveAsync(order);
+    }
+}
+```
+
+How this maps to the concept:
+
+    - ```BackgroundJob.Enqueue``` writes to the database and returns
+    - Workers poll for jobs in priority order (```critical``` → ```default``` → ```low-priority```)
+    - ```SendOrderConfirmation``` includes idempotency (```ConfirmationSentAt``` check)
+    - ```AutomaticRetry``` handles transient failures with backoff
+    - The method signature must match between enqueue and worker processes
+
+---
+
+## 6. Design trade-offs
+
+
+| Dimension                         | Hangfire                          | In-memory queue (e.g., ```Channel&lt;T>```)  | Message broker (e.g. Service Bus, RabbitMQ)   |
+|:----------------------------------|-----------------------------------|----------------------------------------------|-----------------------------------------------|
+|Durability                         |Survives restarts                  |Lost on restart                               |Survives restarts                              |       
+|Setup complexity                   |Low (use existing DB)              |Minimal                                       |High (separate infra)                          |
+|Throughput                         |100s-1000s jobs/sec                |10,000s + jobs/sec                            |10,000s + jobs/sec                             |
+|Latency                            |1-5 seconds (poll-based)           |Microseconds                                  |Milliseconds                                   |
+|Scaling limit                      |DB write throughput                |Worker CPU                                    |Broker throughput                              |
+|Operational cost                   |DB storage + cleanup               |Memory limits                                 |Broker hosting                                 |
+|Failure modes                      |DB locks, table bloat              |Process crash = data loss                     |Network partitions                             |
+
+
+What you gain:
+
+    - Zero infrastructure beyond your database
+    - Built-in retry, scheduling, and dashboard
+    - Easier debugging (jobs visible in SQL)
+
+What you give up:
+
+    - Latency (polling delay + DB writes)
+    - Throughput ceiling (limited by database)
+    - Risk of database contention affecting both app and jobs
+
+What you implicitly accept:
+
+    - At-least-once semantics (idempotency is your problem)
+    - Schema coupling (Hangfire tables live in your DB)
+    - Dashboard security (open by default in dev, needs auth in prod)
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Assuming exactly-once execution
+
+**Why it happends**:
+    - Developers expect jobs to run once because "I only enqueued it once."
+
+**Problem**:
+    - Duplicate emails, double charges, inconsistent data.
+
+**Avoidance**:
+    - Design jobs to be [idempotent](/docs/architecture/api/http/idempotent-requests/). Check a database flag, use unique constraints, or make operations naturally idempotent (e.g., ```UPDATE SET status = 'processed'```).
+
+---
+
+### Enqueueing jobs with complex objects
+
+```csharp
+// Bad: Complex object serialization
+BackgroundJob.Enqueue(() => ProcessOrder(order)); // 'order' is a full entity
+
+// Good: Pass only identifiers
+BackgroundJob.Enqueue(() => ProcessOrder(order.Id));
+```
+
+**Why it happends**:
+    - Convenience—passing the whole object avoids a database lookup.
+
+**Problem**:
+    - Serialization failures, stale data (the object changes before the job runs), increased database storage.
+
+**Avoidance**:
+    - Pass primitive types or IDs. Reload data inside the job.
+
+---
+
+### Ignoring queue priority under load
+
+**Why it happends**:
+    - Default queue seems sufficient until traffic spikes.
+
+**Problem**:
+    - Critical jobs (password resets) wait behind low-priority jobs (analytics).
+
+**Avoidance**:
+    - Use multiple queues (```critical```, ```default```, ```low-priority```) and configure workers to process them in priority order.
+
+---
+
+### Not monitoring job age
+
+**Why it happends**:
+    - Dashboard shows "jobs are running," so system appears healthy.
+
+**Problem**:
+    - Jobs queued but not executing (all workers busy, DB locks, poison jobs blocking the queue).
+
+**Avoidance**:
+    - Alert on max job age in ```Enqueued``` state. If a job sits for >5 minutes, something is wrong.
+
+
+---
+
+### Deploying without old job compatibility
+
+**Why it happends**:
+    - You renamed ```SendEmail``` to ```SendEmailV2``` and redeployed.
+
+**Problem**:
+    - Queued jobs referencing the old method name fail permanently.
+
+**Avoidance**:
+    - Use method aliasing (```[DisplayName("SendEmail")]```), drain queues before breaking changes, or keep old methods as wrappers during transitions.
+
+---
+
+## 8. Operational and production considerations
+
+#### What to monitoring
+
+|Metric                                        |Why                                                                |Threshold                            |
+|----------------------------------------------|-------------------------------------------------------------------|-------------------------------------|
+|Enqueued job count                            |Detects backlog buildup                                            |Alert if > 1,000                     |
+|Oldest enqueued job age                       |Detects worker starvation                                          |Alert if > 10 min                    |
+|Failed job rate                               |Detects poison jobs or systemic errors                             |Alert if > 5%                        |
+|Retry count per job                           |Detects thrashing                                                  |Alert if avg > 2                     |
+|Worker count                                  |Detects crashed workers                                            |Alert if &lt; expected               |
+|DB table size                                 |Detects unbounded growth                                           |Alert if > 10GB                      |
+
+#### What degrades first
+
+    1. **Database write throughput**: Enqueuing 10,000 jobs/sec saturates inserts.
+    2. **Lock contention**: Workers compete for the same jobs, causing deadlocks.
+    3. **Polling overhead**: 100 workers × 10 poll/sec = 1,000 queries/sec doing no work.
+
+#### What becomes expensive
+
+    - **Storage**: Job history acculates. Without cleanup, ```HangfireJob``` table grows unbounded.
+    - **Dashboard queires**: Scanning millions of rows for UI pagination is slow.
+    - **Long-running jobs**: A job that runs for 30 minutes holds a worker thread, reducing concurrency.
+
+#### Operational risks
+
+    - **Schema migrations**: Hangfire owns its tables. Updating Hangfire versions may require migrations during deploy.
+    - **Dashboard exposure**: The ```/hangfire``` endpoint it unauthenticated by default. Restrict it in production.
+    - **Worker scaling**: Horizontal scaling requires all workers to access the same database. No worker can execute jobs if DB is unavailable.
+
+#### Observability signals
+
+```csharp
+// Log job start/end for tracing
+[JobFilter]
+public class LogJobExecutionFilter : JobFilterAttribute, IServerFilter
+{
+    public void OnPerforming(PerformingContext context)
+        => _logger.LogInformation("Job {JobId} starting", context.BackgroundJob.Id);
+    
+    public void OnPerformed(PerformedContext context)
+        => _logger.LogInformation("Job {JobId} completed in {Duration}ms", 
+            context.BackgroundJob.Id, context.Elapsed.TotalMilliseconds);
+}
+```
+
+Track job failures in APM tools (Application Insights, Datadog, New Relic) to correlate with incidents.
+
+---
+
+## 9. When NOT to use this
+
+Do not use Hangfire if:
+
+    - You need low latency (&lt;100ms). Polling and database writes add seconds of delay. Use in-memory queues or reactive patterns.
+    - You have extreme throughput needs (>10,000 jobs/sec). Database writes become the bottleneck. Use a message broker or event streaming platform.
+    - Your jobs are ephemeral with no retry needs. A ```Task.Run``` or ```IHostedService``` with a ```Channel&lt;T>``` is simpler and faster.
+    - Your database is already under heavy load. Hangfire adds write, lock, and polling pressure. It can destabilize an overloaded database.
+    - You need guaranteed ordering. Jobs may execute out of order due to retries, worker distribution, or priority queues.
+    - You're building event-driven microservices. Use a message broker with pub/sub (RabbitMQ, Kafka, Azure Service Bus) for decoupled communication.
+    - You can't afford the operational overhead. Hangfire requires database cleanup, monitoring, and worker lifecycle management. If you're not ready to own that, defer work with simpler primitives.
+
+---
+
+## 10. Key takeaways
+
+    - Hangfire trades database writes for durability. It's reliable but not fast. Choose it when you need persistence, not when you need speed.
+    - At-least-once semantics are non-negotiable. Design jobs to be idempotent or accept duplicate execution as a failure mode.
+    - The database is both the strength and the bottleneck. It provides durability and visibility but limits throughput and introduces contention.
+    - Queue priority matters under load. Without explicit priority queues, critical jobs wait behind low-priority work during traffic spikes.
+    - Schema evolution breaks queued jobs. Plan for method renames, parameter changes, and backward compatibility when deploying new code.
+    - Monitoring job age prevents silent failures. A healthy dashboard doesn't mean jobs are processing—track how long jobs wait in the queue.
+    - Horizontal scaling requires worker coordination. Adding workers helps throughput but increases database polling and lock contention. More workers ≠ infinite scale.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of Hangfire background job processing, highlighting job enqueueing, database-backed durability, worker coordination, execution lifecycle, retries, and operational visibility.
+
+import Light from './_assets/hangfire-jobs-light.svg';
+import Dark from './_assets/hangfire-jobs-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Hangfire Jobs"
+  height={660}
+/>
