@@ -1,0 +1,568 @@
+---
+id: distributed-cache-architecture
+title: Distributed Cache Design
+slug: /architecture/api/http/distributed-cache-architecture
+description: Practical guidance on designing and operating distributed caches, covering consistency trade-offs, failure modes, and production constraints.
+sidebar_label: Distributed Cache Design
+keywords: [distributed cache, cache architecture, azure redis, cache consistency, high performance systems]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document addresses how to design, implement, and operate distributed caching layers in horizontally scaled systems 
+where shared state must be accessed with sub-millisecond latency across multiple application instances.
+
+#### Where this applies:
+
+    - Multi-instance web applications or APIs requiring consistent access to session state, reference data, or frequently quiried entities
+    - Services experiencing read-heavy database load that degrades user experience
+    - Systems with compute scaled independently from data storage
+    - Applications deployed across availability zones or regions requiring local data access
+
+#### Where this does not apply
+
+    - Single-instance application where in-process memory suffices
+    - Systems with acceptable database query latency (typically >50ms p95)
+    - Workloads dominated by unique, non-repetitive queries
+    - Data requiring strong transactional consistency that cannot tolerate eventual consistency windows
+
+---
+
+## 2. Why this matters in real systems
+
+Distributed caching emerges when horizontal scaling creates a shared state problem. When you run a single application instance, process memory acts as 
+your cache. Add a second instance, and they no longer share state. User A's session on instance 1 doesn't exist on instance 2. A product catalog 
+loaded into instance 3's memory is duplicated wastefully across all other instances.
+
+#### Typical pressures:
+
+    - Database connections become the bottleneck before CPU does. You scale from 4 to 16 application instances to handle traffic. 
+Your database now receives 4x the query load for the same logical requests. Connection pool exhaustion occurs before memory or CPU 
+saturation. P95 latency degrades from 45ms to 380ms under load.
+
+    - Cold starts destroy user experience. Kubernetes reschedules pods. A new instance boots and immediately receives production traffic 
+with an empty in-process cache. The first 10,000 requests hit the database directly. Query queue depth spikes. Timeout errors cascade to 
+dependent services.
+
+    - Memory pressure forces difficult trade-offs. Each instance caches 2GB of reference data. You run 20 instances. You're now maintaining 40 GB 
+of duplicated cache entries across your fleet, most of which overlap 95%. Eviction policies run constantly. Cache hit rates vary wildly between 
+instances based on request distribution.
+
+#### What breaks when ignored:
+
+    - Database queries that should return in 8ms now take 200ms under concurrent load
+    - Application instances exhaust connection pools during traffic bursts
+    - Horizontal scaling increases costs linearly without improving performance
+    - Cache inconsistency between instances causes user-visible bugs (stale product prices, outdated permissions)
+
+Simpler approaches stop working when you cannot accept these failure modes in produciton.
+
+---
+
+## 3. Core concept (mental model)
+
+A distributed cache is a shared memory layer accessible to all application instances over the network, 
+trading local access speed for consistency and reduced duplication.
+
+### Mental model: The shared bulletin board
+
+Imagine ten people (application instances) working on the same project. They each need access to the same reference documents.
+
+    - **In-process cache approach**: Each person keeps a personal copy of every document. Updates are inconsistent. Storage is duplicated 10x.
+    When someone joins the team, they start with nothing.
+
+    - **Distributed cache approach**: One shared filling cabinet (Redis cluster) in the center of the rrom. Anyone can read or write. Only one copy 
+    exists. Everyone seens updates within milliseconds. New team members have immediate access.
+
+The trade-off: walking to the filling cabinet takes longer than reaching into your desk drawer, but it's still faster than walking to the archive 
+building (database) downtown.
+
+#### Key properties:
+
+    1. **Network-mediated**: Access requires a network round-trip (typically 1-3ms intra-zone)
+    2. **Shared state**: All instances read from and write to the same logical cache
+    3. **Volatile by default**: Most distributed caches are memory-backed and non-durable
+    4. **Eventually consistent**: Writes propagate rapidly but not instantaneously
+    5. **Evection-managed**: Memory is finite; old or large entries are removed under pressure
+
+By the end of this section, you should think: "A distributed cache centralizes memory to reduce duplication and inconsistency, accepting network 
+latency as the cost."
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Application requests data
+
+An HTTP request arrives at an ASP.NET Core application instance. The controller action needs user profile data for user ID ```12847```.
+
+```bash
+Incoming: GET /api/users/12847/profile
+```
+
+---
+
+### Step 2 — Check distributed cache
+
+Before querying the database, the application checks **Azure Cache for Redis** using the user ID as the key.
+
+```csharp
+var cacheKey = $"user:profile:{userId}";
+var cachedProfile = await _cache.GetStringAsync(cacheKey);
+```
+
+**Why this exists**: Network round-trip to Redis (1-2ms) is 10-50x faster than database query (20-100ms). 
+Even with serialization overhead, cache reads are substantially cheaper.
+
+**Invariant**: The cache key must be deterministic and collision-free. Different data types or versions must not share keys.
+
+---
+
+### Step 3 — Cache hit — return immediately
+
+If the key exists in Redis, deserialize and return the value. The database is never touched.
+
+```csharp
+if (cachedProfile != null)
+{
+    return JsonSerializer.Deserialize<UserProfile>(cachedProfile);
+}
+```
+
+**Assumption**: The cached data is "fresh enough" for the use case. Staleness tolerance is application-specific.
+
+---
+
+### Step 3b — Cache miss — query database
+
+If the key does not exist, query the database, then write the result to Redis before returning.
+
+```csharp
+var profile = await _dbContext.UserProfiles
+    .FirstOrDefaultAsync(u => u.Id == userId);
+
+if (profile != null)
+{
+    var serialized = JsonSerializer.Serialize(profile);
+    await _cache.SetStringAsync(cacheKey, serialized, new DistributedCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(15)
+    });
+}
+
+return profile;
+
+**Why expiration exists**: Data in the cache can become stale. Expiration forces periodic refresh from the authoritative source (database). 
+The TTL (time-to-live) reflects how much staleness the application tolerate.
+
+### Step 4 — Subsequent requests from any instance
+
+Another application instance receives a request for the same user. If checks Redis and finds the cached value.
+No database query occurs. This works because all instances share the same Redis cluster.
+
+### Step 5 — Eviction and invalidation
+
+Redis evicts entries when memory pressure occurs or TTL expires. Applications may also explicitly invalidate cache entries when data changes.
+
+```csharp
+// User updates their profile
+await _dbContext.SaveChangesAsync();
+await _cache.RemoveAsync($"user:profile:{userId}");
+```
+
+**Why explicit invalidaiton exists**: Without it, users would see stale data until TTL expiration. For write-heavy data, invalidate-on-write is essencial. 
+For read-heavy data, expiration alone may suffice.
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+This example demonstrates a product catalog cache in an ASP.NET Core API deployed to [Azure App Services](https://azure.microsoft.com/en-us/products/app-service), 
+using [Azure Cache for Redis](https://azure.microsoft.com/en-us/products/cache).
+
+```csharp
+public class ProductService
+{
+    private readonly IDistributedCache _cache;
+    private readonly ApplicationDbContext _dbContext;
+    private readonly ILogger<ProductService> _logger;
+    
+    private static readonly DistributedCacheEntryOptions CacheOptions = new()
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10),
+        SlidingExpiration = TimeSpan.FromMinutes(3)
+    };
+
+    public ProductService(
+        IDistributedCache cache, 
+        ApplicationDbContext dbContext,
+        ILogger<ProductService> logger)
+    {
+        _cache = cache;
+        _dbContext = dbContext;
+        _logger = logger;
+    }
+
+    public async Task<Product?> GetProductAsync(int productId, CancellationToken ct)
+    {
+        var cacheKey = $"product:{productId}";
+        
+        // Attempt cache read
+        var cached = await _cache.GetStringAsync(cacheKey, ct);
+        if (cached != null)
+        {
+            _logger.LogDebug("Cache hit for product {ProductId}", productId);
+            return JsonSerializer.Deserialize<Product>(cached);
+        }
+
+        _logger.LogInformation("Cache miss for product {ProductId}, querying database", productId);
+
+        // Query database
+        var product = await _dbContext.Products
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.Id == productId, ct);
+
+        if (product == null)
+        {
+            return null;
+        }
+
+        // Populate cache
+        try
+        {
+            var serialized = JsonSerializer.Serialize(product);
+            await _cache.SetStringAsync(cacheKey, serialized, CacheOptions, ct);
+        }
+        catch (Exception ex)
+        {
+            // Cache write failures should not break the request
+            _logger.LogError(ex, "Failed to write product {ProductId} to cache", productId);
+        }
+
+        return product;
+    }
+
+    public async Task InvalidateProductAsync(int productId, CancellationToken ct)
+    {
+        var cacheKey = $"product:{productId}";
+        await _cache.RemoveAsync(cacheKey, ct);
+        _logger.LogInformation("Invalidated cache for product {ProductId}", productId);
+    }
+}
+```
+---
+
+#### Configuration ```appsettings.json```:
+
+```json
+{
+  "ConnectionStrings": {
+    "Redis": "your-cache.redis.cache.windows.net:6380,password=...,ssl=True,abortConnect=False"
+  }
+}
+```
+
+---
+
+#### Service registration in ```Program.cs```
+
+```csharp
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis");
+    options.InstanceName = "ProductCatalog:";
+});
+
+builder.Services.AddScoped<ProductService>();
+```
+
+---
+
+#### How this maps to the concept:
+
+    - The ```IDistributedCache``` abstraction allows swapping Redis for other providers without changing application code
+    - Cache keys include entity type and ID to prevent collisions
+    - Absolute expiration ensures stale data is eventually refreshed
+    - Sliding expiration keeps frequently accessed items in cache longer
+    - Cache write failures are logged but do not fail the request (cache is not authoritative)
+    - Invalidation on update maintains consistency between database and cache
+
+---
+
+## 6. Design trade-offs
+
+|Approach                    |Consistency                             |Latency (p50)                     |Complexity      |Cost                         |Failure Impact                                |
+|----------------------------|----------------------------------------|----------------------------------|----------------|-----------------------------|----------------------------------------------|
+|No cache                    |Strong (database is source of truth)    |20-100ms                          |Low             |Database scales with traffic |High query load limits throughput             |
+|In-process cache            |Weak (per-instance state)               |0.1ms                             |Low             |Memory per instance          |Duplication, cold starts inconsistency        |
+|Distributed cache (Redis)   |Eventual (1-10 ms propagation)          |1-3ms                             |Medium          |Cluster + memory + network   |Cache unavailability forces database fallback |
+|Cache-aside pattern         |Application-controlled                  |1-3ms (hit), 20-100ms (miss)      |Medium          |Cache + database             |Stale reads possible, manual invalidation     |
+|Write-through pattern       |Stronger (writes go to cache + DB)      |20-100ms (writes), 1-3ms (reads)  |High            |Every write pays dual latency|Write failures more complex                   |
+
+#### What you gain with distributed cache:
+
+    - Reduced database load (often 70-95% query reduction)
+    - Horizontal scaling without linear database pressure
+    - Consistent state across application instances
+    - Faster cold starts (shared warm cache)
+
+#### What you give up:
+
+    - Additional infrastructure complexity (Redis cluster, monitoring, failover)
+    - Network latency on every cache operation (1-3ms vs 0.1 ms in-process)
+    - Operational cost (Redis cluster pricing scales with memory and throughput)
+    - Eventual consistency (writes propagate, stale reads possible)
+
+#### What you're implicitly accepting:
+
+    - Cache unavailability will degrade performance, not break the system (requires fallback logic)
+    - Memory is finite; eviction will occur under pressure
+    - Serialization overhead (CPU + network bandwidth)
+    - Network partitions between app and cache can cause cache misses
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Caching data without expiration
+
+**Why it happends**:
+    - Developers assume they'll invalidate cache entries on every write.
+
+**Problem**:
+    - Writes are missed (bugs, exceptions, asynchronous jobs). Cache entries become permanently stale. Users see outdated data indefinitely.
+
+**Avoidance**:
+    - Always set a TTL. Use it as a safety net. Explicit invalidation is an optimization, not a requirement.
+
+```csharp
+// Bad: no expiration
+await _cache.SetStringAsync(key, value);
+
+// Good: expiration as safety net
+await _cache.SetStringAsync(key, value, new DistributedCacheEntryOptions
+{
+    AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(15)
+});
+```
+
+---
+
+### Not handling cache unavailability
+
+**Why it happends**:
+    - Redis is treated as always-available infrastructure.
+
+**Problem**:
+    - Redis node failure, network partition, or configuration error causes application-wide outages. All requests fail because cache reads throw exceptions.
+
+**Avoidance**:
+    - Wrap cache operations in try-catch. Fall back to the database on cache failures. Treat cache as a performance optimization, not a hard dependency.
+
+```csharp
+try
+{
+    var cached = await _cache.GetStringAsync(key, ct);
+    if (cached != null) return Deserialize(cached);
+}
+catch (Exception ex)
+{
+    _logger.LogError(ex, "Cache read failed, falling back to database");
+    // Continue to database query
+}
+
+return await _dbContext.Products.FindAsync(productId);
+```
+
+---
+
+### Caching unbounded collections
+
+**Why it happends**:
+    - Developers cache entire result sets (e.g., "all products") to avoid repeated queries.
+
+**Problem**:
+    - Large cache entries (>1MB) cause memory pressure, slow serialization, and network timeouts. Eviction policies remove smaller, more valuable entries first.
+
+**Avoidance**:
+    - Cache individual entities or paginated subsets. Query patterns should determine cache granularity.
+
+```csharp
+// Bad: cache entire collection
+var allProducts = await _dbContext.Products.ToListAsync();
+await _cache.SetStringAsync("products:all", JsonSerializer.Serialize(allProducts));
+
+// Good: cache individual products
+foreach (var product in products)
+{
+    var key = $"product:{product.Id}";
+    await _cache.SetStringAsync(key, JsonSerializer.Serialize(product), options);
+}
+```
+
+---
+
+### Storing PII in cache without encryption
+
+**Why it happends**:
+    - Cache is treated as an internal implementation detail, not data storage.
+
+**Problem**:
+    - Compliance violations (GDPR, HIPAA). Data breaches expose sensitive information. Redis memory dumps contain plaintext user data.
+
+**Avoidance**:
+    - Encrypt sensitive data before caching, or avoid caching it entirely. Apply the same data classification rules as database storage.
+
+---
+
+### Using cache as durable storage
+
+**Why it happends**:
+    - Redis feels like a database because it supports persistence options.
+
+**Problem**:
+    - Cache eviction deletes data under memory pressure. Cluster failovers lose unpersisted writes. Treating cache as authoritative causes data loss.
+
+**Avoidance**:
+    - The database is the source of truth. Cache is always reconstructible from the database. Never store data exclusively in cache.
+
+---
+
+### Ignoring serialization cost
+
+**Why it happends**:
+    - Serialization/deserialization is assumed negligible compared to network latency.
+
+**Problem**:
+    - Large or complex objects (deep object graphs, collections with thousands of items) cause CPU spikes and GC pressure. Serialization time exceeds network round-trip time.
+
+**Avoidance**:
+    - Profile serialization performance. Use efficient serializers (System.Text.Json with source generation). Cache flattened DTOs, not EF entities with navigation properties.
+
+---
+
+## 8. Operational and production considerations
+
+### Things to monitor:
+
+    - **Cache hit rate**: Percentage of requests served from cache. Target >80% for read-heavy workloads. Declining hit rate indicates insufficient TTL, 
+    high eviction, or poor key distribution.
+
+    - **Cache latency (p50, p95, p99)**: Redis GET operations should complete in 1-3ms infra-zone. P99 > 10ms indicates network issue, server-side CPU saturation,
+    or large value sizes.
+
+    - **Eviction rate**: Keys evicted per second due to memory pressure. High eviction with low memory utilization suggests inefficient key patterns (many 
+    small keys). High eviction with high memory utilization requires capacity increase.
+
+    - **Connection count and failures**: Redis has connection limits (10,000 by default for Azure Cache Standard tier). Connection exhaustion causes 
+    cascading failures. Monitor active connections and connection errors.
+
+    - **Memory utilization**: Redis operates poorly above 80% memory usage. Eviction policies become aggressive. Performace degrades. Set alerts at 70%.
+
+    - **Command latency by operation**: SET commands are slower than GET. MGET faster than GETs. DEL operations on large keys block Redis (single-threaded).
+
+### What degrades first:
+
+Under load, Redis CPU occurs before memory exhaustion. Single-threaded nature means one slow command blocks subsequent commands. Large values (>100KB) or 
+expensive operations (KEYS, FLUSHDB) cause latency spikes.
+
+Under memory pressure, eviction removes least-recently-used keys. Hit rate drops. Database query load increases. Application latency degrades.
+
+### What becomes expensive:
+
+    - **Memory**: Redis pricing scales with memory tir. GB-scale caches at P3/P4 tiers cost $500-$2000/month in Azure.
+    - **Network egress**: Multi-region deployments incur cross-region data transfer costs. Cache replication between regions is expensive at high throughput.
+    - **Cluster management**: Aharded clusters (Redis Cluster mode) require client-side complexity, operational overhead, and careful resharding strategies.
+
+### Operational risks:
+
+    - **Thundering herd on cache expiration**: All instances simultaneously detect cache miss for a popular key. Hundreds of concurrent database queries for the same data. Database connection pool exhaustion.
+Mitigation: Use locking or semaphore patterns to ensure only one instance re-fetches. Others wait for cache to populate.
+
+    - **Cold start amplification**: New instances boot with empty local state. Shared cache is warm, but if Redis is unavailable, all instances hit the database simultaneously.
+Mitigation: Stagger deployments. Implement circuit breakers on database queries.
+
+    - **Memory fragmentation**: Redis memory fragmentation increases over time (write-heavy workloads). Effective memory usage is 60-70% of allocated memory.
+Mitigation: Monitor fragmentation ratio. Restart Redis nodes periodically or enable active defragmentation (performance cost).
+
+### Observability signals:
+
+```csharp
+// Instrument cache operations
+using var activity = _activitySource.StartActivity("cache.get");
+activity?.SetTag("cache.key", cacheKey);
+
+var sw = Stopwatch.StartNew();
+var cached = await _cache.GetStringAsync(cacheKey);
+sw.Stop();
+
+activity?.SetTag("cache.hit", cached != null);
+activity?.SetTag("cache.latency_ms", sw.ElapsedMilliseconds);
+
+_metrics.RecordCacheLatency(sw.ElapsedMilliseconds, cached != null);
+```
+
+Log cache misses for high-value keys. Track miss rate by endpoint or entity type. Identify cacheable queries that aren't being cached.
+
+---
+
+## 9. When NOT to use this
+
+### Scenario: Single-instance application
+If you run one application instance (development, small internal tools), in-process memory (```IMemoryCache```) is simpler, faster, and sufficient. Distributed cache adds latency and operational complexity with no benefit.
+
+### Scenario: Data requires strong consistency
+Financial transactions, inventory decrements, or any operation where stale reads cause correctness issues should not rely on cache. Read-your-writes consistency is not guaranteed in distributed cache. Use the database directly or implement cache-aside with immediate invalidation and accept race conditions.
+
+### Scenario: Write-heavy workloads
+If data changes more frequently than it's read (user session writes, real-time event streams), caching provides minimal benefit. Cache invalidation overhead exceeds query savings. The database is already optimized for writes.
+
+### Scenario: Unbounded or unpredictable query patterns
+Search queries with arbitrary filters, user-generated WHERE clauses, or analytics queries with unique parameters have near-zero cache hit rates. Every query is unique. Cache memory is wasted on single-use entries. Use database query optimization instead.
+
+### Scenario: Low query latency already acceptable
+If your database queries complete in &lt;10ms p95 and your application's latency budget is 200ms, caching saves 5% of total request time while adding operational complexity. The trade-off is unfavorable.
+
+### Scenario: Compliance prohibits external data storage
+Some regulatory environments (healthcare, finance) prohibit storing sensitive data outside specific approved systems. If Redis doesn't meet compliance requirements, caching may be impossible or require encryption that negates performance benefits.
+
+### Scenario: Cost constraints with low traffic
+Distributed cache infrastructure (Redis cluster, memory, monitoring) costs $100-$2000/month minimum. If your database handles current load comfortably and traffic is low, the cost of caching exceeds the value.
+
+---
+
+## 10. Key takeaways
+
+    - **Distributed cache solves the shared state problem in horizontally scaled systems** by centralizing memory access, trading local speed for consistency and reduced duplication.
+
+    - **Cache is an optimization layer, not authoritative storage.** The database is the source of truth. Cache unavailability must degrade performance, not break functionality. Always implement fallback to database queries.
+
+    - **Expiration is a safety net, not a primary invalidation strategy.** Set TTLs on all cached entries to prevent indefinite staleness. Explicit invalidation is an optimization, but writes will be missed.
+
+    - **Cache hit rate above 80% justifies operational complexity.** Below that threshold, investigate key patterns, TTL configuration, or whether caching is appropriate for the workload.
+
+    - **Serialization cost is non-trivial at scale.** Cache flattened DTOs, not complex object graphs. Profile serialization performance. Large values (>100KB) negate latency benefits.
+
+    - **Monitor eviction rate and memory utilization closely.** Eviction under memory pressure reduces hit rate and increases database load. Set alerts at 70% memory usage. High eviction with low memory suggests inefficient key patterns.
+
+    - **Cache invalidation races are unavoidable in distributed systems.** Eventual consistency means temporary staleness. Design application logic to tolerate stale reads or avoid caching data requiring strong consistency.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the distributed caching flow, highlighting shared state access across instances, cache-aside reads, database fallback on misses, and cache invalidation under real production constraints.
+
+import Light from './_assets/distributed-cache-architecture-light.svg';
+import Dark from './_assets/distributed-cache-architecture-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Distributed Cache architecture"
+  height={460}
+/>
