@@ -1,0 +1,852 @@
+---
+id: apim-architecture
+title: APIM Architecture
+slug: /platform/governance/azure/api-management
+description: Deep, production-focused guidance on designing, governing, securing, and operating APIs at scale using Azure API Management.
+sidebar_label: APIM Architecture
+keywords: [azure api management, api governance, api gateway architecture, enterprise api management, api platform design]
+sidebar_position: 10
+---
+
+## 1. What this document is about
+
+**Azure API Management (APIM)** is a reverse proxy and policy execution engine that sits between API consumers and backend services. 
+It provides centralized governance, security enforcement, traffic management, and observability for HTTP-based APIs.
+
+This document addresses the architectural and operational concerns of running APIM in production environments where:
+
+    - APIs serve multiple consumer types (internal teams, external partners, third-party developers)
+    - Security, compliance, and auditability are non-negotiable
+    - Traffic patterns are unpredictable or bursty
+    - Backend services are heterogeneous (AKS, Container Apps, Functions, on-prem)
+    - Network isolation and private connectivity are required
+    - Zero-downtime evolution of API contracts is expected
+
+#### Where this applies:
+
+    - Multi-tenant or multi-consumer API surfaces
+    - Regulated industries with audit and data residency requirements
+    - Microservices architectures requiring centralized policy enforcement
+    - API programs with versioning, throttling and monetization needs
+
+#### Where this does **not** apply:
+
+    - Internal-only service-to-service communication where a service mesh (Istio, Linkerd) id already in place
+    - Scenarios where latency overhead from an additional hop is unacceptable (sub-5ms requirements)
+    - Simple proxy needs without policy logic (Azure Front Door or Appliation Gateway may suffice)
+
+---
+
+## 2. Why this matters in real systems
+
+API Management becomes necessary when direct exposure of backend services creates operational, security or contractual problems.
+
+### Common breaking points without APIM:
+
+    - **Authentication fragmentation**: Different consumers require OAuth2, API keys, client certificates, or Azure AD. Backend services 
+    implement auth inconsistently, creating security gaps and maintenance burden.
+
+    - **Rate limiting and quota enforcement**: Without centralized throttling, backends face resource exhaustion during traffic spikes. Implementing 
+    per-consumer quotas in every service duplicates logic and creates synchronization issues.
+
+    - **Contract evolution**: Breaking changes to backend APIs force all consumers to update simultaneously. Lack of versioning or transformation 
+    capabilities makes backward compatibility impossible.
+
+    - **Observability gaps**: Without a central aggregation point, correlating requests across services requires stiching logs from disparate sources. 
+    Debugging partner integrations becomes forensic work.
+
+    - **Compliance violations**: Direct backend exposure makes it difficult to enforce data residency, audit logging, or PII redaction consistently. 
+    Each service must independently implement compliance controls.
+
+    - **Network topology constraints**: Backends running in private VNets or on-premises cannot be safely exposed to external consumers without complex 
+    firewall rules and jump boxes.
+
+### What tends to break when **APIM** is ignored:
+
+    - Security incidents from inconsistent authentication (one service forgets to validate tokens)
+    - Cascading failures when one misbehaving consumer overwhelms shared backends
+    - Partner churn when API contracts change without notice or backward compatibility
+    - Regulatory findings when audit logs are incomplete or tampered with
+    - Operational blind spots when troubleshooting cross-service failures
+
+### Why simpler approaches stop working
+
+    - **Application Gateway / Front Door alone**: These are L7 load balancers, not policy engines. They lack request transformation, throttling, 
+    response caching, or subscription management.
+
+    - **Backend-embedded logic**: Each service implementing its own rate limiting, auth validation, and logging creates a maintenance nightmare and 
+    inconsistent behavior.
+
+    - **Shared libraries**: Policy logic in shared SDKs still requires every service to be redeployed when policy changes. Versioning mismatches cause 
+    runtime failures.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of APIM as a **stateful, programmable request router** with three distinct phases:
+
+```
+[Consumer] → [Inbound Policy] → [Backend Selection] → [Outbound Policy] → [Consumer]
+                    ↓                                          ↓
+              [Validation]                               [Transformation]
+              [Authentication]                           [Caching]
+              [Rate Limiting]                            [Response Rewriting]
+              [Request Transform]
+```
+
+The lifecycle of a single request:
+
+    1. **Ingress**: Consumer sends request to APIM gateway (developer.contoso.com/api/orders)
+    2. **Subscription validation**: APIM checks if the API key or JWT is valid and has access to this API
+    3. **Inbound policy execution**: Policies run in sequence (validate JWT, check rate limit, transform request)
+    4. **Backend routing**: APIM forwards the request to the actual backend service (AKS cluster, Function App)
+    5. **Outbound policy execution**: Policies run on the response (remove headers, cache, rewrite status codes)
+    6. **Egress**: Response returned to consumer
+
+### Key mental model shift:
+
+APIM is not a passthrough proxy. It's a **policy execution runtime** where policies are small composable XML programs that can:
+
+    - Short-curcuit requests (return cached responses, reject invalid requests)
+    - Make external calls (validate tokens with OAuth provider, enrich request with data from Key Vault)
+    - Transform payloads (XML to JSON, rename fields, filter sensitive data)
+    - Emit telemtry (custom metrics, correlation IDs, audit logs)
+
+Policies are **scoped** at four levels (global → product → API → operation) and **merge** at runtime. Understanding policy 
+scope and execution order is critical to avoiding subtle bugs.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Request arrives at APIM gateway
+
+The consumer sends an HTTP request to the APIM gateway endoint. This could be:
+
+    - **Public endpoint**: ```https://api.contoso.com/orders``` (exposed via Azure Front Door or DNS)
+    - **Private endpoint**: Accessible only from within a VNet via Private Link
+
+#### What happens:
+
+    - APIM terminates TLS (using a certificate from Key Vault or uploaded cert)
+    - Request is matched to a configured API definition (path-based routing)
+    - Subscription key or Authorization header is extracted
+
+#### Why this exists:
+
+Centralized TLS termination allows for certificate rotation without touching backends.
+
+Subscription keys enable per-consumer tracking and throttling.
+
+#### Assumptions:
+
+    - DNS is correctly configured to route traffic to APIM's public IP or Private Endpoint
+    - Certificate in Key Vault is accessible via APIM's Managed Identity
+
+---
+
+### Step 2 — Subscription and access control validation
+
+APIM checks if the consumer has permission to access this API.
+
+#### Validation hierarchy:
+
+    1. **Subscription key**: Header ```Ocp-Apim-Subscription-Key``` or query parameter ```subscription-key```
+    2. **Product association**: The subscription must be associated with a Product that includes this API
+    3. **State check**: Subscription is not suspended or expired
+
+If validation fails, APIM returns ```401 Unauthorized``` or ```403 Forbidden``` without invoking policies or backends.
+
+#### Why this exists:
+
+Subscription-based access control decouples consumer identity from backend services.
+
+Backends never see raw subscription keys.
+
+#### Invariant:
+
+    - Subscription keys are unique and non-guessable (GUIDs)
+    - Revoking a subscription immediately blocks all requests (no caching)
+
+---
+
+### Step 3 — Inbound policy execution
+
+Policies defined at global, product, API and operation scopes are merged and executed in order.
+
+#### Common inbound policy operations:
+
+    - **JWT validation**: ```<validate-jwt>``` policy checks token signature, issuer, audience, claims
+    - **Rate limiting**: ```<rate-limit>``` or ```<quota>``` enforces call limits per subscription or IP
+    - **Request transformation**: ```<set-header>```, ```<rewrite-uri>```, ```<set-body>```  modify the request
+    - **Conditional routing**: ```<choose>``` evaluates expressions and branches logic
+    - **External callouts**: ```<send-request>``` fetches data from Key Vault, external APIs, or databases
+
+#### Example policy:
+
+```xml
+<inbound>
+    <base />
+    <validate-jwt header-name="Authorization" failed-validation-httpcode="401">
+        <openid-config url="https://login.microsoftonline.com/{tenant}/.well-known/openid-configuration" />
+        <required-claims>
+            <claim name="aud" match="all">
+                <value>api://contoso-orders</value>
+            </claim>
+        </required-claims>
+    </validate-jwt>
+    <rate-limit-by-key calls="100" renewal-period="60" counter-key="@(context.Request.IpAddress)" />
+    <set-header name="X-Forwarded-User" exists-action="override">
+        <value>@(context.Request.Headers.GetValueOrDefault("Authorization","").AsJwt()?.Claims["sub"])</value>
+    </set-header>
+</inbound>
+```
+
+#### Why this exists:
+
+Centralized policy enforcement ensures security and business rules are applied uniformly.
+
+Backend services can trust that requests reaching them have already been validated.
+
+#### Assumptions:
+
+    - Policies execute synchronously and add latency (JWT validation: ~10-50ms, external callouts: 100ms+)
+    - Policy failures stop request processing (no automatic retry or fallback)
+
+
+---
+
+### Step 4 — Backend invocation
+
+APIM forwards the (possible transformed) request to the configured backend service.
+
+#### Backend types:
+
+    - **HTTP(S) endpoint**: AKS service, Container App, App Service
+    - **Azure Function**: Direct invocation or via HTTP trigger
+    - **Service Fabric**: Statefull or stateless service
+    - **Logic App**: Workflow trigger
+
+#### Routing decisions:
+
+    - **URL rewriting**: APIM path ```/api/orders/{id}``` maps to backend ```/orders/v2/{id}```
+    - **Load balancing**: Built-in round-robin across multiple backend URLs (limited, not full LB)
+    - **Circuit breaking**: ```<forward-request>``` can timeout and return error without backend retry
+
+#### Why this exists:
+
+Decoupling APIM's public API surface from backend service topology allows backends to evolve independently. Path rewriting enables versioning.
+
+#### Invariants:
+
+    - APIM does not retry failed backend requests by default (implement retry in policy if needed)
+    - Backend timeout is configurable per operation (default: 300s)
+
+---
+
+### Step 5 — Outbound policy execution
+
+After receiving the backend response, outbound policies run in sequence.
+
+#### Common outbound operations:
+
+    - **Response caching**: ```<cache-lookup>``` / ```<cache-store>``` reduce backend load
+    - **Header removal**: ```<set header exists-action="delete">``` strips internal headers
+    - **Response transformation**: ```<set-body>``` modifies JSON or XML structure
+    - **Error handling**: ```<on-error>``` catches exceptions and returns custom error responses
+
+#### Example policy:
+
+```xml
+<outbound>
+    <base />
+    <cache-store duration="60" />
+    <set-header name="X-Backend-Service" exists-action="delete" />
+    <set-header name="X-Request-Id" exists-action="override">
+        <value>@(context.RequestId)</value>
+    </set-header>
+</outbound>
+```
+
+#### Why this exists:
+
+Caching at the gateway layer reduces backend load and improves p99 latency. Header sanitization prevents leaking internal metadata to consumers.
+
+---
+
+### Step 6 — Response returned to consumer
+
+APIM sends the final response back to the consumer with:
+
+    - Transformed body (if outbound policies modified it)
+    - Headers (sanitized or added by policies)
+    - HTTP status code (potentially rewritten)
+
+#### Telemetry emission:
+
+    - Request logged to Azure Monitor / Application Insights (if configured)
+    - Metrics: request count, latency, error rate, throttled requests
+    - Distributed tracing: ```traceparent``` header propagated to backend
+
+---
+
+## 5. Minimal but realistic example
+
+**Scenario**: Expose an internal Orders API running in AKS to external partners.
+
+Requirements:
+
+    - Azure AD authentication (OAuth2)
+    - Rate limiting: 1000 requests/hour per partner
+    - Cache GET requests for 60 seconds
+    - Remove internal headers from responses
+
+#### APIM configuration (Terraform):
+
+```hcl
+resource "azurerm_api_management" "apim" {
+  name                = "apim-prod-orders"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+  publisher_name      = "Contoso"
+  publisher_email     = "api@contoso.com"
+  sku_name            = "Premium_1" # Supports VNet injection, multi-region
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  virtual_network_type = "Internal" # VNet-injected, private only
+}
+
+resource "azurerm_api_management_api" "orders_api" {
+  name                = "orders-api"
+  resource_group_name = azurerm_resource_group.rg.name
+  api_management_name = azurerm_api_management.apim.name
+  revision            = "1"
+  display_name        = "Orders API"
+  path                = "orders"
+  protocols           = ["https"]
+  
+  service_url = "http://orders-service.orders.svc.cluster.local" # AKS internal DNS
+}
+
+resource "azurerm_api_management_api_operation" "get_order" {
+  operation_id        = "get-order"
+  api_name            = azurerm_api_management_api.orders_api.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.rg.name
+  display_name        = "Get Order"
+  method              = "GET"
+  url_template        = "/{orderId}"
+}
+
+resource "azurerm_api_management_api_policy" "orders_policy" {
+  api_name            = azurerm_api_management_api.orders_api.name
+  api_management_name = azurerm_api_management.apim.name
+  resource_group_name = azurerm_resource_group.rg.name
+
+  xml_content = <<XML
+<policies>
+  <inbound>
+    <base />
+    <validate-jwt header-name="Authorization" failed-validation-httpcode="401">
+      <openid-config url="https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration" />
+      <audiences>
+        <audience>api://contoso-orders-api</audience>
+      </audiences>
+    </validate-jwt>
+    <rate-limit-by-key calls="1000" renewal-period="3600" counter-key="@(context.Subscription.Id)" />
+    <cache-lookup vary-by-developer="false" vary-by-developer-groups="false">
+      <vary-by-query-parameter>orderId</vary-by-query-parameter>
+    </cache-lookup>
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+    <cache-store duration="60" />
+    <set-header name="X-AspNet-Version" exists-action="delete" />
+    <set-header name="X-Powered-By" exists-action="delete" />
+  </outbound>
+  <on-error>
+    <base />
+    <set-header name="X-Error-Source" exists-action="override">
+      <value>APIM-Gateway</value>
+    </set-header>
+  </on-error>
+</policies>
+XML
+}
+```
+
+#### How this maps to the concept:
+
+    - **Inbound**: JWT validation ensures only authenticated partners can access the API. Rate limiting prevents abuse. Cache lookup checks if a 
+    cached response exists.
+
+    - **Backend**: Request is forwarded to the AKS service via internal DNS (no public internet).
+
+    - **Outbound**: Response is cached for 60 seconds. Internal headers are stripped to prevent metadata leakage.
+
+    - **On-error**: Custom header added to error responses for debugging.
+
+---
+
+## 6. Design trade-offs
+
+|Decision                         |Gain                                                         |Give up                                                        |Accept                                                                 |
+|---------------------------------|-------------------------------------------------------------|---------------------------------------------------------------|-----------------------------------------------------------------------|
+|VNet-injected (internal mode)    |Full network isolation, private connectivity to backends     |Higher cost (Premium SKU), complex VNet peering/routing        |Cannot use Developer/Consumption tiers                                 |
+|Multi-region deployment          |Regional failover, low-latency global reach                  |2x infrastructure cost, data consistency challenges            |Active-active or active-passive config complexity                      |
+|External vs Internal cache       |**External (Redis)**: Shared across Instances, persistent    |**Internal**: Faster (in-memory), simpler                      |External cache adds latency (~5ms), requires Redis cluster management  |
+|Policy scope (global vs API)     |**Global**: DRY, single source of truth                      |**API-specific**: Flexibility, isolation                       |Global policies harder to test independently                           |      
+|Subscription-based auth          |Simple, built-in quotas, key rotation                        |Less secure than OAuth2, key leakage risk                      |Must implement key vaulting, rotation automation                       |
+|JWT validation in APIM           |Offload auth from backends, centralized config               |Policy latency (~20ms), requires token endpoint availability   |Backends trust APIM-validated requests                                 |
+|Response caching                 |Reduced backend load, improved p99 latency                   |Stale data risk, cache invalidation complexity                 |Cache duration tuning, vary-by-key strategy                            |
+|Self-hosted gateway              |On-prem or multi-cloud deployment local caching              |Additional infra management, version skew risk                 |Must monitor gateway health independently                              |
+|Premium tier                     |VNet injection, multi-region, unlimited cache                |10x cost vs Standard (~$2700/month)                            |Cost justified only for HA + prevate networking                        |
+|Consumption tier                 |Pay-per-call, serveless scalling                             |Cold start latency, no VNet support , limited policies         |Only for unpredictable/low-volume APIs                                 |
+
+#### Key insight:
+
+The Premium tier's cost is not justified by features alone — it's justified by the **operational cost of alternatives**. Running APIM in Standard tier with 
+public endpoints forces you to build custom solutions for VNet integration, which is more espensive in engineering time and reliability risk.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Using subscription keys as a security mechanism
+
+#### Why it happends:
+
+Subscription keys are easy to implement and seem sufficent for access control.
+
+#### What problem it causes:
+
+Keys are bearer tokens transmitted in headers or URLs, making them vulnerable to logging, browser history, and accidental expousure. No automatic 
+rotation, no expiration, no scopes.
+
+#### How to avoid it:
+
+Use OAuth2/OIDC (JWT tokens) for authentication. Use subscription keys **only** for rate limiting and usage tracking, not authorization. Implement 
+key rotation policies (30-90 days) and monitor key usage for anomalies.
+
+---
+
+### Over-relying on APIM's built-in caching or consistency-critical data
+
+#### Why it happends:
+
+APIM's cache is simple to configure and improves performance.
+
+#### What problem it causes:
+
+Cache invalidation is time-based only (no event-driven invalidation). Cached responses can become stale, causing data integrity issues in scenarios like 
+financial transactions or inventory levels.
+
+#### How to avoid it:
+
+Only cache **immutable or slowly-changing** data (product catalogs, static content). For consistency-critical data, cache in the backend with application-level 
+invalidation (Redis with pub/sub, database triggers). Use short TTLs (&lt;60s) and document cache behavior in API contracts.
+
+
+---
+
+### Treating APIM as a service mesh replacement
+
+#### Why it happends:
+
+APIM provides routing, observability, and policy enforcement—similar to Istio or Linkerd.
+
+#### What problem it causes:
+
+APIM is designed for north-south traffic (external consumers to backends), not east-west traffic (service-to-service). 
+Using APIM for internal microservice communication adds unnecessary latency (extra network hop) and cost (charged per call in Consumption tier).
+
+#### How to avoid it:
+
+Use APIM for external API exposure. Use a service mesh (Istio, Linkerd) or Azure Service Connector for 
+internal service communication. Do not route internal traffic through APIM unless you need centralized policy enforcement (e.g., compliance audit trail).
+
+---
+
+### Ignoring policy execution order and scope merging
+
+#### Why it happends:
+
+Policies are defined at multiple levels (global, product, API, operation) and the merge behavior is not obvious.
+
+#### What problem it causes:
+
+Policies execute in the order ```<base />``` is placed. If ```<base />``` is omitted or misplaced, 
+parent policies are skipped, causing security policies (like JWT validation) to be bypassed.
+
+#### How to avoid it:
+
+Always include ```<base />``` in each policy section (inbound, backend, outbound, on-error) 
+unless you explicitly want to override all parent policies. Test policy execution with tracing enabled (```Ocp-Apim-Trace: true``` header).
+
+#### Example of dangerous policy:
+
+```xml
+<inbound>
+    <!-- BUG: <base /> is missing, so global JWT validation is skipped -->
+    <set-header name="X-Custom" exists-action="override">
+        <value>value</value>
+    </set-header>
+</inbound>
+```
+---
+
+###  Not accounting for cold start latency in Consumption tier
+
+#### Why it happends:
+
+Consumption tier is marketed as "serverless" and cost-effective.
+
+#### What problem it causes:
+
+APIM instances in Consumption tier can experience cold starts (5-10 seconds) 
+after periods of inactivity. This is unacceptable for user-facing APIs with strict SLAs.
+
+#### How to avoid it:
+
+Use Consumption tier only for **low-traffic, non-critical APIs** (webhooks, batch jobs, partner integrations with relaxed SLAs). 
+For production APIs with &lt;1s latency requirements, use Standard or Premium tiers.
+
+---
+
+### Exposing internal error details in responses
+
+#### Why it happends:
+
+Default error responses include stack traces, backend URLs, and internal headers.
+
+#### What problem it causes:
+
+Leaking internal metadata aids attackers in reconnaissance (stack traces reveal .NET version, backend service names).
+
+#### How to avoid it:
+
+Implement ```<on-error>``` policies to sanitize error responses. Return generic error messages to consumers, log detailed errors to Application Insights.
+
+#### Example sanitization policy:
+
+```xml
+<on-error>
+    <base />
+    <set-body>@{
+        return new JObject(
+            new JProperty("error", "Internal server error"),
+            new JProperty("requestId", context.RequestId)
+        ).ToString();
+    }</set-body>
+    <set-header name="Content-Type" exists-action="override">
+        <value>application/json</value>
+    </set-header>
+</on-error>
+```
+
+---
+
+### Hardcoding secrets in policies
+
+#### Why it happends:
+
+Policies are XML, and it's tempting to embed API keys or connection strings directly.
+
+#### What problem it causes:
+
+Secrets are visible in policy definitions (stored in Azure, exported via ARM templates, visible to anyone with Contributor access).
+
+#### How to avoid it:
+
+Store secrets in Azure Key Vault. Reference them in policies using Named Values backed by Key Vault.
+
+#### Cprrect approach:
+
+```xml
+<inbound>
+    <set-header name="X-API-Key" exists-action="override">
+        <value>{{external-api-key}}</value> <!-- Named Value from Key Vault -->
+    </set-header>
+</inbound>
+```
+
+Configure Named Value in Terraform:
+
+```hcl
+resource "azurerm_api_management_named_value" "external_api_key" {
+  name                = "external-api-key"
+  resource_group_name = azurerm_resource_group.rg.name
+  api_management_name = azurerm_api_management.apim.name
+  display_name        = "external-api-key"
+  
+  value_from_key_vault {
+    secret_id = azurerm_key_vault_secret.api_key.id
+  }
+}
+```
+---
+
+## 8. Operational and production considerations
+
+### Monitoring and observability
+
+#### What to monitor
+
+    - **Request metrics**: Total requests, success rate (2xx), client errors (4xx), server errors (5xx)
+    - **Latency percentiles**: p50, p95, p99 (broken down by API, operation, consumer)
+    - **Throttling events**: ```429 Too Many Requests``` count per subscription
+    - **Cache hit ratio**: Cache lookups vs cache hits (low ratio indicates ineffective caching)
+    - **Backend availability**: Health check failures, timeout rate
+    - **Capacity metrics**: CPU, memory, network throughput (Premium tier instances)
+
+#### Key observability signals:
+
+Enable Application Insights integration for distributed tracing. Ensure ```traceparent``` headers are propagated to backends for end-to-end correlation.
+
+#### Query example (Log analytics):
+
+```kql
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(1h)
+| where ResponseCode >= 500
+| summarize ErrorCount = count() by ApiId, OperationId, BackendUrl
+| order by ErrorCount desc
+```
+
+#### What degrades first under stress:
+
+    1. **Policy execution latency**: Complex policies (JWT validation, external callouts) add 50-200ms per request. Under load, this compounds.
+    2. **Cache eviction**: Internal cache has limited capacity. High request volume causes cache thrashing, increasing backend load.
+    3. **Connection pool exhaustion**: APIM maintains connection pools to backends. Slow backends cause pool exhaustion, leading to ```503 Service Unavailable```.
+
+---
+
+### Capacity planning
+
+#### APIM capacity units (Premium tier):
+
+Each unit provides ~1000 requests/seconds throughput. Autoscaling adds/removes units based on CPU or memory.
+
+#### Sizing guidelines:
+
+    - **Low traffic (&lt;100 req/s)**: 1 unit (Standard tier may suffice)
+    - **Medium traffic (100-1000 req/s)**: 2-4 units
+    - **High traffic (>1000 req/s)**: 4+ units, consider multi-region deployment
+
+#### Cost implications:
+
+    - Premium tier: ~$2700/month per unit (rigional deployment)
+    - Multi-region adds cost per region (data transfer, duplicate infrastructure)
+    - Consumption tier: ~$3.50 per million requests (no upfront cost, cold start risk)
+
+#### Autoscaling configuraiton (Terraform):
+
+```hcl
+resource "azurerm_monitor_autoscale_setting" "apim_autoscale" {
+  name                = "apim-autoscale"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  target_resource_id  = azurerm_api_management.apim.id
+
+  profile {
+    name = "default"
+    capacity {
+      default = 2
+      minimum = 1
+      maximum = 10
+    }
+    rule {
+      metric_trigger {
+        metric_name        = "Capacity"
+        metric_resource_id = azurerm_api_management.apim.id
+        operator           = "GreaterThan"
+        statistic          = "Average"
+        threshold          = 80
+        time_aggregation   = "Average"
+        time_grain         = "PT1M"
+        time_window        = "PT5M"
+      }
+      scale_action {
+        direction = "Increase"
+        type      = "ChangeCount"
+        value     = "1"
+        cooldown  = "PT10M"
+      }
+    }
+  }
+}
+```
+
+---
+
+### Security hardening
+
+#### Network isolation:
+
+    - Deploy APIM in Internal VNet mode (Premium mode)
+    - Use Private Link for backend connectivity (AKS, App Service)
+    - Restrict unbound traffic via Azure Front Door or Application Gateway (WAF enabled)
+    - Disable public IP address (force all traffic through Front Door)
+
+#### Client authentication:
+
+    - Prefer OAuth2/OIDC over subscription keys
+    - Implement mutual TLS (mTLS) for high-security scenarios
+    - Configure client certificate validation in policies:
+
+```xml
+<inbound>
+    <choose>
+        <when condition="@(context.Request.Certificate == null || !context.Request.Certificate.Verify())">
+            <return-response>
+                <set-status code="403" reason="Invalid client certificate" />
+            </return-response>
+        </when>
+    </choose>
+</inbound>
+```
+
+#### Secret rotation:
+
+    - Use Managed Identity for APIM to access Key Vault
+    - Automate certificate rotation (90-day lifecycle)
+    - Rotate subscription keys on a fixed schedule (30-90 days)
+
+---
+
+### Disaster recovery and high availability
+
+#### Multi-region deployment:
+
+Deploy APIM instances in multiple Azure regions with Azure Front Door for global load balancing.
+
+#### Failover strategy:
+
+    - Active-active: Both regions serve traffic (requires data synchronization for caching, rate limiting)
+    - Active-passive: Primary region handles all traffic, secondary region is warm standby
+
+#### RTO/RPO considerations:
+
+    - Configuration changes (APIs, policies) are synchronized automatically in multi-region deployments
+    - Cache and rate limit counters are not synchronized across regions (use external Redis if strict consistency is required)
+
+#### Backup and restore:
+
+    - Use ARM templates or Terraform to version-control APIM configuration
+    - Export APIs, policies, and Named Values to source control (Azure DevOps, Github)
+    - Test restore procedure quarterly
+
+---
+
+### Operational runbooks
+#### Incident: Backend service is slow (p99 > 2s)
+
+    1. Check APIM metrics: ```BackendDuration``` vs ```TotalDuration``` (isolate latency source)
+    2. Review cache hit ratio: Low ratio indicates cache ineffectiveness
+    3. Increase backend timeout temporarily (avoid cascade failures)
+    4. Enable response caching or increase cache duration
+    5. Notify backend team to investigate service degradation
+
+#### Incident: 429 Too Many Requests (rate limit exceeded)
+
+    1. Identify affected subscription: Query ```ApiManagementGatewayLogs``` for ```ResponseCode == 429```
+    2. Check if legitimate traffic spike (partner integration testing) or abuse
+    3. Temporarily increase quota for legitimate consumers
+    4. Investigate if DDoS or credential compromise (check IP patterns)
+
+#### Incident: Certificate expiration
+
+    1. APIM alerts 30 days before cert expiration (configure Azure Monitor alert)
+    2. Upload new certificate to Key Vault
+    3. Update Named Value reference in APIM (zero downtime)
+    4. Verify TLS handshake from external client
+
+---
+
+
+## 9. When NOT to use this
+
+### Scenario 1: Internal-only microservice communication
+
+If your services are all within a private VNet and communicate service-to-service, 
+APIM adds unnecessary latency and cost. Use a service mesh (Istio, Linkerd) or Azure Service Connector for internal routing and observability.
+
+**Exception**: If you need centralized audit logging or compliance-mandated request inspection, APIM may still be justified.
+
+---
+
+### Extremely high throughput, latency-sensitive systems
+
+APIM adds ~10-50ms of latency (policy execution, network hop). For systems requiring sub-5ms response times (high-frequency trading, gaming), 
+this overhead is unacceptable.
+
+**Alternative**: Use Azure Front Door or Application Gateway as a simple reverse proxy, implement security logic directly in backend services.
+
+---
+
+### Simple public website or static content
+
+If you're serving static HTML/CSS/JS or a simple public website, APIM is overkill. 
+Use Azure CDN, Azure Static Web Apps, or Azure Storage with static website hosting.
+
+---
+
+### Budget-constrained startups with unpredictable traffic
+
+Premium tier ($2700/month minimum) is too expensive for early-stage startups. Consumption tier has cold start issues.
+
+**Alternative**: Use Azure Functions with HTTP triggers + Azure Front Door for basic routing and TLS termination. 
+Migrate to APIM when you have stable revenue and SLA requirements.
+
+---
+
+### Backends already implement robust policy enforcement
+
+If your backend services already validate JWTs, enforce rate limits, and handle caching, APIM duplicates this logic. The added complexity may not be worth it.
+
+**Exception**: Even if backends are robust, APIM provides centralized observability and decouples consumer-facing contracts from backend evolution.
+
+---
+
+## 10. Key takeaways
+
+    - **APIM is a policy execution runtime, not a passthrough proxy**. Policies can short-circuit requests, transform payloads, and make external calls. 
+    Understanding policy scope and execution order is critical to avoiding security bypasses.
+
+    - **Subscription keys are not a security mechanism**. Use OAuth2/OIDC for authentication. Use subscription keys only for rate limiting and usage tracking. 
+    Implement key rotation automation.
+
+    - **Premium tier is expensive but unavoidable for VNet injection and multi-region**. The cost is justified by avoiding the engineering complexity of building custom VNet integration and regional failover.
+
+    - **Cache conservatively and document cache behavior in API contracts**. Only cache immutable or slowly-changing data. Use short TTLs (&lt;60s) for consistency-critical data. Cache invalidation is time-based only.
+
+    - **Monitor cache hit ratio, throttling events, and backend latency percentiles**. These are leading indicators of performance degradation. Low cache hit ratio indicates ineffective caching strategy. High throttling rate may indicate abuse or legitimate traffic growth.
+
+    - **Do not use APIM for internal service-to-service communication**. APIM is designed for north-south traffic (external consumers to backends). Use a service mesh for east-west traffic to avoid unnecessary latency and cost.
+
+    - **Test policy execution with tracing enabled before deploying to production**. Use ```Ocp-Apim-Trace: true``` header to inspect policy execution order and variable values. Missing ```<base />``` in policies can bypass critical security checks.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of Azure API Management, highlighting centralized policy enforcement, controlled consumer access, secure backend isolation, and governed API evolution in production environments.
+
+import Light from './_assets/apim-architecture-light.svg';
+import Dark from './_assets/apim-architecture-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="APIM Architecture"
+  height={560}
+/>
