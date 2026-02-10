@@ -313,36 +313,594 @@ They are applied later, once all required causal dependencies have been satisfie
 
 ## 5. Minimal but realistic example (.NET)
 
+### Scenario: E-commerce order processing with inventory reservation
 
+#### System components:
+
+    - SQL database (order data)
+    - Redis cache (inventory counts)
+    - Azure Service Bus (order events)
+    - Inventory Service (consumes events, updates inventory)
+    - Order Service (creates orders, publishes events)
+
+### Eventual consistency (problematic)
+
+```csharp
+// Order Service
+public async Task<OrderResult> PlaceOrderAsync(CreateOrderRequest request)
+{
+    // Read cached inventory count
+    var inventoryCount = await _cache.GetAsync<int>($"inventory:{request.ProductId}");
+    
+    if (inventoryCount < request.Quantity)
+        return OrderResult.InsufficientInventory;
+    
+    // Create order in database
+    var order = new Order 
+    { 
+        ProductId = request.ProductId, 
+        Quantity = request.Quantity 
+    };
+    await _dbContext.Orders.AddAsync(order);
+    await _dbContext.SaveChangesAsync();
+    
+    // Publish event asynchronously
+    await _serviceBus.PublishAsync(new OrderPlacedEvent 
+    { 
+        OrderId = order.Id, 
+        ProductId = request.ProductId, 
+        Quantity = request.Quantity 
+    });
+    
+    return OrderResult.Success(order.Id);
+}
+
+// Inventory Service (separate process)
+public async Task HandleOrderPlacedAsync(OrderPlacedEvent evt)
+{
+    // Update database inventory
+    await _dbContext.Database.ExecuteSqlRawAsync(
+        "UPDATE Inventory SET Count = Count - {0} WHERE ProductId = {1}",
+        evt.Quantity, evt.ProductId);
+    
+    // Invalidate cache asynchronously
+    await _cache.RemoveAsync($"inventory:{evt.ProductId}");
+}
+```
+
+**Problem**: Cache and database are eventually consistent. Race conditions allow overselling:
+
+    1. Order Service reads cached count (10 times)
+    2. Two concurrent requests each order 6 items
+    3. Both path inventory check (10 >= 6)
+    4. Both orders succeed
+    5. Inventory Service processes events, decrements to -2
+    6. You're sold 12 items but only had 10
+
+---
+
+### Strong consistency (correct but slow)
+
+```csharp
+public async Task<OrderResult> PlaceOrderAsync(CreateOrderRequest request)
+{
+    using var transaction = await _dbContext.Database.BeginTransactionAsync(
+        IsolationLevel.Serializable);
+    
+    try
+    {
+        // Read inventory with exclusive lock
+        var inventory = await _dbContext.Inventory
+            .FromSqlRaw("SELECT * FROM Inventory WITH (UPDLOCK, HOLDLOCK) WHERE ProductId = {0}", 
+                        request.ProductId)
+            .SingleOrDefaultAsync();
+        
+        if (inventory.Count < request.Quantity)
+            return OrderResult.InsufficientInventory;
+        
+        // Decrement inventory atomically
+        inventory.Count -= request.Quantity;
+        
+        // Create order
+        var order = new Order 
+        { 
+            ProductId = request.ProductId, 
+            Quantity = request.Quantity 
+        };
+        await _dbContext.Orders.AddAsync(order);
+        
+        await _dbContext.SaveChangesAsync();
+        await transaction.CommitAsync();
+        
+        // Publish event only after commit (outbox pattern recommended)
+        await _serviceBus.PublishAsync(new OrderPlacedEvent 
+        { 
+            OrderId = order.Id, 
+            ProductId = request.ProductId, 
+            Quantity = request.Quantity 
+        });
+        
+        // Invalidate cache after successful commit
+        await _cache.RemoveAsync($"inventory:{request.ProductId}");
+        
+        return OrderResult.Success(order.Id);
+    }
+    catch
+    {
+        await transaction.RollbackAsync();
+        throw;
+    }
+}
+```
+
+#### How it maps to the concept:
+
+    - Serializable isolation provides strong consistency within the database
+    - Exclusive lock (```UPDLOCK```, ```HOLDLOCK```) prevents concurrent reads/writes to the same inventory row
+    - All operations (check, decrement, order creation) happen atomically
+    - Cache invalidation happens after commit, accepting brief staleness in exchange for correctness
+    - Event publishing follows the write, maintaining causal consistency
+
+**Trade-offs**: Every order acquisition holds a database lock, reducing throughput and increasing latency. Under high concurrency, lock contention becomes a 
+bottleneck.
+
+---
+
+### Casual consistency (balanced)
+
+```csharp
+// Use versioned inventory with optimistic concurrency
+public class Inventory
+{
+    public Guid ProductId { get; set; }
+    public int Count { get; set; }
+    public long Version { get; set; } // Incremented on each update
+}
+
+public async Task<OrderResult> PlaceOrderAsync(CreateOrderRequest request)
+{
+    const int maxRetries = 3;
+    
+    for (int attempt = 0; attempt < maxRetries; attempt++)
+    {
+        // Read current inventory state
+        var inventory = await _dbContext.Inventory
+            .AsNoTracking()
+            .SingleOrDefaultAsync(i => i.ProductId == request.ProductId);
+        
+        if (inventory.Count < request.Quantity)
+            return OrderResult.InsufficientInventory;
+        
+        // Create order
+        var order = new Order 
+        { 
+            ProductId = request.ProductId, 
+            Quantity = request.Quantity,
+            InventoryVersionAtReservation = inventory.Version // Capture version
+        };
+        await _dbContext.Orders.AddAsync(order);
+        
+        // Attempt to decrement inventory with version check (compare-and-swap)
+        var rowsAffected = await _dbContext.Database.ExecuteSqlRawAsync(@"
+            UPDATE Inventory 
+            SET Count = Count - {0}, Version = Version + 1 
+            WHERE ProductId = {1} AND Version = {2} AND Count >= {0}",
+            request.Quantity, request.ProductId, inventory.Version);
+        
+        if (rowsAffected == 0)
+        {
+            // Version changed (concurrent modification) or insufficient inventory
+            await Task.Delay(TimeSpan.FromMilliseconds(100 * (attempt + 1))); // Exponential backoff
+            continue; // Retry
+        }
+        
+        await _dbContext.SaveChangesAsync();
+        
+        // Publish event with version information
+        await _serviceBus.PublishAsync(new OrderPlacedEvent 
+        { 
+            OrderId = order.Id, 
+            ProductId = request.ProductId, 
+            Quantity = request.Quantity,
+            InventoryVersion = inventory.Version + 1
+        });
+        
+        // Invalidate cache
+        await _cache.RemoveAsync($"inventory:{request.ProductId}");
+        
+        return OrderResult.Success(order.Id);
+    }
+    
+    return OrderResult.ConcurrentModificationFailure;
+}
+```
+
+#### How it maps to causal consistency:
+
+    - Version number acts as a logic clock tracking the causal history of inventory updates
+    - Compare-and-swap ensures updates only succeed if no intervening write occurred
+    - Retries handle conflicts without blocking other operations
+    - Events carry version information, allowing downstream consumes to detect and handle out-of-order delivery
+
+**Trade-off**: No locks, higher throughput. Conflicts result in retries instead of waiting. Under exterme contention, retry storms can occur.
 
 ---
 
 ## 6. Design trade-offs
 
+|Consistency Model      |Latency            |Availability                |Throughput              |Complexity                                |Use When                                                                               |
+|-----------------------|-------------------|-------------------------   |------------------------|------------------------------------------|---------------------------------------------------------------------------------------|
+|**Strong**             |High (100ms-1s+)   |Low (requires quorum)       |Low (serialized writes) |Low (simple reasoning)                    |Financial transaction, unique constraints invetory with zero tolerance for overseeling |
+|**Sequential**         |Medium (50-200ms)  |Medium                      |Medium                  |Medium                                    |Operations must appear in a total order, but don't need real-time visibility           |
+|**Causal**             |Low (10-50ms)      |High                        |High                    |High (vector, clocks dependency tracking) |Social feeds, collaborative editing, messaging (replies must follow posts)             |
+|**Eventual**           |Very Low (1-10ms)  |Very High (always writable) |Very High               |Medium (conflict resolution logic)        |Analytics, caching, view counts, non-critical reads                                    |
+|**Read-your-writes**   |Low-Medium         |High                        |High                    |Medium (session affinity, client tracking)|User profiles, settings (user sees own updates immediately                             |
+
+### Alternative approaches and their costs
+
+#### Two-phase commit (2PC):
+
+    - **Gain**: ACID guarantees across distributed resources
+    - **Give up**: Availability (block if coordinator fails), performance (multiple round trips)
+    - **Accept**: Operational complexity of coordinator recovery, potential for indefinitite blocking
+
+#### Saga pattern (compensating transactions):
+
+    - **Gain**: Availability (each step commit independently), no distributed locks
+    - **Give up**: Atomicity (intermediate state visible), potential for inconsistency windows
+    - **Accept**: Complex rollback logic, idempotency requirements, eventual consistency between saga steps
+
+#### CRDT (Conflict-free Replicated Data Types):
+
+    - **Gain**: Automatic conflict resolution, no coordination needed, high availability
+    - **Give up**: Limited to specific data structures (counters sets, registers), cannot express arbitrary business logic
+    - **Accept**: Additional metadata overhead, complex merge semantics
+
+#### Event sourcing with idempotent consumers:
+
+    - **Gain**: Auditability, replayability, natural causal ordering
+    - **Give up**: Query complexity (event replay cost), storage overhead
+    - **Accept**: Eventual consistency between write model and read models
+
+### Failure mode comparison
+
+**Strong consistency failure mode**: During network partition or node failures, writes become unavailable until quorum is restored. Reads may also become 
+unavailable depending on configuration. System chooses consistency over availability.
+
+**Eventual consistency failure mode**: During partition, both sides accept writes independently. When partition heals, conflicts must be resolved (last-write-wins, 
+vector clock merging, or manual internvention). System chooses availability over consistency, accepting temporary divergence.
+
+**Causal consistency failure mode**: Out-of-order event delivery can cause buffering and delayed processing. If dependencies never arrive (due to bugs or data 
+loss), dependent operations remain blocked indefinitely. Requires careful timeout and dead letter queue handling.
 
 
 ---
 
 ## 7. Common mistakes and misconceptions
 
+### "Eventual consistency means data will be correct eventually"
+
+**Why it happens**:
+
+    - The term "eventual" sounds reassuring, implying correctness is just delayed.
+
+**Problem it causes**:
+
+    - Eventual consistency guarantees convergence, not correctness. If two replicas independently accept conflicting writes (both decrement inventory to -1) 
+they'll eventual converge to the same wrong value. Business invariants (non-negative inventory) are not preserved.
+
+**How to avoid**: 
+
+    - Distinguish between convergence and correctness. Use strong consistency or application-level conflict resolution for operations that 
+must preserve invariants.
+
+---
+
+### "Using distributed transactions everywhere"
+
+**Why it happens**:
+
+    - Strong consistency is easy to reason about. Developers default to the familiar ACID model.
+
+**Problem it causes**:
+
+    - Distributed transactions (2PC, XA) kill availability and performance. Every transaction coordinates across multiple services, each holding locks, 
+creating cascading latency. Under load, timeout-induced rollbacks cause thrashing.
+
+**How to avoid**:
+
+    - Reserve distributed transactions for truly atomic cross-service operations (rare). Prefer local transactions within 
+service boundaries, eventual consistency across boundaries, and saga patterns for long-running workflows.
+
+---
+
+### "Read-after-write consistency is free with a cache"
+
+**Why it happens**:
+
+    - Developers assume cache invalidation immediately makes fresh data visible.
+
+**Problem it causes**:
+
+    - Cache invalidation is asynchronous. Between invalidation and cache refresh, 
+reads may hit stale data still in the cache or may trigger a cache miss that fetches from a lagging replica.
+
+**How to avoid**: 
+
+    - Implement read-your-writes using session affinity (sticky sessions), version headers 
+(client sends last seen version, server waits until caught up), or explicitly routing reads to primary after writes.
+
+---
+
+### "Timestamps can establish global ordering"
+
+**Why it happens**:
+
+    - System clocks seem like a simple way to order events across nodes.
+
+**Problem it causes**:
+
+    - Clocks drift and can be adjusted backward (NTP corrections). Two events on different nodes with timestamps T1 &lt; T2 do not guarantee E1 
+happened before E2. Relying on timestamps for ordering causes silent data corruption (later write appears earlier, gets overwritten)
+
+**How to avoid**:
+
+    - Use logical clocks (Lamport clocks, vector clocks) or hybrid logical clocks (HLCs) that combine physical time with logical counters. 
+For strong ordering, use a centralized sequencer (single source of ordering) or consensus protocols.
+
+---
+
+### "Retries solve consistency problems"
+
+**Why it happens**:
+
+    - Retry logic is a standard reliability pattern.
+
+**Problem it causes**:
+
+    - Non-idempotent operations (create order, charge payment) executed multiple times create duplicates. Retries without proper 
+deduplication cause double-charging, duplicate inventory reservations, and violated uniqueness constraints.
+
+**How to avoid**:
+
+    - Make all operations idempotent using client-provided idempotency keys, store request IDs 
+to detect duplicates, or use exactly-once delivery guarantees (complex and expensive).
+
+---
+
+### "Causal consistency is just eventual consistency with ordering"
+
+**Why it happens**:
+
+    - Both allow temporary divergence, so they seem similar.
+
+**Problem it causes**:
+
+    - Causal consistency has stricter guarantees and higher implementation cost. Treating it as eventual consistency with ordering underestimates 
+the complexity of tracking dependencies (vector clocks, dependency graphs) and buffering out-of-order messages.
+
+**How to avoid**:
+
+    - Understand that causal consistency requires explicit dependency tracking across all operations. 
+Only use it when cause-effect violations would break correctness (e.g., seeing a reply before the original message).
+
+---
+
+### "The database handles all consistency"
+
+**Why it happens**:
+
+    - Relational databases provide ACID transactions, leading to a false sense of safety.
+
+**Problem it causes**:
+
+    - Consistency guarantees don't extend beyond database boundaries. A read from SQL followed by a read from Redis is not consistent. Publishing an event to 
+Service Bus after a database commit is not atomic. The database protects its own internal consistency but not your application's distributed state.
+
+**How to avoid**:
+
+    - Recognize that distributed systems span multiple storage systems, caches, and message queues. Map out where data lives and explicitly design 
+consistency across these boundaries using patterns like outbox, sagas, or distributed transactions.
 
 ---
 
 ## 8. Operational and production considerations
 
+### What to monitor
+
+**Replication lag**: Time delta between primary write and replica visibility. Track per replica, per table, per region.
+
+    - **Why**: Indicates how far behind replicas are running. Spikes indicate network issues, replica overload, or large batch writes.
+    - **Alert threshold**: Depends on consistency model. Eventual consistency can tolerate minutes; read-your-writes should alert at >1 second.
+
+**Confict rate**: Number of write conflicts detected (optimistic concurrency failures, CRDT merges, saga compensations).
+
+    - **Why**: High conflict rates indicate hot keys, incorrect partitioning, or excessive concurrent writes.
+    - **What to track**: Conflicts per second, conflict resolution latency, automatic vs. manual resolutions.
+
+**Transaction abort rate**: Percentage of transactions that abort due to serialization failures or deadlocks.
+
+    - **Why**: High abort rates under strong consistency indicate lock contention. System is spending resources on failed work.
+
+**Staleness duration**: Distribution of time between a write completing and that write becoming visible to a given reader.
+
+    - **Why**: Quantifies the practical impact of eventual consistency. 99th percentile staleness matterns more than average.
+
+**Event processing lag**: Delta between event publication time and processing completion time.
+
+    - **Why**: Indicates backpressure in asynchronous pipelines. Lag compounds across dependent services.
+
+**Cache hit rate and invalidation lag**: Cache effectiveness and time between database write and cache invalidation completion.
+
+    - **Why**: Low hit rate negate caching benefits. High invalidation lag increase staleness window.
+
+### What degrades first:
+
+#### Under write-heavy load:
+
+    - Strong consistency: Lock contention causes transaction timeouts and abort rate spikes. Throughput collapses.
+    - Eventual consistency: Replication lag increases as replicas struggle to keep up. Staleness duration grows.
+
+#### Under read-heavy load:
+
+    - Strong consistency: Quorum reads overwhelm replicas. Read latency increases.
+    - Eventual consistency: System scales horizontally with read replicas, handling load gracefully.
+
+#### During network partitions:
+
+    - Strong consistency (CP system): Minority partition becomes unavailable for writes and quorum reads.
+    - Eventual consistency (AP system): Both partitions remain writable, accumulating divergence that must be reconciled.
+
+#### During replica failure:
+
+    - Strong consistency: If quorum cannot be formed (majority of replica down), writes fail. System becomes read-only or fully unavailable.
+    - Eventual consistency: Remaining replicas continue serving reads and writes. Failed replica catches up when restored.
+
+### What becomes expensive
+
+**Storage**: Conflict resolution metadata (vector clocks, version histories, CRDT tombstones) accumulates. Event sourcing store event state change. Multi-version 
+concurrency control (MVCC) maintains old versions.
+
+**Compute**: Conflict detection (vector clock comparisons), CRDT merge operations, and buffering out-of-order events consume CPU and memory. Saga compensation 
+logic executes on failures.
+
+**Network**: Synchronous replication for strong consistency multiplies network calls. Quorum reads query multiple replicas. Causal consistency broadcasts 
+dependency metadata.
+
+**Latency**: Strong consistency adds RTT (round-trip time) for quorum coordination. Cross-region replication adds hundreds of milliseconds. Lock acquisition 
+serializes operations.
+
+### Observability signals
+
+#### Correctness violations:
+
+    - Inventory going negative (invariant broken)
+    - Duplicate processing of idempotent operations (retry without deduplication)
+    - Out-of-order message delivery causing causal violation (reply before original post)
+
+#### Performance degration:
+
+    - P99 latency increase on write operations (lock contention)
+    - Sudden spike in transaction retry rate (optimistic concurrency conflict storm)
+    - Event consumer lag growing monotonically (backpressure)
+
+#### Consistency anomalies:
+
+    - Users reporting stale data (cache serving old values)
+    - Reports showing data inconsistencies across services (eventual consistency divergence)
+    - Failed assertion in testing (race conditions, non-repeatable reads)
+
+
+### Operational risks
+
+    - **Data loss during failover**: If primary fails before replicating writes to secondaries, those writes are lost. 
+    Strong consistency with quorum writes mitigates this; asynchronous replication accepts this risk.
+
+    - **Split-brain scenarios**: Network partition creates two primaries, both accepting writes. 
+    Reconciliation is complex or impossible without application-specific conflict resolution.
+
+    - **Thundering herd on cache invalidation**: Invalidating a hot key causes all subsequent reads to miss cache simultaneously, overwhelming the database.
+
+    - **Cascading failures in sagas**: If one step in a multi-step saga fails after several steps have committed, 
+    compensating transactions must execute in reverse order. If compensation fails, manual intervention is required.
+
+    - **Unbounded replication lag**: Slow consumers or large batch operations can cause replicas to fall hours or days behind, 
+    making eventual consistency impractical for reads requiring fresh data.
 
 ---
 
 ## 9. When NOT to use this
 
+### Don't use strong consistency when:
+
+    - **Your domain tolerantes brief inconsistency**: View counts, "likes", analytics dashboards, and approximations don't require real-time accurancy. 
+    Strong consistency adds cost for zero business value.
+
+    - **Availability matterns more than correctness**: If your SLA promises 99.99% uptime, strong consistency's requirement for quorum makes that SLA 
+    unachievable during partitions or multi-region deployments.
+
+    - **You're operation at high scale**: Serializable transactions don't scale horizontally. Systems handling millions of writes per second (ad serving, 
+    IoT telemetry, clickstream analytics) cannot afford coordination overhead.
+
+    - **Latency is critical**: Real-time gaming, low-latency trading platforms, and streaming services cannot accept the 100ms+ penalty of distributed coordination.
+    
+### Don't use eventual consistency when:
+
+    - **Business invariants must never be violated**: Overselling invetory, double-charging payments, or allowing conflicting reservation is unacceptable. 
+    The risk of covergence to an incorrect state is too high.
+
+    - **User expect immediate read-your-writes**: Profile updates, settings changes , and user-generated content that the user immediately queries must 
+    be visible. The cognitive dissonance of saving a setting and seeing it unchanged on refresh destroys trust.
+
+    - **You lack conflict resolution logic**: Eventual consistency requires explicit handling of conflicts when concurrent writes occur. If you don't have 
+    deterministic merge logic (CRDTs, last-write-wins, manual resolution), you'll end up with silent data corruption.
+
+    - **Regulatory requirements demand auditability**: Financial systems, healthcare records, and legal documents require provable ordering and state. 
+    Eventual consistency's ambiguity about which write "won" violates compliance.
+
+### Don't use casual consistency when:
+
+    - **Operations have no causal relationships**: Independent events (unrelated user actions, sensor readings from different devices) don't benefit 
+    from casual ordering. The overhead of vector clocks and dependency tracking is wasted.
+
+    - **You can't track dependencies**: Casual consistency requires instrumenting your entire system to capture happens-before relationships. If 
+    you're integrating with third-party services or legacy systems that don't emit causality metadata, you can't enforce casual ordering.
+
+    - **Strong consistency is feasible**: If your scale and latency requirements allow strong consistency, it's simpler and provides stronger guarantees. 
+    Casual consistency's complexity only makes sense when strong consistency is too expensive.
+
+
+### Don't use distributed transaction when:
+
+    - **Operations span minutes or hours**: Long-running transactions hold locks, blocking other operations. Saga patterns with compensating transactions 
+    are more appropriate for multi-step workflows that can't complete in seconds.
+
+    - **Coordinator is a single point of failure**: Two-phase commit requires a coordinator. If the coordinator crashes mid-transaction, participants are left 
+    in uncertain states requiring manual intervention.
+
+    - **Cross-organizational boundaries**: You can't enfornce distributed transaction protocols across services you don't control. External APIs don't 
+    participate in your 2PC protocol.
 
 ---
 
 ## 10. Key takeaways
 
+    - **Consistency models are not features you enable; they constraints you enforce**. Every architectural decision — caching, replication, async messaging 
+    — introduces consistency trade-offs. Design these explicitly.
+
+    - **Strong consistency and high availability are mutually exclusive under network partitions**. Choose one. If you need both, partition your data so 
+    critical invariants use strong consistency while non-critical data uses eventual consistency.
+
+    - **Eventual consistency guarantees convergence, not correctness**. If two replicas independently violate an invariant, they'll eventually agree on the
+     wrong value. Protect invariants with strong consistency or application-level validation.
+
+     - **Timestamps from different machines cannot establish global ordering**. Clocks drift. Use logical clocks (Lamport, vector) or centralized 
+     sequencers. Physical timestamps are useful for approximations and debugging, not correctness.
+
+     - **Retries without idempotency create duplicates**. Every operation that can be retried must be idempotent. Use client-provided idempotency keys, 
+     deduplicate on request IDs, or accept exactly-once delivery's operational complexity.
+
+     - **Consistency guarantees don't cross system boundaries automatically**. A read from SQL followed by a read from Redis is not consistent. A database 
+     transaction followed by an event publish is not atomic. Use [outbox patterns](/docs/architecture/patterns/outbox-pattern/) sagas, or distributed 
+     transactions to extend guarantees.
+
+     - **Monitoring replication lang, conflict rate, and staleness is not optional**. These metrics are your early warning system for consistency 
+     violations. Alert on thresholds before users report data corruption.
+
 ---
 
 ## 11. High-Level Overview
 
-> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+> Visual representation of consistency models in distributed systems, highlighting how write operations propagate across replicas, how ordering and visibility guarantees differ, and where coordination, buffering, and convergence occur under each model.
 
+import Light from './_assets/consistency-model-light.svg';
+import Dark from './_assets/consistency-model-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Consistency model"
+  height={400}
+/>
