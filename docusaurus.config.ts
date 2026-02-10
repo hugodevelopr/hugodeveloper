@@ -113,7 +113,7 @@ const config: Config = {
     },
     footer: undefined,
     prism: {
-      theme: prismThemes.vsDark,
+      theme: prismThemes.oneDark,
       darkTheme: prismThemes.dracula,
       additionalLanguages: ['csharp', 'powershell', 'yaml', 'json', 'bash', 'sql']
     },

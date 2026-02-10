@@ -1,0 +1,348 @@
+---
+id: consistency-models
+title: Consistency Models
+slug: /systems/distributed/consistency/consistency-models
+description: Deep technical reference on consistency models in distributed systems, covering guarantees, trade-offs, failure modes, and real-world behavior.
+sidebar_label: Consistency Models
+keywords: [distributed consistency, consistency models, eventual consistency, strong consistency, distributed systems]
+sidebar_position: 10
+---
+
+## 1. What this document is about
+
+This document explains consistency models in distributed systems — the guarantees about the ordering and cisibility of operation across 
+multiple replicas of data
+
+Where this applies:
+
+    - Systems where data exists in multiple locations (caches, read replicas, partitioned databases, event streams)
+    - Architectures using message brokers for asynchronous communication
+    - Services that replicate state across boundaries (microservices, CDNs, multi-region deployments)
+    - Any system where writes and reads may occur against different copies of data
+
+Where this does **not** apply:
+
+    - Single-server applicaiton with no replication
+    - Systems where all operations go through a single authoritative source with no caching
+    - Purely stateless services that don't manage data consistency
+
+When multiple components hold copies of the same logical data, you must explicitly choose what guarantees about order and visibility you're willing 
+to provide and enforce. This choice determines your system's correctness, performance, availability and operational complexity.
+
+---
+
+## 2. Why this matters in real systems
+
+Consistency models become unavoidable when you introduce replication — and you introduce replication constantly without realizing it.
+
+### Common triggers:
+
+    - You add Redis caching in front of your database to reduce local. A user updates their profile in SQL, but the API still returns stale data from cache. 
+Your cache invalidation logic has a race condition. Customer support receives angry emails.
+
+    - You split a monolith into services. **Order Service** publishes an ```OrderPlaced``` event.
+**Inventory Service** and **Shipping Service** both consume it, but process at different speeds due to different loads. **Shipping Service** starts preparing a 
+package before **Inventory Service** has marked items as reserved.You ship products you don't have.
+
+    - You add read replicas to scale database reads. A user posts a comment, gets a success response, refreshes the page, and their comment is missing because they 
+hit a replica that hasn't caught up yet. They post again. Now you have duplicate comments.
+
+    - You partition your database for horizontal scaling. Two users simultaneously book the last seat on a flight, hitting different partitions. 
+Both get confirmations. One arrives at the airport to discover they don't have a seat.
+
+### What breaks when you ignore consistency models:
+
+    - **Lost updates**: concurrent writes overwrite each other with no conflict detection Phantom reads—queries return different results when 
+    re-executed immediately.
+
+    - **Violation of business invariants**: you sell more inventory than exists, double-change customers, or allow conflicting reservations
+
+    - **Cascade failures**: services make decisions on stale data, propagating errors downstream.
+
+    - **Undebuggable behavior**: operations appear to execute out of order, making root cause analysis impossible
+
+### Why simpler approaches stop working:
+
+    - "Just use transactions" assumes all relevant data lives in a single database supporting ACID transactions. In distributed systems, data spans 
+    databases, caches, message queues, and external services.
+
+    - "Just make everything synchronous" kills availability. If every write must synchronously update all replicas, any replica failure makes the 
+    system unavailable for writes.
+
+    - "Just accept eventual consistency everywhere" violates critical business requirements. Some operations (financial transactions, seat reservations, 
+    unique constraint enforcement) require stronger guarantees than "it'll be consistent eventually".
+
+**The physics are unforgiving**: you cannot have strong consistency, high availability and partition tolerance simultaneously (**CAP theorem**). 
+You must choose which guarantee to relax, and that choice must be explicit and intentional.
+
+
+---
+
+## 3. Core concept (mental model)
+
+Think of consistency models as contracts about **visibility** and **ordering**.
+
+**Visibility**: When a write completes, which readers can see it, and when?
+
+**Ordering**: When multiple writes occur, do all observers agree on the order in which they happened?
+
+Imagine a distributed system as a set of nodes, each maintaining a local view of the data.
+When a write occurs on one node, it must progagate to others. The consistency model define the rules governing that propagation.
+
+    - **Strong consistency**: All nodes agree on a single, global order of operations. After a write completes, all subsequent reads (from any node) 
+see that write. This is the easiest model to reason about — it behaves like a single-threaded program — but it's expensive to achieve in distributed systems.
+
+    - **Eventual consistency**: Writes propagate asynchronously. Different nodes may temporarily disagree about the current stage. Given enough time without 
+new writes, all replicas converge to the same state. Reads may see stale data. This maximizes availability and performance but complicates application logic.
+
+    - **Causal consistency**: Preserves cause-and-effect relationships. If operation B causally depends on operation A (e.g., a reply depends on the original message), 
+all nodes see A before B. Operations without causal relationships may be seen in different orders by different nodes. This provides a middle ground — stronger 
+guarantees than eventual consistency without the cost of strong consistency.
+
+The mental model: you're choosing **how synchronized the clocks are** across your distributed system. Strong consistency keeps all clocks perfectly aligned 
+(expensive, slow). Eventual consistency allows clocks to drift (cheap, fast, but confusing). Causal consistency synchronizes only the clocks that matter 
+for correctness.
+
+---
+
+## 4. How it works (step-by-step)
+
+### 🔒 Strong consistency implementation (using distributed locks)
+
+Strong consistency enforces a **single global order of writes**, ensuring that all nodes
+observe the same state at any given time
+
+### Step 1 — Acquire global lock
+
+Before writing, a node acquires a **distributed lock**, typically implemented using a consensus protocol such as:
+
+    - [Raft](https://raft.github.io/)
+    - [Paxos](https://martinfowler.com/articles/patterns-of-distributed-systems/paxos.html)
+    - A distributed coordination service like [ZooKeeper](https://zookeeper.apache.org/)
+
+_**Why**_ 
+
+Ensures only one write occurs at a time across all nodes, creating a total ordering.
+
+**Assumptions**
+
+    - Network is reliable enough that lock acquisition completes within acceptable timeouts.
+
+---
+
+### Step 2 — Perform write
+
+With the lock held, the node writes to its local storage and propagates the write to replicas.
+
+**Invariant**
+
+    - No other node can write while this lock is held.
+
+---
+
+### Step 3 — Wait for acknowledgment
+
+The writer waits for a **quorum (majority)** of replicas to acknowledge the write.
+
+**Why**
+- Guarantees durability even if some nodes fail.
+- Any future read that also reaches a quorum will observe this write.
+
+**Assumptions**
+- A majority of nodes remain available.
+
+
+---
+
+### Step 4 — Release lock and return success
+
+Only after quorum acknowledgment does the writer release the lock and confirm success
+to the client.
+
+**Invariant**
+- From this point forward, any quorum-based read will observe the committed value.
+
+---
+
+### 🌊 Eventual consistency implementation 
+### Implementation using asynchronous replication
+
+Eventual consistency favors **availability and low latency**, accepting temporary divergence
+between replicas.
+
+---
+
+### Step 1 — Write to primary
+
+The client writes to a single node:
+
+- A designated primary, or
+- Any node in leaderless systems (e.g., Cassandra with `quorum = 1`)
+
+---
+
+### Step 2 — Return success immediately
+
+The node acknowledges success **without waiting for replicas**.
+
+**Why**
+- Minimizes write latency.
+- The write is durable on at least one node.
+
+**Assumption**
+- Clients can tolerate reading stale data.
+
+
+---
+
+### Step 3 — Asynchronous propagation
+
+The write is propagated to other replicas in the background.
+
+**Mechanisms**
+- Change Data Capture (CDC)
+- Replication logs
+- Message queues
+- Gossip protocols
+
+---
+
+### Step 4 — Eventual convergence 
+
+Replicas apply writes as they arrive, potentially using:
+
+- Timestamps
+- Vector clocks
+- Conflict resolution strategies
+
+**Invariant**
+- If no new writes occur, all replicas eventually converge to the same state.
+
+**Read path**
+- Reads may hit any replica.
+- Clients can observe stale data if the replica has not yet received recent writes.
+
+---
+
+### 🧭 Causal consistency 
+### Implementation using vector clocks
+
+Causal consistency guarantees that **causally related operations are observed in the same order**
+by all nodes, while allowing concurrent (unrelated) operations to be observed in different orders.
+
+---
+
+### Step 1 — Track causality with vector clocks
+
+Each node maintains a **vector clock**, represented as a map of `{node_id: counter}` pairs.
+This structure tracks the latest operation observed from each node.
+
+**Example**
+```text
+{ node_A: 5, node_B: 3 }
+```
+
+This indicates that the node has observed:
+
+    - 5 operations from ```node_A```
+    - 3 operations from ```node_B```
+
+---
+
+### Step 2 — Attach vector clock to writes
+
+When processing a write:
+
+1. The node increments its own counter in the vector clock.
+2. The full vector clock is attached to the write as metadata.
+
+**Why**
+- The vector clock encodes all causally preceding operations.
+
+---
+
+### Step 3 — Propagate writes with causality metadata
+
+Writes are propagated to replicas together with their vector clocks.
+
+This ensures that causal context travels with the data, not just the payload.
+
+---
+
+### Step 4 — Enforce causal ordering on delivery
+
+A replica applies a write only if it has already observed all causally preceding writes.
+
+This is determined by comparing vector clocks.
+
+**Mechanism**
+
+If a write `W` carries the vector clock:
+
+```text
+{ A: 5, B: 3 }
+```
+
+The replica must have observed:
+
+    - at least 5 operations from ```A```
+    - at least 3 operations from ```B```
+
+before applying ```W```.
+
+#### Why
+
+    - Prevents replicas from observing effects before causes.
+
+---
+
+### Step 5 — Buffer out-of-order writes
+
+Writes that arrive before their causal dependencies are buffered.
+
+They are applied later, once all required causal dependencies have been satisfied.
+
+---
+
+### Read path
+
+    - Reads may observe different orderings of concurrent (non-causally-related) writes.
+    - Reads will never observe an effect before its cause.
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+
+
+---
+
+## 6. Design trade-offs
+
+
+
+---
+
+## 7. Common mistakes and misconceptions
+
+
+---
+
+## 8. Operational and production considerations
+
+
+---
+
+## 9. When NOT to use this
+
+
+---
+
+## 10. Key takeaways
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
