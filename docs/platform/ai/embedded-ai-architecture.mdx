@@ -1,0 +1,744 @@
+---
+id: embedded-ai-architecture
+title: Embedded AI Architecture
+slug: /platform/ai/embedded-ai-architecture
+description: Architecture and governance of embedded AI in multi-tenant SaaS platforms, covering model lifecycle, isolation, RAG, compliance and cost control.
+sidebar_label: Embedded AI Architecture
+keywords: [REST API response shaping, Sparse fieldsets, Field selection REST API, API payload optimizationembedded ai, multi-tenant isolation, rag architecture, model lifecycle, ai governance]
+sidebar_position: 10
+---
+
+## 1. What this document is about
+
+This document addresses the architecture and operation of AI capabilities embedded **natively within multi-tenant SaaS platforms** — not external AI 
+consumption through third-party APIs or standalone AI services used by customers.
+
+Embedded AI means the platform itself uses AI models to enhance, automate, or enable core product features. Examples: intelligent search within the 
+platform, automated data classification, predictive analytics on tenant data, content generation for users, or AI-powered workflow automation.
+
+#### Where this applies:
+
+    - You're building AI features that operate on tenant data stored in your platform
+    - AI capabilities are part of your product's value proposition
+    - You own the model lifecycle, prompt orchestration, and output quality
+    - You must enforce multi-tenant isolation at the AI layer
+    - Compliance, auditability, and cost control are your responsibility
+
+#### Where this does not apply:
+
+    - Customers bring their own AI models or API keys
+    - AI is a pass-through service with no platform-side data processing
+    - Single-tenant or on-premise deployments where isolation is architectural, not logical
+
+---
+
+## 2. Why this matters in real systems
+
+Embedded AI surfaces when product requirements demand capabilities that rule engine, queries, or workflows cannot provide: semantic understanding, 
+genration, classification at scale, or adaptive behavior.
+
+### Typical pressures that force this architecture:
+
+    - **Scale pressure**: A SaaS platform with 10,000 tenants needs to run AI operations across millions of records daily. Native approaches (one API call 
+    per record) create cost explosions and quota exhaustion. You need batching, caching, model selection by workload, and token budgeting per tenant.
+
+    - **Isolation pressure**: Tenant A's prompts, context, and outputs must never leak into Tenant B's results. Shared model infrastructure introduces risk: 
+    prompt injection across tenants, data bleed in vector indexes, cross-tenant inference via side channels. Multi-tenancy at the AI layer is harder 
+    than at the database layer.
+
+    - **Governance pressure**: Regulators ask: "Where did this AI-generated decision come from? What data was used? Who approved it?" You need audit 
+    trails for every inference, input provenance tracking, model version pinning, and explainability hooks.
+
+    - **Cost pressure**: Azure OpenAI charges per token. A single tenant running unconstrained queries can bankrupt the month's AI budget. You need quota 
+    enforcement, cost attribution per tenant, fallback to cheaper models, and rate limiting that doesn't break UX.
+
+    - **Latency pressure**: Users expect sub-second responses. AI calls add 200ms-2s per operation. You need prompt optimization, streaming responses, edge 
+    caching of embeddings, and hybrid architectures where AI is invoked only when necessary.
+
+### What breaks when this is ignored:
+
+    - **Cross-tenant data leakage**: A tenant's PII appears in another tenant's AI-generated content because vector indexes weren't properly partitioned.
+    - **Runaway costs**: A single tenant with a malicious or buggy integration burns $50k in tokens over a weekend.
+    - **Compliance failure**: An auditor asks for the exact model version and input data used to generate a specific output 6 months ago — you have no audit trail.
+    - **Model drift undetected**: Output quality degrades silently over weeks because no one monitors success rate, hallucination frequency, or latency percentiles.
+    - **Vendor lock-in**: Your entire AI architecture assume Azure OpenAI's specific API contracts, making migration to another provider a 6-month rewrite.
+
+### Why simpler approaches stop working:
+
+    - **Stateless API calls**: No session context, no cost tracking, no tenant isolation, no audit trail.
+    - **Shared prompts for all tenants**: One tenant's injection attack poisons results for others; no per-tenant customization or compliance rules.
+    - **Synchronous, one-at-a-time inference**: Latency compounds; batch-eligible workloads waste quota; no parallelization.
+    - **Manual model management**: Updating model versions across hundreds of features becomes a deployment nightmare; rollback is impossible.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of embedded AI as a **regulated pipeline** with four critical boundaries:
+
+```
+[Tenant Request] 
+    ↓
+[Isolation Layer] ← tenant_id, RBAC/ABAC, data residency check
+    ↓
+[Orchestration Layer] ← prompt assembly, context injection, model routing
+    ↓
+[Inference Layer] ← model invocation, quota enforcement, response streaming
+    ↓
+[Observability Layer] ← logging, cost attribution, quality metrics
+    ↓
+[Response] → tenant-scoped, auditable, rate-limited
+```
+
+#### Each boundary enforces a contract:
+
+    1. **Isolation Layer**: Ensures ```tenant_id``` is immutable and propagated through every component. No request proceeds without proven tenant identity. 
+    This is where RBAC/ABAC rules determine if the user can invoke AI features and what data they can access.
+
+    2. **Orchestration Layer**: Assembles prompts dynamically using tenant-specific templates, retrieves context from tenant-scoped data stored (RAG), applies 
+    compliance filters (PII masking), and selects the appropriate model based on workload type (cheap model for drafts, expensive model for final outputs).
+
+    3. **Inference Layer**: Invokes the model with token budgets, timeout enforcement, and retry logic. Implements circuit breakers per tenant to 
+    prevent one tenant's failures from cascading. Handles streaming for UX, batching for background jobs.
+
+    4. **Observability Layer**: Captures every inference: input tokens, output tokens, latency, model version, success/failure, cost. Exports to monitoring 
+    systems. Enables cost chargeback, quality dashboards, and incident forensics.
+
+**Mental model for multi-tenancy**: Every AI operation is a scoped transaction. The ```tenant_id``` is the partition key for data, prompts, quotas, and audit 
+logs. If you lose the ```tenant_id``` at any point, you have a security incident.
+
+**Mental model for cost control**: Treat tokens like database queries — measure them, budget them, optimize them. Every prompt is a cost center. 
+Every cache hit is a cost save.
+
+**Mental model for compliance**: AI outputs are artifacts that must be retained, versioned, and traceable to inputs. If you can't reproduce an output from 
+6 months ago, you can't defend it in an audit.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Request initiation with tenant context
+
+A user action trigger an AI feature (e.g. "Generate summary of this document").
+
+#### What happens:
+
+    - API gateway receives request with authentication token
+    - Middleware extracts ```tenant_id``` and ```user_id``` from token
+    - RBAC/ABAC check: Does this user have permission to invoke AI features?
+    - Data residency check: Is this tenant restrcted to specific Azure regions?
+
+**Why this exists**: Without tenant context attached immediately, downstream services can't enforce isolation or quotas.
+
+**Invariant**: ```tenant_id``` is immutable and propagated via correlation headers or context objects through every service call.
+
+---
+
+### Step 2 — Quota and rate limit enforcement
+
+Before processing begins, check tenant's AI quota.
+
+#### What happens:
+
+    - Query Redis cache: ```ai_quota:{tenant_id}:monthly_tokens_used```
+    - Compare against: ```ai_quota:{tenant_id}:monthly_tokens_limit```
+    - If exceeded, return ```429 Too Many Requests``` with reset timestamp
+    - Increment a provisional token estimate (actual deduction happens post-inference)
+
+**Why this exists**: Prevents runaway costs. A tenant with unlimited access could consume $100k in tokens before anyone notices.
+
+**Assumption**: Token estimation is pessimistic (uses max possible tokens for worst-case prompt). Actual usage is reconciled after inference.
+
+---
+
+### Step 3 — Prompt orchestration and context retrieval
+
+Assemble the prompt dynamically using tenant-specific data.
+
+#### What happens:
+
+    - Load prompt template from configuration: ```ai_prompts:{feature_name}:template```
+    - Retrieve tenant-specific context via RAG:
+        - Query Azure AI Search with filter: ```tenant_id eq '{tenant_id}'```
+        - Retrieve top K embeddings from tenant-partitioned index
+        - Fetch actual documents from Azure Blob Storage (tenant-scoped container)
+    - Apply PII filters if LGPD/GDPR flags are set for tenant
+    - Inject system message with compliance rules: "Never include PII in output"
+    - Assemble final prompt: system message + RAG context + user input
+
+**Why this exists**: Generic prompts produce generic results. Context from tenant's own datamakes AI outputs relevant and accurate.
+
+**Invariant**: RAG queries must include ```tenant_id``` filter. No cross-tenant data access.
+
+---
+
+### Step 4 — Model selection and routing
+
+Choose the appropriate model based on workload characteristics.
+
+#### What happens:
+
+    - Check feature flag: ```ai_model_routing:{tenant_id}:{feature_name}```
+    - Route based on criteria:
+        - **Draft generation**: ```gpt-4o-mini``` (cheap, fast)
+        - **Final production output**: ```gpt-4o``` (expensive, high quality)
+        - **Batch processing**: Asynchronous queue, use ```gpt-4o-mini``` with longer timeout
+    - If tenant has custom model preference (enterprise tier), honor it
+
+**Why this exists**: One model doesn't fit all workloads. Cost optimization requires routing low-stakes tasks to cheaper models.
+
+**Operational risk**: Model deprecations. Azure OpenAI retires models with 6-month notice. You need a mapping layer that abstracts model names.
+
+---
+
+### Step 5 — Inference with observability
+
+Invoke the model and capture telemetry.
+
+#### What happens:
+
+    - Call Azure OpenAI API with:
+        - ```model```: selected model version
+        - ```messages```: assembled prompt
+        - ```max_tokens```: canculated from quota headroom
+        - ```temperature```, ```top_p```: from feature configuration
+        - ```user```: set to ```tenant_id``` for Azure's abuse monitoring
+    - Stream response chunks if real-time UX is needed
+    - Capture OpenTelemetry span:
+        - ```ai.model.name```
+        - ```ai.model.version```
+        - ```ai.input.tokens```
+        - ```ai.output.tokens```
+        - ```ai.response.latency_ms```
+        - ```ai.cost.usd```
+        - ```tenant_id```, ```user_id```, ```feature_name```
+
+**Why this exists**: Observability is not optional. Without telemetry, you can't debug failures attribute costs, or detect drift.
+
+**Invariant**: Every inference generate a structured log entry with cost and performance metrics.
+
+---
+
+### Step 6 — Response validaiton and post-processing
+
+Ensure output meets safety and compliance requirements.
+
+#### Wha happens:
+
+    - Run output through content safety filter ([Azure Content Safety API](https://learn.microsoft.com/en-us/azure/ai-services/content-safety/))
+    - Check for PII leakage (regex patterns, NER models)
+    - Validate output structure if schema is expected (JSON, XML)
+    - If validation fails, log failure, redact output, return error
+
+**Why this exists**: Models hallucinate, leak training data, or generate harmful content. Validation is defense-in-depth.
+
+**Trade-off**: Adds 50-200ms latency. Acceptable for high-stakes features, skip for low-risk drafts.
+
+---
+
+### Step 7 — Audit logging and cost reconciliation
+
+Persist the inference event for compliance and cost attribution.
+
+#### What happens:
+
+    - Write audit record to SQL (tenant-partitioned table)
+
+```sql
+INSERT INTO ai_inference_log (
+    tenant_id, user_id, feature_name, model_version,
+    input_hash, output_hash, input_tokens, output_tokens,
+    cost_usd, latency_ms, timestamp, correlation_id
+  )
+```
+
+    - Update Redis quota counter: ```ai_quota:{tenant_id}:monthly_tokens_used += actual_tokens```
+    - Publish event to Azure Service Bus for analytics pipeline
+
+**Why this exists**: Regulators require audit trails. Finance requires cost chargeback per tenant.
+
+**Retention policy**: 2 years minumum for LGPD/GDPR compliance.
+
+---
+
+### Step 8 — Return response to user
+
+Stream or return the final output
+
+#### What happens:
+
+    - If streaming: Send Server-Sent Events (SSE) to frontend
+    - If synchronous: Return JSON payload
+    - Include metadata: ```model_version```, ```cost_tokens```, ```cache_hit``` (if applicable)
+
+**Why this exists**: Transparency builds trust. Users understand when AI is being used and can report issues.
+
+---
+
+## 5. Minimal but realistic example 
+
+**Scenario**: A tenant wants to generate a summary of uploaded documents using RAG.
+
+```csharp
+// Service class: AIDocumentSummarizer.cs
+public class AIDocumentSummarizer
+{
+    private readonly IAzureOpenAIClient _openAIClient;
+    private readonly IAzureAISearchClient _searchClient;
+    private readonly IQuotaService _quotaService;
+    private readonly IAuditLogger _auditLogger;
+    private readonly ILogger<AIDocumentSummarizer> _logger;
+
+    public async Task<SummaryResult> GenerateSummaryAsync(
+        string tenantId, 
+        string userId, 
+        string documentId, 
+        CancellationToken cancellationToken)
+    {
+        // Step 1: Check quota
+        var quotaCheck = await _quotaService.CheckAndReserveAsync(
+            tenantId, 
+            estimatedTokens: 2000, 
+            cancellationToken);
+        
+        if (!quotaCheck.IsAllowed)
+        {
+            throw new QuotaExceededException(quotaCheck.ResetDate);
+        }
+
+        // Step 2: Retrieve document context via RAG
+        var searchResults = await _searchClient.SearchAsync(
+            indexName: "documents",
+            searchText: documentId,
+            filter: $"tenant_id eq '{tenantId}'",
+            top: 3,
+            cancellationToken);
+
+        var contextChunks = searchResults.Results
+            .Select(r => r.Document.GetString("content"))
+            .ToList();
+
+        // Step 3: Assemble prompt
+        var systemMessage = "You are a document summarizer. Output concise summaries. Never include PII.";
+        var userMessage = $"Summarize the following document:\n\n{string.Join("\n\n", contextChunks)}";
+
+        var messages = new List<ChatMessage>
+        {
+            new ChatMessage(ChatRole.System, systemMessage),
+            new ChatMessage(ChatRole.User, userMessage)
+        };
+
+        // Step 4: Invoke model with observability
+        using var activity = Activity.Current?.Source.StartActivity("AI.Inference");
+        activity?.SetTag("tenant_id", tenantId);
+        activity?.SetTag("feature", "document_summary");
+
+        var startTime = DateTime.UtcNow;
+        
+        var response = await _openAIClient.GetChatCompletionsAsync(
+            deploymentName: "gpt-4o-mini", // Cost-optimized model
+            new ChatCompletionsOptions
+            {
+                Messages = messages,
+                MaxTokens = 500,
+                Temperature = 0.3f,
+                User = tenantId // For Azure's abuse monitoring
+            },
+            cancellationToken);
+
+        var latency = DateTime.UtcNow - startTime;
+        var choice = response.Value.Choices[0];
+        var summary = choice.Message.Content;
+
+        // Step 5: Calculate actual cost
+        var inputTokens = response.Value.Usage.PromptTokens;
+        var outputTokens = response.Value.Usage.CompletionTokens;
+        var costUsd = CalculateCost(inputTokens, outputTokens, "gpt-4o-mini");
+
+        // Step 6: Reconcile quota
+        await _quotaService.ReconcileUsageAsync(
+            tenantId, 
+            actualTokens: inputTokens + outputTokens, 
+            reservationId: quotaCheck.ReservationId,
+            cancellationToken);
+
+        // Step 7: Audit log
+        await _auditLogger.LogInferenceAsync(new InferenceAudit
+        {
+            TenantId = tenantId,
+            UserId = userId,
+            Feature = "document_summary",
+            ModelVersion = "gpt-4o-mini-2024-07-18",
+            InputTokens = inputTokens,
+            OutputTokens = outputTokens,
+            CostUsd = costUsd,
+            LatencyMs = (int)latency.TotalMilliseconds,
+            CorrelationId = Activity.Current?.Id
+        });
+
+        // Step 8: Return result
+        return new SummaryResult
+        {
+            Summary = summary,
+            ModelVersion = "gpt-4o-mini-2024-07-18",
+            TokensUsed = inputTokens + outputTokens,
+            CostUsd = costUsd
+        };
+    }
+
+    private decimal CalculateCost(int inputTokens, int outputTokens, string model)
+    {
+        // gpt-4o-mini: $0.15/1M input, $0.60/1M output (as of Jan 2025)
+        return (inputTokens * 0.15m / 1_000_000) + (outputTokens * 0.60m / 1_000_000);
+    }
+}
+```
+
+### How this maps to the concept:
+
+    - **Isolation**: ```tenant_id``` is used to filter search results and set ```User``` field
+    - **Quota enforcement**: Pessimistic reservation before inference, reconciliation after
+    - **Orchestration**: Prompt assembly with RAG context from tenant-scoped index
+    - **Observability**: OpenTelemetry activity, structured audit log, cost calculation
+    - **Cost control**: Uses cheaper model (```gpt-4o-mini```) for summarization workload
+
+---
+
+## 6. Design trade-offs
+
+|Approach                         |What you gain                                                          |What you give up                                                            |When to choose                                                               |
+|---------------------------------|-----------------------------------------------------------------------|----------------------------------------------------------------------------|-----------------------------------------------------------------------------|
+|**Synchronous inference**        |Simple request/response flow, immediate feedback, easier debugging     |Higher latency, blocking threads, quota exhaustion on spikes                |Low-volume features, interactive UX where user waits                         |
+|**Asynchronous queue-based**     |Batching, cost optimization, backpressure handling, retry logic        |Complexity (queue management), delayed results, polling UX                  |Batch operations, non-interactive workflows, cost-sensitive workloads        |
+|**Shared model deployment**      |Lower infrastructure cost, simpler operations                          |Cross-tenant isolation risk, noisy neighbor problem, quota conflicts        |Early-stage products, trusted tenants only                                   |
+|**Per-tenant model deployment**  |Perfect isolation, custom model tunning per tenant                     |10x infrastructure cost, operational overhead, slower rollouts              |Enterprise tier, regulated insdustries, contractual isolation requirements   | 
+|**Prompt caching**               |50-90% cost reduction on repeated prompts, faster responses            |Cache invalidation complexity, stale results risk, storage cost             |High-repetition workloads (same docs, same queries), RAG with static corpora |
+|**Streaming responses**          |Better UX (perceived speed), lower timeout risk                        |Complexity in error handling, partial result management, harder to validate |Real-time features, long-form generation, chatbots                           |
+|**Batch API (Azure OpenAI)**     |50% cost reduction vs real-time API                                    |24-hour max latency, no streaming, requires job management                  |Nightly data processing, report generation, non-urgent tasks                 |
+|**Vendor abstraction layer**     |Model portability, multi-cloud strategy, easier migration              |Abstraction tax (10-20% dev overhead), lowest-common-denominator API        |Regulated industries avoiding lock-in, multi-region deployment               |
+|**Direct Azure OpenAI SDK**      |Full features access, optimal performance, simpler code                |Vendor lock-in, migration cost if switching provides                        |Startups, single-cloud strategy, speed over portability                      |
+
+#### Implicit acceptance with embedded AI:
+
+    - **You own the output quality**: Users blame you, not OpenAI, if the AI hallucinates or produces garbage.
+    - **You own the cost**: A bug in prompt orchestration can burn $10k overnight.
+    - **You own compliance**: If a model leaks PII, you face LGPD/GDPR fines, not the model vendor.
+    - **You own the latency**: If Azure OpenAI has an outage, your plantform's AI features are down.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### No tenant_id propagation through AI pipelines
+
+#### Why it happens:
+
+    - Developers treat AI calls like stateless functions and forget to pass tenant context.
+
+#### Problem:
+
+    - Cross-tenant data leakage. A RAG query without ```tenant_id``` filter returns results from all tenants.
+
+#### How to avoid:
+
+    - Make ```tenant_id``` a required parameter in every AI-related service method. Use middleware to inject into correlation context. Add integration tests 
+    that verify isolation.
+
+---
+
+### Synchronous AI calls in request/response cycles
+
+#### Why it happens:
+
+    - Easiest to implement. Just ```await``` the OpenAI call and return.
+
+#### Problem: 
+
+    - 95th percentile latency balloons to 5+ seconds when the model is slow or quota-throttled. Users abandon the page.
+
+#### How to avoid:
+
+    - Use async/background jobs for non-interactive AI. For interactive features, implement optimistic UI updates and streaming.
+
+---
+
+### No cost attribution per tenant
+
+#### Why it happens:
+
+    - "We'll worry about costs later."
+
+#### Problem:
+
+    - Cannot identify which tenants are driving costs. Cannot implement tiered pricing or quota enforcement. Finance cannot chargeback AI spend.
+
+#### How to avoid:
+
+    - Log every inference with ```tenant_id``` and ```cost_usd```. Build dashboards from day 1. Implement quota enforcement before general availability.
+
+---
+
+### Storing raw prompts and outputs without PII filtering
+
+#### What it happens:
+
+    - Audit logs need full input/output for debugging.
+
+#### Problem:
+
+    - Logs become a LGPD/GDPR liability. An attacker who gains access to logs can exfiltrate PII.
+
+#### How to avoid: 
+
+    - Hash inputs an outputs in audit logs. tore only metadata (token counts, model version, timestamps). Retain raw data in a separate, encrypted, 
+    access-controlled store with short retention (30 days).
+
+---
+
+### No circuit breaker per tenant
+
+#### Why it happens:
+
+    - Shared infrastructure, no isolation of failure domains.
+
+#### Problem:
+
+    - One tenant with a runaway loops (infinite retries) exhausts quota for all tenants. Cascade failures.
+
+#### How to avoid:
+
+    - Implement per-tenant circuit breakers. After N failures in M seconds, return ```503 Service Unavailable``` for that tenant only. Other tenants unaffected.
+
+---
+
+### Hardcoding model names in application code
+
+#### Why it happens:
+
+    - ```model: "gpt-4``` is simple and works.
+
+#### Problem:
+
+    - When Azure deprecates ```gpt-4```, you need to deploy code changes across all services. No A/B testing of models. No gradual rollout.
+
+#### How to avoid:
+
+    - Store model name in configuration (feature flag, database). Map logical model IDs (```summarization_model```) to physical models (```gpt-4o-mini```). 
+    Uodate mapping without code changes.
+
+---
+
+### No validation of AI outputs
+
+#### Why it happens:
+
+    - "The model is smart, it won't produce bad outputs."
+
+#### Problem:
+
+    - Models hallucinate, leak training data, ignore instructions. One hallucinated SQL query in a generated report can cause a security incident.
+
+#### How to avoid:
+
+    - Always validate outputs. For structured data, parse and schema-validate. For text, run content safety checks. For code, use static analysis. 
+    Log validation failures.
+
+---
+
+### Ignoring token economics in prompt design
+
+#### Why it happens:
+
+    - "More context is better."
+
+#### Problem:
+
+    - Embedding entire documents in prompts wastes 80% of tokens on irrelevant content. Costs explode.
+
+#### How to avoid:
+
+    - Use RAG to retrieve only relevant chunks. Limit context to top-K embeddings. Experiment with chunk sizes (256 tokens vs 512 tokens). Monitor 
+    cost-per-inference and optimize aggressively.
+
+---
+
+## 8. Operational and production considerations
+
+### What to monitor
+
+#### Per-tenant quotas:
+
+    - ```ai_tokens_used_today``` vs ```ai_tokens_limit_daily```
+    - Alert when tenant exceeds 80% of quota
+    - Dashboard showing top 10 tenants by token usage
+
+#### Model performance:
+
+    - P50, P95, P99 latency per model and feature
+    - Success rate (2xx vs 4xx vs 5xx responses from Azure OpenAI)
+    - Token efficiency: ```output_tokens / input_tokens``` ratio
+
+#### Cost metrics:
+
+    - Total AI spend per day, per tenant, per feature
+    - Cost-per-request trend over time
+    - Quota burn rate (time until tenants hit limits)
+
+#### Quality signals:
+
+    - User feedback (thumbs up/down on AI outputs)
+    - Retry rate (how often do users regenerate outputs?)
+    - Validation failure rate (malformed outputs)
+
+#### Infrastructure health:
+
+    - Azure OpenAI quota utilization (you have regional quotas)
+    - Circuit breaker trip rate per tenant
+    - RAG index lag (how stale are embeddings?)
+
+### What degrades first
+
+#### Under load:
+
+    - Azure OpenAI quota exhaustion →  429 errors →  circuit breakers trip →  AI features unavailable
+    - RAG search latency increases →  total request latency spikes → timeouts
+
+#### Under cost pressure
+
+    - Tenants hit quota limits → cannot use AI features until next billing cycle
+    - Shared quota depleted by one tenant → all tenants affected
+
+#### Under model drift:
+
+    - Output quality declines silently →  users lose trust →  support tickets increase
+    - New model version has different token pricing →  costs spike unexpectedly
+
+### What becomes expensive
+
+#### Storage:
+
+    - Audit logs with full prompts/outputs grow to terabytes
+    - Vector indexes for RAG (Azure AI Search charges per GB and per query)
+
+#### Compute:
+
+    - Per-tenant model deployments (if you go that route) cost $500 - $5000/month per tenant
+    - Real-time embeddings generation for every document upload
+
+#### Network:
+
+    - Streaming responses to thousands of concurrent users
+    - Large payload (images, documents) sent to Azure OpenAI
+
+### Operational risks
+
+**Model deprecation**: Azure OpenAI deprecates models with 6-month notice. You need a migration plan: update model mappings, regression test all features, 
+monitor for quality degradation.
+
+**Quota exhaustion**: Regional quotas are shared across all tenants. One tenant's spike can exhaust quota. Mitigation: Distribute tenants across multiple reigons, 
+implement aggressive rate limiting.
+
+**Data residency violations**: LGPD/GDPR requires data to stay in specific regions. If a tenant's data is processed by an Azure OpenAI instance in the wrong region, 
+you're non-compliant. Mitigation: Enforce region selection at the tenant level, block cross-region calls.
+
+**Prompt injection attacks**: Malicious users craft inputs that manipulate the model into ignoring system instructions. Mitigation: Validate inputs, use 
+prompt sandboxing, monitor for anomalous outputs.
+
+**Cost runaway**: A bug in retry logic or a tenant with a scripted attack burns $50k in tokens overnight. Mitigation: Hard caps per tenant, kill switches, 
+alerting on cost spikes.
+
+### Observability signals
+
+#### Latency anomalies:
+
+    - Sudden increase in P95 latency → model is slow or quota-throttled
+    - Check Azure OpenAI status page, inspect retry logs
+
+#### Cost spikes:
+
+    - Daily spend increases 3x →  investigate which tenant, which feature
+    - Correlate with deployment changes (new prompt template?)
+
+#### Quality degradation:
+
+    - User feedback score drops from 4.2 to 3.1 → model update broke something
+    - A/B test rollback, inspect changed outputs
+
+#### Isolation breaches:
+
+    - RAG query returns results with multiple ```tenant_id``` values → index misconfiguration
+    - Immediate incident response, audit all recent queries
+
+---
+
+## 9. When NOT to use this
+
+Do not use embedded AI when:
+
+    - **When you have &lt;100 users total**: Embedded AI infrastructure is overkill. Use a simple API wrapper around OpenAI with no tenant isolation. 
+    Focus on product-market fit, not architecture.
+
+    - **When AI is a "nice-to-have" feature**: If the product works perfectly without AI, don't embed it. Users will tolerate external AI integrations 
+    (e.g., Zapier + OpenAI) until demand justifies native support.
+
+    - **When compliance requirements prohibit cloud AI**: Some industries (defense, healthcare in certain jurisdictions) require on-premise models. SaaS 
+    platforms cannot meet these requirements without self-hosted infrastructure.
+
+    - **When latency budgets are &lt;100ms**: AIinference takes 200ms - 2s eveb with optimized prompts. If your feature needs sub-100ms responses (e.g., 
+    autocomplete), use traditional ML models or heuristics.
+
+    - **When you cannot afford $10k+/month in AI costs**: Embedded AI at scale is expensive. If your total revenue is &lt;$50k/month, your cannot sustainably 
+    operate AI features with thousands of users.
+
+    - **When your team has no ML/AI expertises**: Operating embedded AI requires understanding model behavior, debugging hallucinations, optimizing prompts, and 
+    managing model lifecycles. If your purely backend/froend engineers, outsource to AI-as-a-service platform (e.g., customers bring their own API keys).
+
+    - **When data isolation is impossible**: If your architecture has shared databases without row-level security, or shared blob storage without container-level 
+    isolation, you cannot safetly embed AI. Fix the data architecture first.
+
+    - **When vendor lock-in is unacceptable**: If your business strategy requires multi-cloud or model portability, the overhead of abstraction layers (20-30% 
+    dev time tax) may not be worth it. Consider AI-as-a-service offerings with standardized APIs.
+
+---
+
+## 10. Key takeaways
+
+    - **Tenant isolation at the AI layer is harder than database isolation.** Every component—prompts, 
+        RAG indexes, quotas, audit logs—must enforce tenant_id scoping. One missing filter causes data leakage.
+
+    - **Cost control is not optional.** Without per-tenant quotas, one user can bankrupt your AI budget. 
+        Implement token budgeting, rate limiting, and cost attribution from day 1.
+
+    - **Compliance requires full traceability.** LGPD/GDPR audits will ask: "What model version generated this output? 
+        What input data was used? Where is it stored?" If you cannot answer, you fail the audit.
+
+    - **Model deprecation is a when, not if.** Abstract model names from code. Store mappings in configuration. 
+        Test new models before Azure forces the upgrade.
+
+    - **Observability is your defense against silent failures.** Models degrade, costs spike, 
+        and latency increases without error messages. Monitor token usage, latency percentiles, and output quality continuously.
+
+    - **Streaming improves perceived performance more than faster models.** A 2-second response feels instant if 
+        tokens appear progressively. Invest in SSE or WebSockets before optimizing prompts.
+
+    - **Prompt engineering is cost engineering.** Every unnecessary token in a prompt costs money at scale. 
+        Optimize context retrieval, chunk sizes, and system messages aggressively.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
+
+import Light from './_assets/embedded-ai-architecture-light.svg';
+import Dark from './_assets/embedded-ai-architecture-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Embedded AI Architecture"
+  height={560}
+/>
