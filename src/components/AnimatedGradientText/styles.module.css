@@ -1,0 +1,30 @@
+.text {
+  display: inline;
+  color: transparent;
+
+  background-image: var(--agt-gradient);
+  background-size: 260% 100%;
+  background-position: 0% 50%;
+  background-clip: text;
+  -webkit-background-clip: text;
+
+  animation: agt-move var(--agt-speed) ease-in-out infinite;
+  will-change: background-position;
+}
+
+.pauseOnHover:hover {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .text {
+    animation: none;
+    background-position: 50% 50%;
+  }
+}
+
+@keyframes agt-move {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}

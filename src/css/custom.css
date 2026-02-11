@@ -1,8 +1,39 @@
 :root {
+
+  /*==========================
+    Gradient Hero
+    ==========================
+  */
+
+/* default (light) */
+  --agt-gradient: linear-gradient(
+    90deg,
+    #1f2937 0%,
+    #334155 25%,
+    #0f172a 50%,
+    #334155 75%,
+    #1f2937 100%
+  );
+}
+
+/* dark override */
+html[data-theme='dark'] {
+  --agt-gradient: linear-gradient(
+    90deg,
+    #d4d7dd 0%,
+    #b6bcc7 20%,
+    #f1f3f6 40%,
+    #c9ced6 60%,
+    #aab2bd 80%,
+    #d4d7dd 100%
+  );
+
+
+
   /* =========================
      Brand (Violet Accent)
      ========================= */
-  --ifm-color-primary: #9b8cff;        /* violet clean */
+  --ifm-color-primary: #9b8cff; /* violet clean */
   --ifm-color-primary-dark: #8576f2;
   --ifm-color-primary-darker: #7669e8;
   --ifm-color-primary-darkest: #5d52c8;
@@ -10,10 +41,15 @@
   --ifm-color-primary-lighter: #c1baff;
   --ifm-color-primary-lightest: #dedbff;
 
+
+
+
   /* =========================
      Typography
      ========================= */
-  --ifm-font-family-base: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  --ifm-font-family-base:
+    ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial,
+    "Apple Color Emoji", "Segoe UI Emoji";
   --ifm-heading-font-family: var(--ifm-font-family-base);
   --ifm-line-height-base: 1.75;
 
@@ -35,13 +71,13 @@
 /* ======================================================
    LIGHT THEME — Modern tech (cool off-white + violet)
    ====================================================== */
-:root[data-theme='light'] {
+:root[data-theme="light"] {
   /* Backgrounds */
-  --ifm-background-color: #f7f8fc;           /* cool off-white */
-  --ifm-background-surface-color: #ffffff;   /* cards/panels */
+  --ifm-background-color: #f7f8fc; /* cool off-white */
+  --ifm-background-surface-color: #ffffff; /* cards/panels */
 
   /* Text */
-  --ifm-font-color-base: rgba(16, 18, 24, 0.92);        /* near-black */
+  --ifm-font-color-base: rgba(16, 18, 24, 0.92); /* near-black */
   --ifm-font-color-secondary: rgba(16, 18, 24, 0.68);
 
   /* Borders / dividers */
@@ -50,7 +86,7 @@
   --ifm-color-emphasis-400: rgba(16, 18, 24, 0.18);
 
   /* TOC / chrome */
-  --ifm-toc-border-color: rgba(16, 18, 24, 0.10);
+  --ifm-toc-border-color: rgba(16, 18, 24, 0.1);
   --ifm-navbar-background-color: rgba(247, 248, 252, 0.88);
 
   /* Code highlight line bg (slightly softer in light) */
@@ -60,18 +96,18 @@
 /* ======================================================
    DARK THEME — IDE / BLACK + VIOLET
    ====================================================== */
-[data-theme='dark'] {
+[data-theme="dark"] {
   /* Backgrounds */
-  --ifm-background-color: #07080d;          /* near-black */
-  --ifm-background-surface-color: #0c0f1a;  /* IDE panel */
+  --ifm-background-color: #07080d; /* near-black */
+  --ifm-background-surface-color: #0c0f1a; /* IDE panel */
 
   /* Text */
-  --ifm-font-color-base: rgba(225, 228, 232, 0.90);
-  --ifm-font-color-secondary: rgba(200, 204, 214, 0.70);
+  --ifm-font-color-base: rgba(225, 228, 232, 0.9);
+  --ifm-font-color-secondary: rgba(200, 204, 214, 0.7);
 
   /* Borders / dividers */
   --ifm-color-emphasis-200: rgba(255, 255, 255, 0.06);
-  --ifm-color-emphasis-300: rgba(255, 255, 255, 0.10);
+  --ifm-color-emphasis-300: rgba(255, 255, 255, 0.1);
   --ifm-color-emphasis-400: rgba(255, 255, 255, 0.16);
 
   /* TOC / chrome */
@@ -115,12 +151,12 @@
 }
 
 /* Light: cleaner surface */
-:root[data-theme='light'] .admonition {
+:root[data-theme="light"] .admonition {
   background: rgba(155, 140, 255, 0.06);
 }
 
 /* Dark: slightly deeper */
-[data-theme='dark'] .admonition {
+[data-theme="dark"] .admonition {
   background: rgba(155, 140, 255, 0.06);
 }
 
@@ -137,12 +173,11 @@
 }
 
 /* Light inline code */
-:root[data-theme='light'] .markdown :not(pre) > code {
+:root[data-theme="light"] .markdown :not(pre) > code {
   background: rgba(155, 140, 255, 0.12);
-  border: 1px solid rgba(16, 18, 24, 0.10);
+  border: 1px solid rgba(16, 18, 24, 0.1);
   color: rgba(16, 18, 24, 0.92);
 }
-
 
 /* ======================================================
    Code blocks — IDE feel (keeps title bar + copy)
@@ -153,24 +188,18 @@
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.12);
 }
 
-
-
-
 /* Filename/title bar */
 .theme-code-block-title {
   font-weight: 650;
   border-bottom: 1px solid var(--ifm-color-emphasis-200);
 }
 
-
 /* Dark title bar */
-[data-theme='dark'] .theme-code-block-title {
+[data-theme="dark"] .theme-code-block-title {
   background: rgba(255, 255, 255, 0.04);
   color: rgba(232, 234, 237, 0.85);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
-
-
 
 /* Highlighted line (native Docusaurus class) */
 .theme-code-block-highlighted-line {
@@ -178,9 +207,6 @@
   margin: 0 -1rem;
   padding: 0 1rem;
 }
-
-
-
 
 /* ======================================================
    Selection (small delight)
@@ -190,7 +216,7 @@
   color: rgba(16, 18, 24, 0.95);
 }
 
-[data-theme='dark'] ::selection {
+[data-theme="dark"] ::selection {
   background: rgba(155, 140, 255, 0.35);
   color: #fff;
 }
@@ -222,11 +248,19 @@
 
 .kb-diagram-container {
   max-width: 100%;
-  overflow-x: auto; 
+  overflow-x: auto;
 }
 
-.only-light { display: block; }
-.only-dark { display: none; }
+.only-light {
+  display: block;
+}
+.only-dark {
+  display: none;
+}
 
-html[data-theme='dark'] .only-light { display: none; }
-html[data-theme='dark'] .only-dark { display: block; }
+html[data-theme="dark"] .only-light {
+  display: none;
+}
+html[data-theme="dark"] .only-dark {
+  display: block;
+}

@@ -3,6 +3,7 @@ import Link from "@docusaurus/Link";
 import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 import Layout from "@theme/Layout";
 import Heading from "@theme/Heading";
+import AnimatedGradientText from "@site/src/components/AnimatedGradientText";
 
 import styles from "./index.module.css";
 
@@ -44,14 +45,15 @@ export default function Home(): ReactNode {
           <div className={styles.vignette} />
         </div>
 
-
         {/* HERO */}
         <section className={styles.hero}>
           <div className={styles.heroLeft}>
             <div className={styles.kicker}>Author</div>
 
             <Heading as="h1" className={styles.title}>
-              Hugo Moura
+              <AnimatedGradientText as="span" speedSec={30}>
+                Hugo Moura
+              </AnimatedGradientText>
             </Heading>
 
             <p className={styles.lead}>
@@ -69,7 +71,7 @@ export default function Home(): ReactNode {
               <Link to="/blog" className={styles.secondary}>
                 Blog
               </Link>
-            </div>            
+            </div>
 
             <div className={styles.signals}>
               <span className={styles.signal}>Architecture</span>
