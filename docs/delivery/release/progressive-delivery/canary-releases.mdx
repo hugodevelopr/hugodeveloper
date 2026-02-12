@@ -1,0 +1,749 @@
+---
+id: canary-releases
+title: Canary Release 
+slug: /delivery/release/progressive-delivery/http-response-shaping
+description: Production-grade canary release on Azure AKS using traffic splitting, automated metric gates, rollback strategy and Terraform IaC.
+sidebar_label: Canary Release 
+keywords: [canary release, azure aks, progressive delivery, traffic splitting, terraform iac]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This documents explains how to implement canary releases — a progressive delivery pattern where new software version are deployed to a small subset of 
+production traffic before full rollout — on Azure infrastructure
+
+#### Where this applies:
+
+    - Microservices running on Azure Kubernetes Service (AKS) or Azure App Service
+    - Systems with mature observability (metrics, logs, traces)
+    - Teams capable of automated rollback within minutes
+    - Applications where blast radius control justifies deployment complexity
+
+#### Where this does not apply:
+
+    - Batch jobs or scheduled workloads without live traffic
+    - Systems without reliable health metrics or SLOs
+    - Monoliths where partial deployment creates version skew problems
+    - Development/staging environments (unnecessary overhead)
+
+This is not about A/B testing for product features. This about risk mitigation during software deployments.
+
+---
+
+## 2. Why this matters in real systems
+
+The traditional "deploy and pray" model breaks down under three predictable pressures:
+
+    - **Scale pressure**: When you serve millions of requests daily, a bad deploy doesn't just affect some users — it affects enough users that your incident 
+    becomes a business event. A 5% error rate on 10 million requests is 500,000 failures. You need containment before detection becomes response.
+
+    - **Evolution pressure**: Modern systems change constantly. Multiple teams ship daily. The surface area for regression grows with every dependency update, 
+    config change, or infrastructure modification. Comprehensive pre-production testing becomes economically impossible. You must validate in production, 
+    but carefully.
+
+    - **Reliability pressure**: Your SLA assumes sub-second response times and 99.9% + availability. A broken deployment that affects all users violates this 
+    instantly. But a broken deployment affecting 5% of users for 3 minutes might stay within budget. The math of partial failure is fundamentally different.
+
+### What breaks when ignored:
+
+    - A database query regression hits all users simultaneously, overwhelming your database before you detect the problem
+    - A memory leak deploys to all pods, causing cascading failures across regions
+    - A third-party SDK update introduces 2-second latency, but your staging load tests ran with mocked dependencies
+    - A configuration typo breaks authentication, locking out customers until rollback completes (15+ minutes in many systems)
+
+Simpler approaches — blue/green, rolling updates without traffic control — work until they cost you an outage. Canary releases emerge when the cost of 
+full-blast failures exceeds the cost of deployment sophistication.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of a canary release as a **controlled experiement in production with an escape hatch**. The deployment progress through phases:
+
+```
+[Baseline: v1.0 @ 100%] 
+         ↓
+[Canary: v1.1 @ 5%, Stable: v1.0 @ 95%] ← observation window
+         ↓
+     [Gates: metrics within SLO?]
+         ↓                    ↓
+    [YES: promote]      [NO: rollback]
+         ↓                    ↓
+[v1.1 @ 20%]          [v1.0 @ 100%]
+         ↓
+[v1.1 @ 50%]
+         ↓
+[v1.1 @ 100%] ← new baseline
+```
+
+#### Key invariants:
+
+    1. **Two versions run concurrently** during the canary window. Your infrastructure must suport this.
+    2. **Traffic split is deterministic**: The same user/request should hit the same version for session consistency.
+    3. **Metrics are comparative**: You compare canary metrics against baseline (current production), not absolute thresholds.
+    4. **Promotion is gated**: Automated checks or manual approval required beforeincreasing traffic percentage.
+    5. **Rollback is instant**: Traffic shifts back to stable version without pod restarts.
+
+The "canary" metaphor comes from coal mining — miners brought canaries underground because they'd die from toxic gas before humans noticed. Your canary 
+deployment dies (get rolled back) before your entire user base suffers.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Deploy canary version alongside stable version
+
+You introduce the new version (```v1.1```) into your cluster/app service while keeping the current version (```v1.0```) full operational. Both version 
+share the same external endpoint but are distinct workloads internally.
+
+**Why this exists**: You need versions available so traffic routing can split between them. A true canary is not a rolling update — it's deliverate version 
+coexistence.
+
+#### Assumptions:
+
+    - Both version can run against the same database schema (backward-compartible migrations)
+    - Shared resources (cache, message queues) handle mixed version access
+    - Replica count for canary starts small (1-2 pods) to minimize resource cost
+
+---
+
+### Step 2 — Route small traffic percentage to canary
+
+A traffic manager (Azure Front Door, Application Gateway, service mesh like Istio/Linkerd, or [Flagger's](https://flagger.app/) 
+integrated routing) send 5-10% of request ```v1.1```, while 90-95% continue to ```v1.0```
+
+**Why this exists**: Limits blast radius. If ```v1.1``` has a critical bug, only a small user cohort experiences it.
+
+#### Routing strategies:
+
+    - **Random sampling**: Simple but risks session inconsistency (user switches version mid-session)
+    - **Header-based**: Route by ```X-Canary: true``` header (useful for internal testing)
+    - **Cookie/session-based**: Sticky routing ensures user sees one version (recommended for statefull apps)
+    - **Cohort-based**: Route by user ID hash (deterministic, consistent)
+
+**Invariant**: Routing decision must happen at the edge (load balancer/ingress), not application code.
+
+---
+
+### Step 3 — Collect and compare metrics
+
+During the observation window (typically 10-60 minutes), you monitor:
+
+    - **Error rate** (5xx responses, exceptions)
+    - **Latency** (p50, p95, p99)
+    - **Saturation** (CPU, memory, request queue depth)
+    - **Business metrics** successful transactions, API call success)
+
+Critical, you compare ```v1.1 canary``` metrics against ```v1.0 baseline``` metrics collected in the same time window.
+
+**Why this exists**: Absolute thresholds fail in practice. "Error rate &lt;0.1%" is useless if your baseline is 0.05% and the canary is 0.5% — that's a 10x 
+increase. Relative comparasion catches regressions.
+
+**Azure implementation**: Application Insights custom metrics, Log Analytics queries, Prometheus (if using service mesh), OpenTelemetry spans.
+
+---
+
+### Step 4 — Gate decision — promote or rollback
+
+An automated gate (or manual review) evaluates:
+
+```
+IF canary_error_rate > baseline_error_rate * 1.5 THEN rollback
+IF canary_p95_latency > baseline_p95_latency * 1.3 THEN rollback
+IF canary_cpu > 80% THEN rollback
+ELSE promote to next stage
+```
+
+**Why this exists**: Human reaction time is too slow for production incidents. Automated gates contain damage within minutes. Manual gates add control for 
+risky changes.
+
+#### Failure modes:
+
+    - **False positives**: Noisy metrics trigger unnecessary rollbacks (requires metric smoothing, longer observation windows)
+    - **False negatives**: Gate misses subtle degradation (requires comprehensive metric coverate)
+
+---
+
+### Step 5 — Progressive promotion or full rollback
+
+**If gates pass**: Increase canary traffic (5% → 20% → 50% → 100%), repeating observation at each stage.
+
+**If gates fail**: Instantly shift 100% traffic back to ```v1.0```, then terminate ```v1.1``` pods. No user-visible downtime.
+
+**Why this exists**: Progressive promotion limits risk at each stage. Even if the 5% canary succeeds, the 50% canary might reveal load-dependent bugs 
+(database connection exhaustion, rate limit violations).
+
+**Invariant**: Each promotion stage has its own observation window and gate evaluation.
+
+---
+
+### Step 6 — Retire old version
+
+Once ```v1.1``` reaches 100% and stabilizes (typically 24-72 hours), you decommssion ```v1.0``` infrastructure.
+
+**Why this exists**: Running two versions indefinitely wastes resources. But premature retirement risks inability to rollback if a delayed issue appers 
+(e.g., weekly batch job fails). 
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+This exemple use **AKS with Flagger** (a progressive delivery operator) and **Azure Appliction Gateway Ingress Controller** for traffic splitting.
+
+#### Infrastructure
+
+```hcl
+# AKS cluster with monitoring
+resource "azurerm_kubernetes_cluster" "aks" {
+  name                = "prod-aks"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  dns_prefix          = "prodaks"
+
+  default_node_pool {
+    name       = "default"
+    node_count = 3
+    vm_size    = "Standard_D4s_v3"
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  azure_monitor {
+    enabled = true
+  }
+}
+
+# Application Gateway for ingress
+resource "azurerm_application_gateway" "appgw" {
+  name                = "prod-appgw"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+
+  sku {
+    name     = "WAF_v2"
+    tier     = "WAF_v2"
+    capacity = 2
+  }
+  # ... gateway_ip_configuration, frontend ports, etc.
+}
+```
+
+#### Kubernetes Deployment (Helm values for Flagger)
+
+```
+# api-service.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+    spec:
+      containers:
+      - name: api
+        image: acr.azurecr.io/api-service:v1.0
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+---
+# Flagger Canary resource
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: api-service
+  namespace: production
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  service:
+    port: 8080
+  analysis:
+    interval: 1m           # Check metrics every minute
+    threshold: 5           # Fail after 5 consecutive failures
+    maxWeight: 50          # Max canary traffic before full promotion
+    stepWeight: 10         # Increase by 10% each step
+    metrics:
+    - name: request-success-rate
+      thresholdRange:
+        min: 99            # Canary must maintain 99%+ success
+      interval: 1m
+    - name: request-duration
+      thresholdRange:
+        max: 500           # p99 latency under 500ms
+      interval: 1m
+    webhooks:
+    - name: load-test      # Optional: synthetic traffic to canary
+      url: http://flagger-loadtester/
+      timeout: 5s
+      metadata:
+        cmd: "hey -z 1m -q 10 -c 2 http://api-service-canary:8080/health"
+  metricsServer: http://prometheus:9090  # Prometheus for metrics
+```
+
+#### Application Insights Query (gate logic)
+
+```
+// Compare canary vs baseline error rates
+let canaryErrors = requests
+| where timestamp > ago(10m)
+| where customDimensions.version == "v1.1"
+| summarize ErrorRate = todouble(countif(success == false)) / count() * 100;
+
+let baselineErrors = requests
+| where timestamp > ago(10m)
+| where customDimensions.version == "v1.0"
+| summarize ErrorRate = todouble(countif(success == false)) / count() * 100;
+
+// Alert if canary error rate > 1.5x baseline
+canaryErrors
+| extend BaselineRate = toscalar(baselineErrors)
+| where ErrorRate > BaselineRate * 1.5
+```
+
+#### CI/CD Pipeline (GitHub Actions)
+
+```
+# .github/workflows/deploy.yml
+name: Canary Deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Build and push image
+      run: |
+        docker build -t acr.azurecr.io/api-service:${{ github.sha }} .
+        docker push acr.azurecr.io/api-service:${{ github.sha }}
+    
+    - name: Update Kubernetes deployment
+      run: |
+        kubectl set image deployment/api-service \
+          api=acr.azurecr.io/api-service:${{ github.sha }} \
+          -n production
+    
+    # Flagger automatically detects image change and starts canary
+    - name: Wait for canary analysis
+      run: |
+        kubectl wait canary/api-service \
+          --for=condition=Promoted \
+          --timeout=20m \
+          -n production || \
+        kubectl logs -l app=flagger -n flagger-system --tail=50
+```
+
+#### How this maps to the concept:
+
+    1. Flagger watches the ```api-service``` Deployment for image changes
+    2. When you push a new image, Flagger creates a ```api-service-canary``` Deployment (10% traffic)
+    3. Every minute, Flagger queries Prometheus for success rate and latency metrics
+    4. If metrics stay within thresholds for 5 consecutive checks, traffic increases to 20%, then 30%, etc
+    5. If any check fails 5 times, Flagger rolls back (shifts traffic to ```api-service-primary```, deletes canary pods)
+    6. After 50% traffic succeeds, Flagger promotes to 100% and makes ```v1.1``` the new primary
+
+---
+
+## 6. Design trade-offs
+
+|Aspect                                    |Canary Releases                         |Blue/Green Deployment                       |Rolling Update                  |
+|------------------------------------------|----------------------------------------|--------------------------------------------|--------------------------------|
+|**Blast radius**                          |Minimal (5-50% traffic)                 |Total (50% at switch)                       |Gradual (pod-by-pod)            |
+|**Rollback speed**                        |Instant (traffic shift)                 |Instant (traffic shift)                     |Slow (redeploy old version)     |
+|**Resource cost**                         |Medium (2x pods during canary)          |High (2x full environment)                  |Low (replaces pods in-place)    |
+|**Complexity**                            |High (traffic routing, metrics, gates)  |Medium (infrastructure duplicatation)       |Low (native Kubernetes)         |
+|**Observability requirement**             |Critical (no metrics = no gates)        |Optional                                    |Optional                        |
+|**Database migration compatibility**      |Must be backward-compatible             |Can run separate schemas                    |Must be backward-compatible     |
+|**Session stickiness**                    |Required for stateful apps              |Not required                                |Not required                    |
+|**Traffic control granularity**           |Fine (1-100% increments)                |Coarse (0% or 100%)                         |None (pod replacement)          |
+
+#### What you gain with canary:
+
+    - Early detection of production-only issues (load patterns, third-party API behavior, infrastructure quirks)
+    - Controlled exposure limits customer impact
+    - Confidence to deploy frequently without elaborate staging environments
+    - Automated rollback reduces mean time to recovery (MTTR)
+
+#### What you give up:
+
+    - Operational complexity (traffic routing, metric pipelines, gate configuration)
+    - Resource overhead (running two versions simultaneously)
+    - Longer deployment time (30-60 minutes vs. 5 minutes for rolling update)
+    - Dependency on mature observability (no metrics = can't validate)
+
+#### What you implicitly accept:
+
+    - Your application must handle version coexistence (schema compatibility, API versioning)
+    - Metrics have noise/lag; false positives will happen
+    - Incident response runbooks must account for "canary stuck at 20%" scenarios
+    - Cost of extra replicas and traffic routing infrastructure
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Using absolute metric thresholds instead of comparative baselines
+
+**Why it happends**:
+
+    - It's easier to configure "error rate &lt; 1%" than to compare canary vs. baseline.
+
+**Problem**:
+
+    - Production traffic patterns vary by hour/day. Your baseline error rate might be 0.5% normally 
+    but 2% during peak traffic (due to timeout spikes, retry storms). An absolute threshold causes false positives.
+
+**How to avoid**:
+
+    Always compare canary metrics to baseline metrics collected in the same time window. Use ratios: ```canary_errors / baseline_errors > 1.5```.
+
+---
+
+### Skipping database migration compatibility planning
+
+**Why it happends**:
+
+    - Developers assume the database change deploys atomically with the code.
+
+**Problem**:
+
+    - Canary releases mean ```v1.0``` and ```v1.1``` run concurrently. If ```v1.1``` adds a required column without a
+     default, ```v1.0``` crashes on insert. If ```v1.1``` removes a column ```v1.0``` still reads, ```v1.1``` crashes.
+
+**How to avoid**: Use expand-contract pattern:
+
+    1. Deploy schema change that's compatible with both versions (add column with default, mark old column nullable)
+    2. Deploy ```v1.1``` code that uses new schema
+    3. After ```v1.1``` reaches 100%, remove old column in next release    
+
+
+---
+
+### Ignoring session stickiness for stateful applications
+
+**Why it happends**:
+
+    - Random traffic splitting is simpler to configure than sticky routing.
+
+**Problem**:
+
+    - User logs in via ```v1.0``` (creates session in Redis with ```v1.0``` format), next request hits ```v1.1``` (expects different session format), 
+    session fails, user logged out.
+
+**How to avoid**: 
+
+    -Configure routing based on session cookie, user ID hash, or connection affinity. 
+Azure Application Gateway supports cookie-based affinity. Service meshes support header-based routing
+
+
+---
+
+### Setting observation windows too short
+
+**Why it happends**:
+    - Pressure to ship fast; 2-minute canary feels safer than 20-minute.
+
+**Problem**: Many issues don't manifest immediately:
+
+    - Memory leaks take 15+ minutes to OOM
+    - Database connection pools exhaust gradually
+    - Cache invalidation bugs show up after cache expires (5-10 minutes)
+    - Downstream rate limits trigger after burst accumulates
+
+**How to avoid**: 
+
+    - Observation windows should be at least 10 minutes per stage. For critical services, 30-60 minutes. Factor in your slowest failure mode (heap exhaustion, connection leaks).
+
+---
+
+### Not testing rollback under load
+
+**Why it happends**:
+
+
+    - Teams test happy path (canary succeeds), never test failure path (canary rolls back).
+
+**Problem**: 
+
+    - Rollback shifts 100% traffic to stable version instantly. If stable version's replica count is too low 
+    (you scaled down to save cost), it can't handle the surge, causing an outage during rollback.
+
+**How to avoid**: 
+
+    - Keep stable version at full replica count during canary window
+    - Run chaos engineering tests that force rollback during peak traffic
+    - Monitor stable version's resource usage during canary (it should have headroom)
+
+---
+
+### Promoting canary to 100% without a soak period
+
+**Why it happends**:
+
+    - All gates passed at 50%, so why wait?
+
+**Problem**: 
+
+    - Some bugs only trigger at scale. Connection pool exhaustion, database lock contention, downstream service rate limits—these emerge at 100% load, not 50%.
+
+**How to avoid**: 
+
+    - After canary reaches 100%, keep old version infrastructure available for 24-48 hours. Monitor for delayed failures (batch jobs, cron tasks, weekly reports). Only then decommission old version.
+
+---
+
+### Overcomplicating traffic routing for simple services
+
+**Why it happends**:
+
+    - Canary releases sound advanced; teams build elaborate header-based routing with custom middleware.
+
+**Problem**: 
+
+    - You've added complexity that breaks when the middleware has a bug, or when requests come from unexpected clients (mobile apps, third-party webhooks). The routing layer itself becomes a failure point.
+
+**How to avoid**: 
+
+    - Use the simplest routing mechanism that satisfies your consistency requirements. For stateless APIs, random percentage-based routing works. Don't add header logic unless you have a concrete stickiness requirement.
+
+---
+
+## 8. Operational and production considerations
+
+### What to monitor:
+
+#### Critical metrics (block promotion if degraded)
+
+    - Error rate ratio: ```canary_errors / baseline_errors```
+    - Latency degradation: ```canary_p95 / baseline_p95```
+    - Resource saturation: CPU > 80%, memory > 85% (canary pods)
+    - Downstream dependency errors: third-party API failures, database timeouts
+
+#### Supporting metrics (context for investigations):
+
+    - Request volume to canary vs. baseline (confirms traffic split is accurate)
+    - Distinct user count hitting canary (detects routing skew)
+    - Cache hit rate (canary might bypass warmed cache)
+    - Database query time (schema changes can degrade queries)
+
+#### Business metrics (validates functional correctness):
+
+    - Transaction completion rate (e-commerce checkout, payment success)
+    - User-visible errors (login failures, API 4xx from client perspective)
+    - Feature flag activation (if canary includes new features)
+
+---
+
+### What degrades first:
+
+    1. **Database connection exhaustion**: New version opens more connections than old, pool limit hit, queries timeout
+    2. **Memory pressure**: Canary pods OOM because of inefficient caching or memory leak
+    3. **Downstream rate limits**: Canary makes more API calls to third-party, hits quota, requests fail
+    4. **CPU throttling**: New version has expensive computation, pods throttled, latency spikes
+
+These degradations often don't appear in staging because staging lacks production data volume and traffic patterns.
+
+---
+
+### What becomes expensive
+
+#### Cost amplifiers:
+
+    - Running 2x pod replicas during canary windows (5-10 pods per version)
+    - Application Gateway / Front Door traffic routing (per-request cost)
+    - Increased observability data volume (double the metrics, logs, traces)
+    - Crorr-region traffic if canary runs in different region for A/B comparison
+
+#### Mitigation:
+
+    - Limit canary replica count to minimum viable (1-2 pods for small services)
+    - Use shorter observation windows for low-risk changes
+    - Aggregate metrics before sending to Application Insights (reduce ingestion cost)
+    - Schedule canaries during off-peak hours when extra capacity is cheaper
+
+---
+
+### Operational risks
+
+**Stuck canary**: Automated gate fails to promote or rollback due to metric collection lag or bug. Requires manual intervetion. Runbook must define 
+"how long do we wait before forcing a decision?"
+
+**Split-brain state**: Canary and baseline diverge in data (one writes to cache, other doesn't), causing inconsistent user experience. Requires coordination 
+layer (event sourcing, CQRS) or accepting eventual consistency.
+
+**Cascading failures**: Canary triggers downstream service overload (new version calls API 3x more), downstream fails, brings down baseline too. 
+Requires bulkheads (separate connection pools per version)
+
+**False rollbacks**: Noisy metric triggers rollback of a good deployment. Team loses trust in automation, starts disabling gates, defeats the purpose. 
+Requires tuning thresholds and smoothing windows.
+
+---
+
+### Observability signals
+
+#### Application Insights custom events for canary lifecycle:
+
+```csharp
+telemetryClient.TrackEvent("CanaryStarted", new Dictionary<string, string> {
+    { "version", "v1.1" },
+    { "initialTrafficPercent", "5" }
+});
+```
+
+#### Distributed tracing to isolate version-specific latency:
+
+    - Tag spans with ```version=v1.0``` or ```version=v1.1```
+    - Compare trace durations across versions
+    - Identify which microservice in the chain introduced latency
+
+#### Log analytics queries for error correlation:
+
+```
+exceptions
+| where timestamp > ago(15m)
+| extend version = tostring(customDimensions.version)
+| summarize count() by version, outerMessage
+| order by count_ desc
+```
+
+You need telemetry granular enough to attribute failures to specific versions. Without this, you can't gate promotions reliaby.
+
+---
+
+## 9. When NOT to use this
+
+Do not use canary releases when:
+
+### Scenario: Low-traffic services (&lt;100 req/min)
+
+**Why**: Not enough request to generate statistically significant metrics in reasonable time. A 5% canary receiving 5 req/min won't reveal issues. Your 
+observation window becomes hours, defeating the purpose.
+
+**Alternative**: Blue/green with extended monitoring period, or just use rolling updates with robust smoke tests.
+
+---
+
+### Scenario: No mature observability infrastructure
+
+**Why**: Canary gates depend on real-time metrics with &lt;1 minute lag. If you don't have Application Insights / Prometheus / OpenTelemetry instrumentation returning golden signals, 
+you're flying blind. You'll either over-rollback (false positives) or under-rollback (false negatives).
+
+**Alternative**: Invest in observability first. Run blue/green deployments until your metrics are trustworthy.
+
+---
+
+### Scenario: Tightly coupled monolith with shared state
+
+**Why**: Canary requires version coexistence. If your app stores session state in-memory, shares a singleton cache, 
+or uses database schema tied to version-specific business logic, running two versions corrupts state.
+
+**Alternative**: Refactor for statelessness (externalize sessions to Redis), use expand-contract migrations, or accept full-cluster deployments with blue/green.
+
+---
+
+### Scenario: Regulatory/compliance requirements for change traceability
+
+**Why**: Some industries (finance, healthcare) require documented approval for every production change. Automated canary promotion bypasses human review gates.
+
+**Alternative**: Use manual approval at each traffic percentage gate, or restrict canaries to pre-production 
+environments, treating production as blue/green with change control board approval.
+
+---
+
+### Scenario: Cost-sensitive environments with tight budgets
+
+**Why**: Canary releases double your pod count during deployment (10 stable pods + 2 canary pods = 12 total). For large clusters, this is expensive. 
+If your margin doesn't tolerate 20-40% temporary cost increase, canaries are unaffordable.
+
+**Alternative**: Rolling updates with aggressive smoke tests, or scheduled deployments during low-traffic windows to minimize risk.
+
+---
+
+### Scenario: Services with unpredictable, bursty traffic
+
+**Why**:  If your service sees 10 req/min for 23 hours and 10,000 req/min for 1 hour (batch processing trigger, scheduled report generation), 
+your canary metrics during quiet hours are meaningless. The real test happens during burst, which you can't wait for.
+
+**Alternative**: Synthetic load testing with production-realistic traffic patterns, or blue/green with traffic replay from production logs.
+
+---
+
+### Scenario: Frequent hotfixes under incident pressure
+
+**Why**: During an outage, you need the fix deployed in 2 minutes, not 20 minutes with canary stages. Automated gates become blockers when every second counts.
+
+**Alternative**: Maintain a fast-path deployment pipeline (direct rolling update) for emergencies, reserve canary for planned releases.
+
+---
+
+## 10. Key takeaways
+
+    - **Canary releases are insurance against deployment failures, not a deployment strategy for all changes**.  Use them when the cost of a full-blast failure 
+    (customer impact, revenue loss, reputation damage) exceeds the cost of deployment complexity and observability infrastructure.
+
+    - **Comparative metrics matter more than absolute thresholds**. Comparing canary error rate to baseline error rate in the same time window accounts for 
+    traffic patterns, seasonal variation, and infrastructure noise. Absolute thresholds cause false positives.
+
+    - **Database schema changes are the hardest part of canary deployments**. Your schema must support both old and new code running concurrently. Use 
+    expand-contract migrations: add new columns before deployment new code, remove old columns after old code is decommissioned.
+
+    - **Traffic routing happens at the edge, not in application code**. Whether you use Application Gateway, Front Door, or a service mesh, routing decisions 
+    must happen before requests reach your application. Application-level routing introduces latency and complexity.
+
+    - **Observation windows must account for your slowest failure mode**. If your memory leak takes 20 minutes to manifest, a 5-minute canary is useless. 
+    Factor in connection pool exhaustion, cache expiration, downstream rate limits — whatever can fail gradually.
+
+    - **Keep stable version infrastructure running until canary proves itself at 100% load**. Many issues only emerge at full scale (database lock contention, 
+    downstream service saturation). After promotion, wait 24-48 hours before decommissioning old version infrastructure.
+
+    - **Automated gates reduce MTTR, but noisy metrics destroy trust**. If your gates trigger false rollbacks, teams disable automation and the system becomes 
+    manual approval theater. Invest in metric smoothing, longer windows, and runbook-based overrides to maintain confidence in automation.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the progressive delivery flow, highlighting concurrent version coexistence, deterministic traffic splitting, comparative metric gates, automated promotion/rollback decisions, and controlled blast radius during production rollout.
+
+import Light from './_assets/canary-release-light.svg';
+import Dark from './_assets/canary-release-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Canary Release"
+  height={380}
+/>

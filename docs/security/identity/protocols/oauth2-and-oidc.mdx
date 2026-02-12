@@ -1,0 +1,267 @@
+---
+id: oauth2-and-oidc
+title: OAuth2 & OIDC
+slug: /security/identity/protocols/oauth-and-oidc
+description: Deep dive into OAuth2/OIDC API security using .NET and Keycloak, covering flows, token validation, JWKS rotation, scopes, and enterprise hardening.
+sidebar_label: OAuth2 & OIDC 
+keywords: [oauth2, oidc, keycloak, jwt validation, api security]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+
+
+---
+
+## 2. Why this matters in real systems
+
+
+---
+
+## 3. Core concept (mental model)
+
+
+---
+
+## 4. How it works (step-by-step)
+
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+### request
+
+```
+GET /customers/42?fields=id,name,status
+```
+
+---
+
+### Domain model (simplified)
+
+```csharp title="Customer.cs"
+public sealed class Customer
+{
+    public Guid Id { get; init; }
+    public string Name { get; init; } = null!;
+    public string Email { get; init; } = null!;
+    public CustomerStatus Status { get; init; }
+    public DateTime CreatedAt { get; init; }
+}
+```
+
+---
+
+### Field definition contract
+
+Explicit, server-owned mapping
+
+```csharp title="CustomerFields.cs"
+public static class CustomerFields
+{
+    public static readonly IReadOnlyDictionary<string, Expression<Func<Customer, object>>> Map =
+        new Dictionary<string, Expression<Func<Customer, object>>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["id"] = c => c.Id,
+            ["name"] = c => c.Name,
+            ["email"] = c => c.Email,
+            ["status"] = c => c.Status
+        };
+}
+```
+
+Why this matters:
+
+    - No reflection
+    - No stringly-typed access to domain objects
+    - Compile-time safety
+    - Centralized authorization control
+
+---
+
+### Query execution with projection
+
+```csharp
+public async Task<IDictionary<string, object>> GetCustomerAsync(
+    Guid id,
+    IReadOnlyCollection<string> fields,
+    CancellationToken cancellationToken)
+{
+    var projections = fields
+        .Select(f => CustomerFields.Map[f])
+        .ToArray();
+
+    var query = _db.Customers
+        .Where(c => c.Id == id)
+        .Select(BuildProjection(projections));
+
+    return await query.SingleAsync(cancellationToken);
+}
+```
+
+Projection builder:
+
+```csharp
+private static Expression<Func<Customer, IDictionary<string, object>>> BuildProjection(
+    Expression<Func<Customer, object>>[] selectors)
+{
+    return customer => selectors.ToDictionary(
+        s => GetFieldName(s),
+        s => s.Compile().Invoke(customer)
+    );
+}
+```
+
+Key properties:
+
+    - No full entity materialization
+    - Projection happens at query level
+    - Field list drives execution
+
+---
+
+### Serialization
+
+The returned dictionary is serialized directly via ```System.Text.Json```.
+
+No custom converters.
+No dynamic objects.
+No reflection at runtime.
+
+---
+
+## 6. Design trade-offs
+
+
+| Approach                         | Pros                   | Cons                              |
+|:---------------------------------|------------------------|-----------------------------------|
+|Fixed DTOs                        |Simple                  | DTO explosion, poor evolution     |
+|Multiple endpoints                |Explicit                | Maintence overhead                | 
+|GraphQL                           |Powerful                | Operational and cognitive cost    | 
+|Field selection (this)            |Efficient, REST-native  | More backend complexity           | 
+
+What you gain:
+
+    - Payload reduction
+    - Better cache utilization
+    - Easier API evolution
+    - Explicit client intent
+
+What you give up:
+
+    - Simplicity of static DTOs
+    - Some tooling familiarity
+    - Slightly higher implementation complexity
+
+What you implicitly accept:
+
+    - Clients must be disciplined
+    - Documentation becomes critical
+    - Validation logic is unavoidable
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### "We can just ignore unrequested fields during serialization"
+
+**Why it happends**:
+    - Looks simpler
+
+**Problem**:
+    - Database and domain layers still over-fetch
+
+**Avoidance**:
+    - Always push projection down to the query
+
+---
+
+### "Let clients request any field dynamically"
+
+**Why it happends**:
+    - Over-flexibility mindset
+
+**Problem**:
+    - Security leaks
+    - Contract instability
+
+**Avoidance**:
+    - Explicit server-side field registry
+
+---
+
+### "Missing fields should be returned as null"
+
+**Why it happends**:
+    - Misunderstanding semantics
+
+**Problem**:
+    - Breaks client assumptions
+    - Blurs meaning
+
+**Avoidance**:
+    - Omitted means omitted
+
+---
+
+## 8. Operational and production considerations
+
+#### Things to monitor:
+
+    - Payload size distribution
+    - p95/p99 latency by field set
+    - Cache hit ratio variance
+    - GC pressure from allocations
+
+#### What degrades first:
+
+    - Serialization cost under high cardinality field sets
+    - Cache efficiency if field sets are too granula
+
+#### Operational risks:
+
+    - Unbounded combinations of field sets
+    - Cache fragmentation
+    - Poor documentation causing misuse
+
+#### Mitigations:
+
+    - Field set normalization
+    - Max field count limits
+    - Default field sets for common clients
+
+---
+
+## 9. When NOT to use this
+
+Do not use sparse fieldsets when:
+
+    - You control both client and server tightly
+    - Payload size is negligible
+    - API is strictly internal and short-lived
+    - Regulatory requirements mandate fixed schemas
+    - Team maturity does not support contract discipline
+
+In these cases, simpler DTO-based APIs are safer.
+
+---
+
+## 10. Key takeaways
+
+    - Field selection is about **evolution**, not just performance
+    - Over-fetching is a hidden cost that compounds over time
+    - Projections must influence data access, not just serialization
+    - Explicit field contracts are mandatory for safety
+    - Cache behavior must be considered early
+    - Flexibility without constraints becomes technical debt
+    - REST can evolve without becoming GraphQL
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end flow, highlighting the transactional boundary, outbox persistence, asynchronous dispatch, and downstream consumption.
+
