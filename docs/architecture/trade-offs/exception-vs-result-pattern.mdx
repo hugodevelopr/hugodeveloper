@@ -1,0 +1,633 @@
+---
+id: exception-vs-result-pattern
+title: Exception vs Result
+slug: /architecture/trade-offs/exception-vs-result-pattern
+description: Architectural trade-offs between exceptions and Result pattern for business rule validation in high-throughput .NET APIs.
+sidebar_label: Exception vs Result
+keywords: [exception-handling, result-pattern, business-validation, aspnet-core, runtime-performance]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document examines how to model and propagate business rule validation failures in .NET application where **performance, allocation behavior, and 
+observability clarity** directly impact production outcomes.
+
+**Applies to:**
+
+    - High-throughput ASP.NET Core APIs (>1000 RPS per instance)
+    - Domain logic executed inside hot paths (request handlers, background workers, event processors)
+    - Systems with strict latency budgets (P99 &lt; 50ms)
+    - Distributed architectures where failure semantics must be explicit and observable
+
+**Does not apply to:**
+
+    - Infrastructure failures (database unavailable, network timeout)
+    - Programmer error (null reference, index out of bounds)
+    - Low-throughput CRUD applications where allocation and control flow overhead is negligible
+    - Systems without measurable latency or GC pressure constraints
+
+The core question: **Should business rule violations be modeled as exceptions or as explicit result values?** This choice affects allocation patterns, control 
+flow complexity, observability signal quality, and architectural consistency across service boundaries.
+
+---
+
+## 2. Why this matters in real systems
+
+### The pressure points
+
+In a typical ASP.NET Core API handling order processing, you might see:
+
+```csharp
+// Request arrives → validation → business logic → persistence → response
+// This happens 2,000 times per second during peak traffic
+```
+
+Each request execute 5-15 validation rules (stock availability, credit limits, shipping constraints). When a rule fails, the system must:
+
+    1. Stop processing immediately
+    2. Communicate the specific failure to the caller
+    3. Log the event with appropriate severity
+    4. Maintain transaction integrity
+    5. Return a meaningful HTTP response
+
+
+**What breaks at scale:**
+
+    - **Exeption-based validation** in hot paths creates 10,000+ exception allocation per second. Each exception captures a stack trace (typically 2-8 KB). 
+    GC Gen0 collections spike. P99 latency increases by 15-40ms. The cost isn't the throw-it's the ``StackTrace` capture and the object graph that becomes garbage.
+
+    - **Incosistent error modeling** where some validations throw, others return nulls, and others use out parameters leads to defensive programming patterns 
+    everywhere. Code becomes unreadable. Observability is compromised because you can't distinguish "user sent invalid data" from "system is failing".
+
+    - **Observability collapse** happens when validation failures are logged as errors (they're not errors-they're expected behavior). Your alerting fires 
+    constantly. When real errors occur, they're buried in noise.
+
+#### What actually happens in production
+
+A team ships a new feature that add 3 validation rules to a frequently-called endpoint. Each rule throws `ValidationException` on failure. Traffic is normal, 
+but suddently:
+
+    - P99 latency jumps from 35ms to 85ms
+    - GC pauses increase from 2ms to 12ms
+    - Error logs explode (90% are validation failures, not errors)
+    - On-call gets paged because "error rate" crosses threshold
+    - APM traces show most time spent in exception handling
+
+The code is "correct" but the architectural choice made validation **indistinguishable from failure** at operational level.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of error modeling as **signal classification at runtime**.
+
+There are three categories of runtime signals:
+
+    1. **Expected outcomes** — Business rules fail, users send invalid input, resources aren't available. These are parte of normal operation. The system 
+    should handle them efficiently and explicitly.
+
+    2. **Unexpected failures** — Database connection lost, disk full, out of memory. The system cannot continue. Exceptional control flow is appropriate.
+
+    3. **Programmer errors**: — Null reference, index out of bound, contract violation. These should never reach prodction.
+
+**The mental model:**
+
+```
+Request → Domain Logic → Outcome
+
+If outcome ∈ {expected results}:
+  → Model as explicit value (Result<T>)
+  → Return through normal control flow
+  → Log at Info/Debug level
+  → Map to appropriate HTTP status (400, 409, etc.)
+
+If outcome ∈ {unexpected failures}:
+  → Model as exception
+  → Unwind the stack
+  → Log at Error/Critical level
+  → Map to 500 (system failure)
+
+If outcome ∈ {programmer errors}:
+  → Fail fast (exception)
+  → Fix the bug
+  → Never ship to production
+```
+
+**Result Pattern** makes the first category **explicit in tye type system**. Instead of:
+
+```csharp
+void ProcessOrder(Order order) // throws ValidationException
+```
+
+You have:
+
+```csharp
+Result<OrderConfirmation> ProcessOrder(Order order) // returns success or typed failure
+```
+
+The compiler now enforces that callers must handle both paths. The failure path is first-class data, not an exceptional control flow.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Exception-based validation flow
+
+    1. **Validation occurs** inside domain logic or handler
+    2. Rule violation detected → `throw new ValidationException(message)`
+    3. **Stack unwinds** through potentially 5-10 frames
+    4. Exception captured by middleware/filter at the top of the request pipeline
+    5. **Stack trace captured** (allocation, CPU cost)
+    6. Middleware maps exception type to HTTP status code
+    7. Exception logged (often as Error)
+    8. Response returned to client
+
+**Key characteristics:**
+
+    - Control flow is implicit (invisible in method signatures)
+    - Allocation cost is per-exception (not per-request unless you always throw)
+    - Every throw site must be discoverable through grep or runtime
+    - The type system doesn't enforce handling
+
+### Result Pattern flow
+
+    1. **Validation occurs** inside domian logic
+    2. Rule violation detected → `return Result.Failure("insufficient_stock)`
+    3. **Caller immediately sees** the result (no unwinding)
+    4. Caller pattern-matches or checks `IsSuccess`
+    5. If failure, propagate up (returning another Result) or handle
+    6. At API boundary, map `Result` to HTTP response
+    7. Log at appropriate level based on outcome type
+
+**Key characteristics:**
+
+    - Control flow is explicit (visible in return type)
+    - Allocation is minimal (single Result object, often struct-optimized)
+    - The type system forces you to acknowledge both success and failure paths
+    - No stack trace overhead
+
+### The structural difference
+
+**Exception** say: "Something went wrong. Figure out what to do."
+
+**Result** says: "Here are the two possible outcomes. You must handle both."
+
+In a hot path executing 10,000 times per second, the difference between throwing 10,000 exceptions vs return 10,000 Result object is:
+
+    - **Allocation:** ~20-80 MB of garbage vs ~1-2 MB
+    - **GC pressure:** Frequent Gen0 collection vs negligible impact
+    - **CPU cost:** Stack trace capture vs simple object construction
+    - **Observability:** Exception logs vs structured failure data
+
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+### Exception-based approach
+
+```csharp
+public class CreateOrderHandler : IRequestHandler<CreateOrderCommand, OrderResponse>
+{
+    private readonly IOrderRepository _repository;
+    private readonly IInventoryService _inventory;
+
+    public async Task<OrderResponse> Handle(CreateOrderCommand request, CancellationToken ct)
+    {
+        // Validation throws on failure
+        if (request.Items.Count == 0)
+            throw new ValidationException("Order must contain at least one item");
+
+        if (request.Items.Any(i => i.Quantity <= 0))
+            throw new ValidationException("Item quantities must be positive");
+
+        // Business rule throws on failure
+        foreach (var item in request.Items)
+        {
+            var available = await _inventory.GetAvailableStock(item.ProductId, ct);
+            if (available < item.Quantity)
+                throw new BusinessRuleException($"Insufficient stock for {item.ProductId}");
+        }
+
+        var order = Order.Create(request.CustomerId, request.Items);
+        await _repository.Save(order, ct);
+
+        return new OrderResponse { OrderId = order.Id };
+    }
+}
+
+// Global exception filter
+public class ValidationExceptionFilter : IExceptionFilter
+{
+    public void OnException(ExceptionContext context)
+    {
+        if (context.Exception is ValidationException vex)
+        {
+            context.Result = new BadRequestObjectResult(new { error = vex.Message });
+            context.ExceptionHandled = true;
+        }
+    }
+}
+```
+
+**Issues at 2,000 RPS with 15% validation failure rate:**
+
+    - 300 exception/second
+    - ~600 KB-2.4 MB garbage/second (just from exceptions)
+    - Error logs dominated by expected validation failures
+    - Cannot distinguish validation failure from system error in metrics
+
+### Result Pattern approach
+
+```csharp
+public class CreateOrderHandler : IRequestHandler<CreateOrderCommand, Result<OrderResponse>>
+{
+    private readonly IOrderRepository _repository;
+    private readonly IInventoryService _inventory;
+
+    public async Task<Result<OrderResponse>> Handle(CreateOrderCommand request, CancellationToken ct)
+    {
+        // Validation returns Result
+        if (request.Items.Count == 0)
+            return Result.Failure<OrderResponse>("EMPTY_ORDER", "Order must contain at least one item");
+
+        if (request.Items.Any(i => i.Quantity <= 0))
+            return Result.Failure<OrderResponse>("INVALID_QUANTITY", "Item quantities must be positive");
+
+        // Business rule returns Result
+        foreach (var item in request.Items)
+        {
+            var stockResult = await _inventory.CheckStock(item.ProductId, item.Quantity, ct);
+            if (stockResult.IsFailure)
+                return Result.Failure<OrderResponse>("INSUFFICIENT_STOCK", stockResult.Error);
+        }
+
+        var order = Order.Create(request.CustomerId, request.Items);
+        await _repository.Save(order, ct);
+
+        return Result.Success(new OrderResponse { OrderId = order.Id });
+    }
+}
+
+// Minimal Result implementation (can use libraries like FluentResults, LanguageExt, or ErrorOr)
+public readonly struct Result<T>
+{
+    public bool IsSuccess { get; }
+    public T? Value { get; }
+    public string ErrorCode { get; }
+    public string ErrorMessage { get; }
+
+    private Result(bool isSuccess, T? value, string errorCode, string errorMessage)
+    {
+        IsSuccess = isSuccess;
+        Value = value;
+        ErrorCode = errorCode;
+        ErrorMessage = errorMessage;
+    }
+
+    public static Result<T> Success(T value) => new(true, value, "", "");
+    public static Result<T> Failure(string code, string message) => new(false, default, code, message);
+}
+
+// API endpoint mapping
+[HttpPost]
+public async Task<IActionResult> CreateOrder([FromBody] CreateOrderCommand command)
+{
+    var result = await _mediator.Send(command);
+
+    return result.IsSuccess
+        ? Ok(result.Value)
+        : result.ErrorCode switch
+        {
+            "EMPTY_ORDER" or "INVALID_QUANTITY" => BadRequest(new { code = result.ErrorCode, message = result.ErrorMessage }),
+            "INSUFFICIENT_STOCK" => Conflict(new { code = result.ErrorCode, message = result.ErrorMessage }),
+            _ => StatusCode(500, "Unexpected error")
+        };
+}
+```
+
+**Characteristics:**
+
+    - Return types explicitly indicate fallibility
+    - No exception throw for business rule violations
+    - Allocations reduced by 95%
+    - Error codes enable structured logging and metrics
+    - Clear separation: validation failures (400) vs business rules violations (409) vs system errors (500)
+
+---
+
+## 6. Design trade-offs
+
+|Apesct                       |Exception-based                                                |Result Pattern                                                 |
+|-----------------------------|---------------------------------------------------------------|---------------------------------------------------------------|
+|**Performance (hot path)**   |High allocation, GC pressure, stack trace overhead             |Minimal allocation, negligible GC impact                       |
+|**Type safety**              |Failure path invisible in signatures                           |Failure path explicit in return type                           |
+|**Code complexity**          |Simple to write initially, complex to maintain                 |Slightly more verbose, but explicit                            |
+|**Control flow**             |Implicit (requires documentation or grep)                      |Explicit (compiler-enforced)                                   |
+|**Observability**            |Validation failures appear as exceptions (noise)               |Failures are structured data (signal)                          |
+|**Framework integration**    |Built-in (exception filters, middleware)                       |Requires custom mapping at boundaries                          |
+|**Learning curve**           |Familiar to most .NET developers                               |Requires pattern adoption and discipline                       |
+|**Error composition**        |Difficult (exception stacking is awkward)                      |Natural (Result types compose easily)                          |
+|**Backward compatibility**   |Easy to add, hard to remove                                    |Requires API surface changes                                   |
+|Debugging                    |Stack traces available                                         |Must log context explicitly                                    |
+
+**What you gain with Result Pattern:**
+
+    - Predictable performance under load
+    - Clear architectural boundary between expected outcomes and failures
+    - Structured error data for metrics and alerting
+    - Type-driven correctness (compiler enforces handling)
+    - Reduced cognitive load (failures are visible in method signatures)
+
+**What you give up:**
+
+    - Familiarity and framework default behavior
+    - Some convenience (can't just throw and forget)
+    - Stack traces for validation failures (you must log context explicitly)
+    - Automatic propagation up the call stack
+
+**What you're implicitly accepting:**
+
+    - Team discipline to use Result consistently
+    - Refactoring cost if transitioning from exceptions
+    - Custom middleware/filters for Result-to-HTTP mapping 
+    - Explicit error handling at every layer
+
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Using Result for everything including infrastructure failures
+
+**Why it happens:** Team adopt Result Pattern and apply it universally.
+
+**Problem:** Database timeouts, network failures, and out-of-memory conditions are **exceptional**. They should unwind the stack and trigger circuit breakers, 
+retries, or fallback logic. Modeling them as Result forces every call site to handle catastrophic failures explicitly, which is rarely appropriate.
+
+
+**How to avoid:** Reserve Result for **domain-level outcomes**. Let exceptions represent infrastructure and programmer errors. A good heuristic: if you'd page 
+an engineer at 3am, it's an exception.
+
+---
+
+### Crating a "God Result" type with dozens of error cases
+
+**Why it happens:** Teams try to represent every possible failure as a typed union in a single Result.
+
+**Problem:** The type becomes unwieldy. Pattern matching becomes verbose. Adding new error cases breaks API compatibility.
+
+**How to avoid:** Use error codes (strings or enums) instead of deeply nested discriminated unions. Keep Result generic: `Result<T>` with simple error payload. 
+Richness belongs in the error message or structured log context, not the type system.
+
+---
+
+### Loggin Result failures as errors
+
+**Why it happens:** Developers treat any failure as an error condition.
+
+**Problem:** Expected business rule violations flood error logs. Alerting becomes meaningless. Real errors are buried.
+
+**How to avoid:** Log validation failures at Info or Debug level. Use strctured logging with error codes. Reserve Error level for unexpected failures (exceptions).
+
+```csharp
+// Wrong
+if (result.IsFailure)
+    _logger.LogError("Order validation failed: {Error}", result.Error);
+
+// Right
+if (result.IsFailure)
+    _logger.LogInformation("Order validation failed: {ErrorCode}", result.ErrorCode);
+```
+
+---
+
+### Mixing exceptions and Results incosistently
+
+**Why it happens:** Gradual adoption, multiple teams, lack of architectural governance.
+
+**Problem:** Some validators throw, others return Results. Callers must defensively handle both patterns. Code reviews become arguments about style.
+
+**How to avoid:** Establish clear boundaries. Common pattern: domain layer uses Result, infrastructure throws exceptions, API layer maps both to HTTP. 
+Document the decision in an ADR (Architecture Decision Record).
+
+---
+
+### Returning Result&lt;Unit> instead of Result
+
+**Why it happens:** Teams over-apply generics.
+
+**Problem:** `Result&lt;Unit>` (where Unit is an empty struct) is awkward. It forces you to construct a meaningless success value.
+
+**How to avoid:** Use a non-generic `Result` type for operations that don't return data:
+
+```csharp
+public Result DeleteOrder(Guid orderId) // not Result<Unit>
+```
+
+---
+
+### Ignoring Result without handling
+
+**Why it happens:** Developer forgets to check `IsSuccess`
+
+**Problem:** Failures are silently ignored. The system behaves incorrectly without raising alarms.
+
+**How to avoid:** Use `readonly struct` for Result to prevent mutation. Enable nullable reference types. Consider Roslyn analyzers that enforce Result handling 
+(e.g., require explicit discard `_ = result` if intentionally ignored).
+
+---
+
+## 8. Operational and production considerations
+
+### What to monitor
+
+**With exceptions:**
+
+    - Exception count by type (distinguish validation from infrastructure)
+    - Exception rate as percentage of total requests
+    - GC Gen0 collection frequency and duration
+    - P99/P95 latency correlation with exception rate
+
+**Result Result Pattern:**
+
+    - Validation failure rate by error code (structured metric)
+    - Failure-to-success ratio per endpoint
+    - Latency histograms (should show tighter distribution)
+    - Allocation rate (should decrease measurably)
+
+### What degrades first
+
+**Exception under load:**
+
+    - GC starts running more frequently as exception allocation accumulate
+    - P99 latency increases because GC pauses occur during request processing
+    - CPU usage increases due to stack trace capture overhead
+    - Log ingestion costs spike (especially if sending to external service)
+
+**Result Pattern under load:**
+
+    - If Result types are not struct-optimized, you may still see allocation pressure (less than exceptions, but measurable)
+    - If error messages are large strings, memory usage can still be significant
+    - If every layer logs the same failure, log volume increases without adding value
+
+### What becomes expensive
+
+**Exceptions:**
+
+    - Log storage (every exception writes a stack trace)
+    - APM costs (if tracing every exception as a span)
+    - Alert fatigue (false positives from validation failures)
+
+**Result Pattern:**
+
+    - Development time (requires more explicit code)
+    - Training cost (team must understand the pattern)
+    - Refactoring cost (if migrating from exception-based code)
+
+### Observability signals
+
+**For exceptions:**
+```csharp
+catch (ValidationException ex)
+{
+    _logger.LogWarning(ex, "Validation failed for {OrderId}", orderId);
+    // Still logs stack trace even if you don't need it
+}
+```
+
+**For Result Pattern:**
+```csharp
+if (result.IsFailure)
+{
+    _logger.LogInformation(
+        "Validation failed: {ErrorCode} for Order {OrderId}",
+        result.ErrorCode,
+        orderId
+    );
+    // Structured, no stack trace noise
+}
+```
+
+**OpenTelemetry integration:**
+
+Record validation failures as span attributes, not errors:
+
+```csharp
+using var activity = ActivitySource.StartActivity("ProcessOrder");
+
+var result = await _handler.Handle(command, ct);
+
+if (result.IsFailure)
+{
+    activity?.SetTag("validation.failed", true);
+    activity?.SetTag("validation.error_code", result.ErrorCode);
+    // Don't call SetStatus(ActivityStatusCode.Error) — this isn't an error
+}
+```
+
+This keeps your error rate metrics clean and allows you to analyze validation failures separately from system failures.
+
+
+### What to test
+
+**Exceptions:**
+
+    - Verify middleware catches and maps correctly
+    - Ensure stack traces don't leak to clients
+    - Load test to measure GC impact under realistic failure rates
+
+**Result Pattern:**
+
+    - Verify all callers handle both success and failure paths
+    - Test error code mapping to HTTP status codes
+    - Validate that infrastructure exceptions still propagate correctly (don't accidentally catch them in Result handling)
+
+---
+
+## 9. When NOT to use this
+
+### Low-throughput systems
+
+If your API handles 10 requests per second, exception overhead is irrelevant. The complexity cost of Result Pattern exceeds any performance benefit. 
+Use exceptions-they're simpler.
+
+### Programmer errors and contract violations
+
+If a method receives null when it requires non-null, that's a bug. Throw `ArgumentNullException`. Don't model programmer errors as Result-they should never occur 
+in production.
+
+### Infrastructure failures
+
+Database connection lost, Redis unavailable, external API timeout-these are exceptions. Don't force every database call to return `Result<T>` where failure 
+means "the database is down". Let exceptions propagate and handle them globally with retry policies, circuit breakers, or fallback logic.
+
+### Systems where observability is immature
+
+If your team doesn't have structured logging, metrics collection, or distributed tracing in place, Result Pattern won't help. Fix observability first. 
+Without proper instrumentation, Result failures are just as invisible as exceptions.
+
+### Codebases without disciplined architecture
+
+Result Pattern requires **team discipline**. If your codebase lacks consistent patterns, clear layer boundaries, or code review rigor, introducing Result will 
+create inconsistency: some code will use exceptions, some will use Result, and many places will mix both awkwardly.
+
+### When you need stack traces for debugging
+
+During early development or when debugging complex flows, stack traces are invaluable. If you're actively investigating why a rule fails, exceptions provide 
+context automatically. Once the system stabilizes, consider migrating to Result.
+
+### Public APIs with broad consumer bases
+
+If you're building a library or SDK consumed by external teams, exceptions are the .NET convention. Forcing consumers to handle `Result<T>` breaks idiomatic 
+expectations and increases adoption friction. Reserve Result Pattern for internal service boundaries.
+
+### Legacy codebases with deep exception handling
+
+If your system has 50+ catch blocks, exception filters, and middleware already tuned to handle specific exception types, retrofitting Result Patter is high-risk. 
+The refactoring surface is too large. Accept the technical debt or migrate incrementally over months.
+
+---
+
+## 10. Key takeaways
+
+    - **Model expected outcomes explicitly.** Business rule violations are not erros-they're normal runtime conditions that belong in the type system as Result 
+    values, not hidden in exception-based control flow.
+
+    - **Performance is measurable, not theoretical.** In high-throughput systems, exceptions introduce allocation, GC pressure, and latency variance. Profile 
+    under realistic load before and after adopting Result Pattern to quantify impact.
+
+    - **Observability clarity matters more than convenience.** Structured error codes enable precise metrics, alerting, and debugging. Exception-based 
+    validation pollutes error logs and conflates expected failures with system failures.
+
+    - **The type system should reflect reality.** If a method can fail due to domain constraints, `Result<T>` makes that failure explicit. Callers must 
+    acknowledge both paths, reducing the likelihood of unhandled edge cases in production.
+
+    - **Reserve exceptions for the exceptional.** Infrastructure failures, programmer errors, and catastrophic conditions should still throw. Result Pattern is 
+    not a replacement for exceptions-it's a complement for domain-level outcomes.
+
+    - **Consistency beats perfection.** A codebase that uses Result Pattern everywhere it applies is better than a codebase that mixes exceptions and Results 
+    arbitrarily. Establish boundaries, document them, and enforce them in code review.
+
+    - **Don't adopt patterns you haven't measured.** If your system doesn't exhibit GC pressure, allocation problems, or observability issues from validation 
+    exceptions, Result Pattern may be unnecessary complexity. _Solve problems you have, not problems you've read about._
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the request execution flow, highlighting where business rule validation occurs, how failures propagate (exception vs Result), and the impact on control flow, allocation behavior, and observability signals.
+
+import Light from './_assets/exception-vs-result-pattern-light.svg';
+import Dark from './_assets/exception-vs-result-pattern-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Exception vs Result Pattern"
+  height={860}
+/>
