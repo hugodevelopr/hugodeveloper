@@ -419,7 +419,7 @@ Document the decision in an ADR (Architecture Decision Record).
 
 **Why it happens:** Teams over-apply generics.
 
-**Problem:** `Result&lt;Unit>` (where Unit is an empty struct) is awkward. It forces you to construct a meaningless success value.
+**Problem:** `Result<Unit>` (where Unit is an empty struct) is awkward. It forces you to construct a meaningless success value.
 
 **How to avoid:** Use a non-generic `Result` type for operations that don't return data:
 
