@@ -1,0 +1,98 @@
+---
+id: rag-architecture
+title: RAG Architecture
+slug: /platform/ai/rag-architecture
+description: Production-grade RAG architecture covering hybrid retrieval, vector indexing, LLM grounding, multi-tenant isolation, evaluation, and cost control on Azure/.NET.
+sidebar_label: RAG Architecture
+keywords: [retrieval augmented generation, hybrid retrieval, vector indexing, azure ai search, llmops]
+sidebar_position: 20
+---
+
+## 1. What this document is about
+
+This document explains how to design, implement, and operate production-grade Retrieval-Augmented Generation 
+(RAG) systems for enterprise that require:
+
+    - Multi-tenant isolation with strict data boundaries
+    - Hybrid retrieval combining vector similarity and lexical search
+    - Metadata filtering, re-ranking, and grounding
+    - Compliance with data protection regulations (PII/LGPD)
+    - Observability, evaluation, and safe rollout across service
+
+**Where this applies:**
+
+    - Enterprise knowledge bases, customer support, internal documentation, legal/compliance Q&A
+    - Systems serving 100+ concurrent users with &lt;2s p95 latency requirements
+    - Multi-tenant SaaS platforms where data leakage represents existential risk
+    - Regulated industries requiring audit trails and explainability
+
+**Where this does not apply:**
+
+    - Single-user prototypes or demos
+    - Systems that can tolerate stale data (24>h lag)
+    - Use cases where vector-only search suffices
+    - Non-LLM information retrieval systems
+
+
+---
+
+## 2. Why this matters in real systems
+
+
+---
+
+## 3. Core concept (mental model)
+
+---
+
+## 4. How it works (step-by-step)
+
+
+---
+
+## 5. Minimal but realistic example 
+
+
+---
+
+## 6. Design trade-offs
+
+
+---
+
+## 7. Common mistakes and misconceptions
+
+
+---
+
+## 8. Operational and production considerations
+
+
+---
+
+## 9. When NOT to use this
+
+
+---
+
+## 10. Key takeaways
+
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end embedded AI flow, highlighting tenant-scoped isolation boundaries, quota enforcement, prompt orchestration with RAG, controlled model invocation, audit persistence, and optional asynchronous processing for batch and embedding workloads.
+
+
+import Light from './_assets/embedded-ai-architecture-light.svg';
+import Dark from './_assets/embedded-ai-architecture-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Embedded AI Architecture"
+  height={560}
+/>
