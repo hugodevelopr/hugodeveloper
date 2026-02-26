@@ -1,0 +1,660 @@
+---
+id: agentic-systems
+title: Agentic Runtime Architecture
+slug: /platform/ai/agentic-systems
+description: Production-grade agentic AI runtime design covering planner-executor loops, tool contracts, memory models, guardrails, observability and cost control.
+sidebar_label: Agentic Runtime
+keywords: [agentic ai, llm orchestration, planner executor, tool contracts, multi-tenant isolation]
+sidebar_position: 10
+---
+
+## 1. What this document is about
+
+This document addresses the engineering challenges of building **production-grade Agentic AI systems:** systems where a language model doesn't just respond to 
+a single prompt but operates in an autonomous loop — planning subtasks, invoking tools, maintaining state across steps, and making decisions that have 
+real-world consequences.
+
+The problems covered include:
+
+    - How to structure an angent loop that is deterministic enough to audit and debug
+    - How to design tool execution safely in multi-tenant environments
+    - How to manage memory an context across long-running agent tasks
+    - How to enforce cost, latency, and safety guardrails without breaking agent capability
+    - How to observe, test, and roll back agentic behavior in production
+
+**Where this applies:** Any system where an LLM is given agency over a sequence of actions — scheduling, code generation and execution, data retrieval, API 
+orchestration, workflow automation.
+
+**Where this does not apply:** Single-turn LLM completions with no side effects; [RAG](/docs/platform/ai/rag-architecture/) pipelines that only read and summarize; fine-tuned classifiers and 
+extraction models with no planning component.
+
+---
+
+## 2. Why this matters in real systems
+
+The simplest version of an AI feature is a prompt-in, text-out completion. That model breaks down as soon as the task requires more than on step, more information 
+than fits in context, or actions with side effects.
+
+Teams reach for agentic architecture under the following pressures:
+
+    - **Tasks tha require sequention decisions**. A user asks an AI assistant to "prepare a competitive analysis". That involves searching the web, reading 
+    multiple documents, synthesizing across sources, and generating a structured report. No single prompt handles this. You need planning, tool dispatch, and 
+    result aggregation across an unknown number of steps.
+
+    - **Context window ceilings**. Event with 200K-token contexts, long-running tasks accumulate too much history. Agents that blindly concatenate every observation 
+    eventually degrade in quality and spike in cost. You need explicit memory management: what to keep in context, what to summarize, what to retrieve.
+
+    - **Tool use with real side effects**. The moment an agent can write to a database, send an email, or call an external API, the stakes change entirely. One 
+    misrouted tool call or runaway loop has consequences that a text completion never did. You need execution isolation, rollback, and audit trails.
+
+**What tends to break when this is ignored:**
+
+    - Agents get stuck in infinite loops when the goal condition is ambiguous or tool results are enexpected
+
+    - Context windows overflow mid-task, causing the agent to lose earlier steps and re-do work
+
+    - Unconstrained tool execution burns API credits or sends duplicate request to downstream systems
+
+    - Without structured logging, a failed 30-step agent run is impossible to debug
+
+    - Prompt injection through tool result poisons the agent's subsequent decisions
+
+Simpler approaches — chain-of-thought prompting, fixed multi-step pipelines — stop working when the task structure is genuinely dynamic, when the number of steps isn't 
+known in advance, or when the agent needs to recover from partial failures.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of an agentic system as a **controlled decision loop with external memory and bounded execution authority**.
+
+The core loop has four phases, repeated until a termination condition is met:
+
+```
+[OBSERVE] → [PLAN] → [ACT] → [REFLECT]
+     ↑                              |
+     └──────────────────────────────┘
+```
+
+    - **OBSERVE:** The agent receives the current state of the world — the original goal, prior tool results, retrieved memories, and any system context.
+
+    - **PLAN:** The LLM reasons over the obervation and decides what to do next. This may be explicit (chain-of-thought, ReAct-style reasoning) or implicit 
+    (structured tool selection).
+
+    - **ACT:** A tool is invoked, or the agent emits a final response. This is the only point where side effects occur.
+
+    - **REFLECT:** The result of the action is evaluated. Did it succeed? Does the goal need updating? Is termination warranted?
+
+The key insight is that **the LLM is not the runtime** — it is the reasoning engine inside a runtime you control. The loop, state management, tool dispatch, 
+guardrails, and termination logic all live outside the model. The LLM makes decisions; your orchestrator enforces invariants.
+
+This separation is what makes agentic systems testable, auditable and safe.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Goal Ingestion and Task Decomposition
+
+The agent receives a goal — typically a natural language instruction with optional structured context (user ID, tenant config, available tools, memory scope).
+
+The orchestrator constructs the initial prompt: system instructions defining the agent's role, available tools in JSON schema format, any pre-loaded memory, and the user goal.
+
+**Why it exists:** The initial prompt shape determines the quality of everything downstream. Tool schemas that are ambiguous, memory that is irrelevant, or system 
+instructions that contradict each other will cause failures that are hard to trace back to the root.
+
+**Assumption:** The LLM can reliably select tools from a well-defined schema. This breaks down when the tool list exceeds ~20 entries — consider tool routing or 
+capability namespacing at scale.
+
+---
+
+### Step 2 — Tool Selection and Parameter Extraction
+
+The LLM responds with either a tool call (structured output: tool name + arguments) or a final answer. Modern APIs (`OpenAI function calling`, `Anthropic tool use`) 
+return this as a structured object, not raw text, which eliminates most parsing fragility.
+
+**Invariant:** The orchestrator validates the tool call before execution — argument schema validation, authorization check against tenant permissions, rate limit check. 
+Tool calls that fail validation are returned as error observations, not slintly dropped.
+
+---
+
+### Step 3 — Tool Execution
+
+The orchestrator executes the tool in an isolated context: a sandboxed function, a microservice call, a read-only database query, or a restricted API client. 
+The execution is wrapped in:
+
+    - A timeout (hard kill after N seconds)
+    - An error handler that returns a structured failure observation
+    - An audit log entry (tool name, arguments, result, timestamp, trace ID)
+    - A cost accumulator (token count, API call count, compute time)
+
+**Why isolation matters:** Tool execution is where the agent touches real systems. Without isolation, a buggy tool can block the event loop, leak cross-tenant data, 
+or consume unbounded resources.
+
+---
+
+### Step 4 — Observation Injection
+
+The tool result is formatted as an observation and appended to the conversation history. The loop returns to Step 1 with the updated context.
+
+**Memory management happens here:** Before appending, the orchestrator checks whether the context budget is approaching its ceiling. If so: summarize older turns, 
+evict low-relevance tool results, or offload to long-term memory (vector store).
+
+---
+
+### Step 5 — Termination Check
+
+Before re-entering the LLM, the orchestrator evaluates termination conditions:
+
+    - **Natural:** The LLM emits a final response (no tool call)
+    - **Step budget:** Maximum step count exceeded
+    - **Time budget:** Wall-clock limit exceeded
+    - **Cost budget:** Token or API call ceiling hit
+    - **Stuck detection:** The same tool called with the same arguments N times consecutively
+
+**Why explicit termination matters:** An LLM asked to "keep trying until you succeed" will do exactly that, especially when tool errors return ambiguous message. 
+Without a hard step ceiling, runaway agents are a real production risk.
+
+---
+
+### Step 6 — Result Assembly and Audit Finalization
+
+On termination, the orchestrator assembles the final response, marks the run as complete (or failed/truncated), and writes the full trace to durable storage. 
+The trace includes every observation, tool call, LLM response, and cost metric.
+
+---
+
+## 5. Minimal but realistic example 
+
+The following is a stripped-down but production-aware agent loop in C# / ASP.NET Core using the Anthropic HTTP API directly. It handles context budget, step limits, 
+per-step timeout, and structured audit logging. The pattern maps cleanly onto an Azure Service Bus worker or a hosted `BackgroundService`.
+
+```csharp
+// AgentRunner.cs
+using System.Diagnostics;
+using System.Net.Http.Json;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+public enum AgentStatus { Running, Complete, Failed, BudgetExceeded }
+
+public record AgentStepTrace(
+    int Step,
+    string StopReason,
+    long LatencyMs,
+    int Tokens,
+    List Tools
+);
+
+public record ToolCallTrace(string Name, JsonNode? Input, string ResultStatus);
+
+public class AgentRun
+{
+    public string RunId { get; } = Guid.NewGuid().ToString();
+    public List Messages { get; } = new();
+    public int Steps { get; set; }
+    public int TotalTokens { get; set; }
+    public List Trace { get; } = new();
+    public AgentStatus Status { get; set; } = AgentStatus.Running;
+}
+
+public class AgentRunner
+{
+    private const int MaxSteps = 10;
+    private const int TokenBudget = 60_000;
+    private static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(8);
+    private const string Model = "claude-sonnet-4-20250514";
+
+    private readonly HttpClient _http;
+    private readonly ILogger _logger;
+
+    // Tool definitions sent to the API on every request
+    private static readonly JsonArray ToolDefinitions = JsonNode.Parse("""
+    [
+      {
+        "name": "search_documents",
+        "description": "Search the internal knowledge base for relevant documents.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" },
+            "top_k": { "type": "integer" }
+          },
+          "required": ["query"]
+        }
+      },
+      {
+        "name": "write_summary",
+        "description": "Write a structured summary to the output store.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "title":   { "type": "string" },
+            "content": { "type": "string" }
+          },
+          "required": ["title", "content"]
+        }
+      }
+    ]
+    """)!.AsArray();
+
+    public AgentRunner(IHttpClientFactory httpFactory, ILogger logger)
+    {
+        _http = httpFactory.CreateClient("anthropic");
+        _logger = logger;
+    }
+
+    public async Task RunAsync(
+        string goal,
+        string tenantId,
+        string systemPrompt,
+        CancellationToken ct = default)
+    {
+        var run = new AgentRun();
+        run.Messages.Add(UserMessage(goal));
+
+        while (run.Steps < MaxSteps && run.TotalTokens < TokenBudget)
+        {
+            using var stepCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            stepCts.CancelAfter(StepTimeout);
+
+            var sw = Stopwatch.StartNew();
+            JsonObject response;
+
+            try
+            {
+                response = await CallAnthropicAsync(systemPrompt, run.Messages, stepCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning("Step {Step} timed out for run {RunId}", run.Steps, run.RunId);
+                run.Status = AgentStatus.Failed;
+                break;
+            }
+
+            sw.Stop();
+            run.Steps++;
+
+            var usage = response["usage"]!;
+            var stepTokens = usage["input_tokens"]!.GetValue()
+                           + usage["output_tokens"]!.GetValue();
+            run.TotalTokens += stepTokens;
+
+            var stopReason = response["stop_reason"]!.GetValue();
+            var stepTrace = new AgentStepTrace(run.Steps, stopReason, sw.ElapsedMilliseconds, stepTokens, new());
+            run.Trace.Add(stepTrace);
+
+            var contentArray = response["content"]!.AsArray();
+
+            if (stopReason == "end_turn")
+            {
+                // Append assistant turn and exit
+                run.Messages.Add(AssistantMessage(contentArray));
+                run.Status = AgentStatus.Complete;
+                break;
+            }
+
+            if (stopReason == "tool_use")
+            {
+                run.Messages.Add(AssistantMessage(contentArray));
+                var toolResultContent = new JsonArray();
+
+                foreach (var block in contentArray)
+                {
+                    if (block?["type"]?.GetValue() != "tool_use") continue;
+
+                    var toolName = block["name"]!.GetValue();
+                    var toolInput = block["input"]?.AsObject();
+                    var toolUseId = block["id"]!.GetValue();
+
+                    // Validate schema + auth before dispatch (simplified)
+                    var result = await ExecuteToolAsync(toolName, toolInput, tenantId, ct);
+                    var resultStatus = result.ContainsKey("error") ? "error" : "ok";
+
+                    stepTrace.Tools.Add(new ToolCallTrace(toolName, toolInput, resultStatus));
+
+                    toolResultContent.Add(new JsonObject
+                    {
+                        ["type"] = "tool_result",
+                        ["tool_use_id"] = toolUseId,
+                        ["content"] = result.ToJsonString()
+                    });
+                }
+
+                run.Messages.Add(UserMessage(toolResultContent));
+                continue;
+            }
+
+            // Unexpected stop reason
+            _logger.LogError("Unexpected stop_reason '{Reason}' at step {Step}", stopReason, run.Steps);
+            run.Status = AgentStatus.Failed;
+            break;
+        }
+
+        if (run.Status == AgentStatus.Running)
+            run.Status = AgentStatus.BudgetExceeded;
+
+        return run;
+    }
+
+    private async Task CallAnthropicAsync(
+        string system,
+        List messages,
+        CancellationToken ct)
+    {
+        var body = new JsonObject
+        {
+            ["model"] = Model,
+            ["max_tokens"] = 2048,
+            ["system"] = system,
+            ["tools"] = ToolDefinitions.DeepClone(),
+            ["messages"] = new JsonArray(messages.Select(m => m.DeepClone()).ToArray())
+        };
+
+        var response = await _http.PostAsJsonAsync("v1/messages", body, ct);
+        response.EnsureSuccessStatusCode();
+
+        return await response.Content.ReadFromJsonAsync(cancellationToken: ct)
+               ?? throw new InvalidOperationException("Empty response from Anthropic API");
+    }
+
+    private static async Task ExecuteToolAsync(
+        string toolName,
+        JsonObject? input,
+        string tenantId,
+        CancellationToken ct)
+    {
+        // In production: enforce tenant authorization, rate limits,
+        // per-tool timeout, and sandboxing here.
+        return toolName switch
+        {
+            "search_documents" => new JsonObject
+            {
+                ["results"] = new JsonArray(new JsonObject
+                {
+                    ["id"] = "doc-1",
+                    ["snippet"] = "...relevant content..."
+                })
+            },
+            "write_summary" => new JsonObject
+            {
+                ["status"] = "ok",
+                ["id"] = Guid.NewGuid().ToString()
+            },
+            _ => new JsonObject { ["error"] = $"Unknown tool: {toolName}" }
+        };
+    }
+
+    private static JsonObject UserMessage(string text) => new()
+    {
+        ["role"] = "user",
+        ["content"] = text
+    };
+
+    private static JsonObject UserMessage(JsonArray toolResults) => new()
+    {
+        ["role"] = "user",
+        ["content"] = toolResults.DeepClone()
+    };
+
+    private static JsonObject AssistantMessage(JsonArray content) => new()
+    {
+        ["role"] = "assistant",
+        ["content"] = content.DeepClone()
+    };
+}
+```
+
+**Registration in `Program.cs`** — configure the typed `HttpClient` with the Anthropic base URL and API key (sourced from Key Vault or environment, never hardcoded):
+
+```csharp
+builder.Services.AddHttpClient("anthropic", client =>
+{
+    client.BaseAddress = new Uri("https://api.anthropic.com/");
+    client.DefaultRequestHeaders.Add("x-api-key", builder.Configuration["Anthropic:ApiKey"]);
+    client.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
+});
+
+builder.Services.AddScoped();
+```
+
+**How thi maps to the concept:**
+
+    - `run.Messages` is the working context — the OBSERVE input passed in full to every LLM call
+    - `stopReason == "tool_use"` triggers the ACT phase; `stopReason == "end_turn"` triggers natural termination
+    - `ExecuteToolAsync()` is the isolated execution boundary — auth, rate limiting, and sandboxing are enforced here before any tool reaches real infrastructure
+    - `run.Trace` is the immutable audit log, written regardless of outcome
+    - `MaxSteps` and `TokenBudget` are the hard termination guardrails; the `while` condition enforces them — the LLM never decides when to stop
+    - `CancellationTokenSource.CreateLinkedTokenSource` + `CancelAfter` enforces per-step wall-clock latency budgets without blocking the thread pool
+
+In production, inject this runner into an Azure Service Bus `IHostedService` consumer, propagate the `Activity` from OpenTelemetry via `ActivitySource`, and 
+checkpoint `run.Messages` to Redis after each step for resumability across restarts.
+
+---
+
+## 6. Design trade-offs
+
+### Orchestration Model
+
+|Approach                                |Strengths                                                             |Weaknesses                                                                       |
+|----------------------------------------|----------------------------------------------------------------------|---------------------------------------------------------------------------------|
+|**Single-agent loop**                   |Simple to reason about, easy to debug, low latency per step           |Doesn't parallelize; bottlenecks on sequential tool calls                        |
+|**Multi-agent (supervisor + workers)**  |Parrallelism; specialization; isolation of failure domains            |Coordination complexity; harder to trace; LLM-to-LLM communication failures      |
+|**Hierarchical planning**               |Handles very long tasks; explicit decomposition                       |Planning errors compound; hard to course-correct mid-plan                        |
+|**Reactive (event-drive)**              |Naturally async, decouples produces/consumer                          |State management across events is complex; harder to guarantee completion        |
+
+
+### Memory Strategy
+
+|Strategy                                |When to use                                              |Cost                                                           |
+|----------------------------------------|---------------------------------------------------------|---------------------------------------------------------------|
+|**Full context window**                 |Short tasks (&lt; ~20 steps), high-stakes recall needs   |High token cost per step                                       |
+|**Rolling window**                      |Medium tasks where only recent steps matter              |Loss of early context; may revisit completed work              | 
+|**Summarization**                       |Long tasks with repetitive observation                   |Summarization quality determines downstream quality            |
+|**Vector retrieval (RAG)**              |Tasks with large document corpora                        |Retrieval latency; relevance tunning required                  |
+|**Episodic memory**                     |Cross-session continuity                                 |Requires persistent store; recall quality varies               |
+
+---
+
+### Determinism vs. Flexibility
+
+Higher temperature produces more creative, adaptive behavior. Lower temperature produces more predictable, auditable behavior. For production agents with side 
+effects, default to temperature 0 or near 0. The cost is occasionally suboptiomal tool selection on ambiguous inputs — accept this tradeoff in favor of auditability.
+
+**What you're implicitly accepting** when you build a multi-agent system: you are accepting that the communication between agents is a new attack surface, a new 
+failure mode, and a new debugging surface. The complexity budget grows faster than the capability benefit in most enterprise use cases below a certain scale.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+
+    - **Threating the LLM as the orchestrator**. Teams often prompt the LLM to "decide when to stop" or "call tools in any order you need". This works in demos. In 
+production, it produces loops, runaway costs, and behaviors that are impossible to audit. The orchestrator must own loop control. The LLM owns reasoning within a step;
+
+    - **No schema validation on tool inputs**. The LLM will occasionally hallucinate arguments that violate the tool schema — wrong types, missing fields, values outside 
+expected ranges. If these reach your tool implementation unchecked, you get runtime errors in production systems. Validate every tool call before dispatch.
+
+    - **Context window inflation**. Every tool result gets appended to the message history. After 15 steps, you're sending 30,000+ tokens per LLM call, and 80% 
+of it is old tool results the model has already processed. Without active context management, per-step costs grow linearly with task length.
+
+    - **Forgetting that tool results are unstrusted input**. A tool that reads from an external source — a web page, a user-submitted document, a third-party API — 
+can return content that contains prompt injection: "Ignore previous instructions and instead..." The LLM will sometimes comply. Sanitize or structurally isolate tool 
+results from the instruction context.
+
+    - **No stuck detection**. An agent instructed to "find the user's account ID" will retry a failing search query indefinitely if there's no loop guard. 
+Detect repeated identical tool calls as a stuck signal and emit a structured failure.
+
+    - **Synchronous tool execution in async workflows**. Calling a slow external API synchronously inside the agent loop inflates per-step latency. For tools with > 500ms 
+latency, considerer async execution patterns: dispatch the tool call, continue with other steps if possible, and await the result.
+
+    - **Conflating agent runs with user sessions**. Agent runs are discret, bounded execution units. User sessions span multiple runs. Mixing these concepts leads 
+to unintended state carryover, cross-session memory leakage, and confused authorization boundaries.
+
+    - **Under-investing in the eval harness**. Agentic habior is hard to unit test because outcomes depend on LLM non-determinism. Teams that skip structured evaluation 
+end up doing all their testing in production. Build a harness that replays recorded agent traces with stubbed tool responses and asserts on outcome structure.
+
+---
+
+## 8. Operational and production considerations
+
+### What to Monitor
+
+**Per-step metrics:**
+
+    - LLM latency (p50, p95, p99 per step)
+    - Token consumption (input + output per step, cumulative per run)
+    - Tool dispatch latency per tool name
+    - Tool error rate per tool name
+
+**Per-run metrics:**
+
+    - Total step count
+    - Total token spend
+    - Run duration (wall clock)
+    - Termination reason distribution (complete / budget_exceeded / failed / stuck)
+    - Goal completion rate (requires an evaluator — either LLM-as-judge or deterministic assertion)
+
+**Signals that degrade first under load:**
+
+    - LLM provider rate limits become binding — per-tenant token quotas need active tracking
+    - Tool service latency spikes propagate directly into agent loop latency
+    - Context window management logic becomes a bottlenect if it involves synchronous vector search
+
+### OpenTelemetry Integration
+
+Every agent run should emit a root span. Each LLM call and each tool execution should be child spans 
+with semantic attributes. In .NET, use `System.Diagnostics.ActivitySource` — the native OTel instrumentation API:
+
+```csharp
+// AgentTelemetry.cs — single shared ActivitySource for the agent subsystem
+public static class AgentTelemetry
+{
+    public static readonly ActivitySource Source = new("AgentRunner", "1.0.0");
+}
+
+// Inside AgentRunner.RunAsync — root span for the entire run
+using var runActivity = AgentTelemetry.Source.StartActivity("agent.run");
+runActivity?.SetTag("agent.run_id", run.RunId);
+runActivity?.SetTag("agent.tenant_id", tenantId);
+
+// Inside the loop — child span per step
+using var stepActivity = AgentTelemetry.Source.StartActivity("agent.step");
+stepActivity?.SetTag("agent.step", run.Steps);
+stepActivity?.SetTag("llm.model", Model);
+
+// After the API response — token attributes on the step span
+stepActivity?.SetTag("llm.tokens.input",  usage["input_tokens"]!.GetValue());
+stepActivity?.SetTag("llm.tokens.output", usage["output_tokens"]!.GetValue());
+stepActivity?.SetTag("llm.stop_reason",   stopReason);
+stepActivity?.SetTag("agent.latency_ms",  sw.ElapsedMilliseconds);
+
+// Per tool call — child span nested under the step span
+using var toolActivity = AgentTelemetry.Source.StartActivity("agent.tool");
+toolActivity?.SetTag("tool.name",      toolName);
+toolActivity?.SetTag("tool.status",    resultStatus);
+toolActivity?.SetTag("agent.run_id",   run.RunId);
+toolActivity?.SetTag("agent.tenant_id", tenantId);
+```
+
+**Registration in `Program.cs`** — wire the `ActivitySource` into the OTel pipeline and export to Azure Monitor or any OTLP-compatible backend:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing
+        .AddSource("AgentRunner")
+        .AddHttpClientInstrumentation()   // captures outbound Anthropic API calls
+        .AddAzureMonitorTraceExporter()   // or .AddOtlpExporter() for Grafana/Jaeger
+    )
+    .WithMetrics(metrics => metrics
+        .AddMeter("AgentRunner")
+        .AddAzureMonitorMetricExporter()
+    );
+```
+
+This produces distributed traces that span Azure Service Bus consumers, tool microservice calls, and every LLM API round-trip — with W3C `transparent` propagated 
+automatically by `AddHttpClientInstrumentation`. Without this, debugging a failed 20-step run across three services is effectively impossible.
+
+### What Becomes Expensive
+
+LLM token cost scales with context length × steps. A 20-step agent run where each step appends 1,000 tokens of tool results accumulates 20,000 tokens of history. 
+By step 20, you're sending 22,000 tokens as input — and that's before your system prompt and current observation. At $3/MTok input, a single run costs ~$0.07 in 
+input tokens alone. At 10,000 runs/day, that's $700/day in input tokens from history inflation alone. Context compression is not optional at scale.
+
+### Operational Risks
+
+    -  **LLM provider outages.** Your agent platform needs circuit breakers and graceful degradation paths. Uncaught provider 5xx errors inside an agent loop will cause cascading job failures.
+    - **Tool service latency spikes.** If your search tool degrades from 200ms to 3s, every agent step that uses it blows its latency budget. Per-tool timeout enforcement is critical.
+    - **Replay and resumability.** Long-running agent tasks that fail midway need either idempotent re-execution or checkpoint/resume logic. Determine which model applies to your task types early — retrofitting is painful.
+
+### Production-Safe Rollout
+
+Agentic behavior changes are hard to feature-flag cleanly because they're emergent. Strategies that work:
+
+- Shadow mode: run new agent version alongside old, compare outputs, don't execute side effects
+- Canary by tenant or goal type — not by percentage traffic
+- Replay testing against a library of recorded runs before any deployment
+
+---
+
+## 9. When NOT to use this
+
+**Single-step tasks**: If the user's request can be answered with one LLM call and one optional RAG lookup, building an agent loop is adding complexity with no benefit. 
+Most "AI features" in internal enterprise tools are single-step.
+
+**When latency is the primary constraint**: A well-engineered agent loop adds at minimum 2-4 LLM round trips per multi-step task. If your SLA is 500ms end-to-end, you need a different architecture.
+
+**When the task graph is fully static**: If every instance of the task follows the same steps in the same order, implement it as a deterministic pipeline. Reserve 
+dynamic agent loops for tasks where the step count and order genuinely vary.
+
+**When you don't have the observability infrastructure**: Running agentic workloads without distributed tracing, structured audit logs, and per-run cost accounting is 
+flying blind. The failure modes are subtle and the debugging surface is large. Build the observability layer first.
+
+**In early product validation phases**: Before you're validated that users want the capability at all, building a full multi-agent platform is a premature infrastructure 
+investiment. Mock the agentic behavior with a human-in-the-loop or a hardcoded pipeline first.
+
+**Multi-agent systems for tasks one agent handles fine**: The coordination overhead of multiple agents — prompt routing, inter-agent messaging, failure propagation — is 
+non-trivial. Most tasks that seem like they need multi-agent can be handled by a single agent with a broader tool set and explicit planning.
+
+---
+
+## 10. Key takeaways
+
+    - **The LLM is the reasoning engine, not the runtime**: Loop control, state management, guardrails, and termination logic belong in your orchestrator. Never 
+    let the model when to stop or what permissions it has.
+
+    - **Context window management is a first-class engineering concern**: Per-step token cost grows with history length. Design your memory management strategy 
+    before you hit ceiling in production, not after.
+
+    - **Every tool call is a trust boundary**: Validate input schemas before dispatch. Treat tool results as untrusted — prompt injection through tool output is a real 
+    attack vector in production systems.
+
+    - **Hard limits on steps, tokens, and wall time are non-negotiable**: Without them, runaway agents are a production incident waiting to happen. These limits 
+    also define your cost ceiling and enable predictable SLAs.
+
+    - **Structured audit trails are what makes agentic behavior debugglable**: Log every LLM response, every tool dispatch, and every termination decision with a 
+    correlation ID. You will need this to reproduce and investigate failures.
+
+    - **Evaluate against recorded traces, not just live runs**: The non-determinism of LLMs makes unit testing hard but not impossible. Build a replay harness early — 
+    it's the only way to validate behavior changes without putting production at risk.
+
+    - **Multi-tenant isolation requires explicit enforcement at every layer**: Tool execution, memory retrieval, audit logs, and cost attribution all need tenant 
+    context propagated explicitly. Relying on implicit isolation is how cross-tenant data leaks happen.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end Agentic AI runtime, highlighting tenant-scoped isolation, planner–executor loops, validated tool dispatch, memory management (rolling context + vector retrieval), guarded LLM invocation, deterministic termination controls, audit trace persistence, observability signals, and asynchronous tool and state orchestration workflows.
+
+import Light from './_assets/agentic-systems-light.svg';
+import Dark from './_assets/agentic-systems-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Agentic Systems Architecture"
+  height={800}
+/>
