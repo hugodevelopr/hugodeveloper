@@ -311,7 +311,7 @@ public sealed class BlobStorageService
 public sealed class QueueWorker : BackgroundService
 {
     private readonly QueueClient _queue;
-    private readonly QueueClient _poisonQueue; // {original-name}-poison
+    private readonly QueueClient _poisonQueue; // \{original-name\}-poison
     private const int MaxDequeueCount = 5;
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -362,7 +362,7 @@ public sealed class QueueWorker : BackgroundService
 }
 ```
 
-> Azure Queue Storage has no native dead-letter queue. The pattern above — move to a {name}-poison queue after N dequeue atempts — is the standard replacement. 
+> Azure Queue Storage has no native dead-letter queue. The pattern above — move to a \{name\}-poison queue after N dequeue atempts — is the standard replacement. 
 > Monitor the poison queue as a critical operational signal: persistent messages indicate systemic processing failures, not transient errors.
 
 ---
