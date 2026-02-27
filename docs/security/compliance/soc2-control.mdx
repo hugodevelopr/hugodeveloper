@@ -1,0 +1,535 @@
+---
+id: soc2-control
+title: SOC2 Control 
+slug: /security/compliance/soc2-control
+description: Deep dive into SOC 1/2 control design, risk mapping, Type I/II audits, evidence automation, and enterprise GRC integration.
+sidebar_label: SOC2 Control
+keywords: [soc2 compliance, control design, type ii audit, trust service criteria, grc framework]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+SOC (System and Organization Controls) is an auditing framework defined by the AICPA (American Institute of Certified Public Accountants) that allows service 
+organizations to demonstrate, through reports issued by independent auditors (CPAs), that their internal controls are sufficient to protect data, ensure 
+availability, and meet agreed-upon trust criteria.
+
+This document covers:
+
+    - Structural differences between SOC 1, SOC 2 and SOC 3 — when each applies
+    - Type I vs. Type II — what clients actually want and what auditors actually evaluate
+    - The five Trust Services Criteria (TSC) and how to select them
+    - How to build and operate a mature SOC program: from evidence collection to the final report
+    - Integration with corporate GRC, LGPD/GDPR, ISO 27001, and SOX
+    - Evidence automation and continuous control monitoring
+
+**Where it applies**: Organizations that process data on behalf of clients (SaaS, managed services, BPO, data centers, cloud providers) that need to demonstrate 
+operational reliability in due diligence processes, enterprise sales cycles and regulatory requirements.
+
+**Where it does not apply**: Organizations that only process their own data with no external clients auditing their controls; pure internal audits without 
+thrid-party report issuance; compliance with sector-specific regulations like PCI-DSS or HIPAA (although SOC2 is complementary to both).
+
+---
+
+## 2. Why this matters in real systems
+
+### The typical trigger
+
+A SaaS company starts selling to enterprise clients. The client's security team sends a 200-question questionnaire. Sales asks engineering to respond. Two months 
+later, the deal stalls in legal review because the client requires a SOC 2 Type II report the company doesn't have one.
+
+That is the most common path to a first SOC engagement. But it isn't the only one.
+
+### Other real-world scenarios
+
+**Governament and enterprise contracts**: Many contracts above a certain value include an explicit clause requering an annual SOC 2 Type II report. Without it, 
+the contract does not get signed.
+
+**M&A due diligence**: Companies subject to SOX that outsource financial processes nned their vendors to hold SOC 1 reports, because their external auditors will 
+ask for it.
+
+**Cyber insurance**: Insurers increasingly require SOC 2 as a prerequisite for cyber liability policies at reasonable premiums.
+
+### What breaks when this is ignored
+
+    - Deals stalled in security review → measurable revenue loss
+    - Manual responses to security questionnaries (VSAQ, SIG, CAIQ) repeated for every client, consuming engineering and security time without scaling
+    - Absense of a formal controls program → basic failures discovered only when an incident occurs
+    - Controls exists but are undocumented → audit fails not because the control is missing, but because the evidence is
+
+---
+
+## 3. Core concept (mental model)
+
+Think of SOC as an **audited transparency contract**
+
+As a service provider, you make assertions about your controls: "we enforce MFA", "we run daily backups with tested restores", "we monitor privileged access in 
+real time". An independent auditor verifies whether those assertions are true — not just on paper, but in practice, over time.
+
+The output is a report your client can use as evidence of your reliability, without having to audit you directly.
+
+**Then SOC program lifecycle:**
+
+
+```
+Scope definition
+        ↓
+Trust Services Criteria selection
+        ↓
+Gap assessment (current controls vs. requirements)
+        ↓
+Remediation and control implementation
+        ↓
+Observation period (for Type II: minimum 6 months)
+        ↓
+Continuous evidence collection
+        ↓
+Readiness assessment (internal pre-audit)
+        ↓
+CPA audit
+        ↓
+Report issuance
+        ↓
+Controlled distribution / annual renewal
+```
+
+**Type I**: A photograph. The auditor verifies that your controls exists and are suitably designed as of a specific date.
+
+**Type II**: A film. The auditor verifies that your controls operated consistently throughout an observation period (typically 6 to 12 months). This is what 
+enterprise clients actually require.
+
+---
+
+## 4. How it works (step-by-step)
+
+
+### 4.1 Selecting the report type
+
+**SOC 1** — Relevant when your systems affect your clients' financial controls. Banks, payment processors, payroll companies, outsourced accounting. Governed by 
+SSAE 18. The focus is on User Entity controls over ICFR (Internal Control over Financial Reporting).
+
+**SOC 2** — Relevant when you process, store, or trasmit client data and need to demonstrate operational reliability beyond the financial dimension. The most 
+common report for technology companies. Based on the Trust Services Criteria.
+
+**SOC 3** — The public-facing version of a SOC 2. No technical control detail, just the seal indicating a passed audit. Useful for marketing, but it does not 
+substitute for SOC 2 in due diligence processes.
+
+> You may need SOC 1 and SOC 2 simultaneously if your service affects both your clients' financial processes and their operational data.
+
+---
+
+### 4.2 Scope definition
+
+Scope defines which systems, infrastructure, processes and people are subject to the audit. A classic mistake: scope that is too broad increases cost and 
+complexity without proportional value; scope that is too narrow fails to cover what the client actually cares about.
+
+Principles for scope definition:
+
+    - Include everything that processes, stores, or trasmits client data within the audited service
+    - Include critical supporting systems (IAM, SIEM, CMDB, backup systems)
+    - Explicitly exclude unrelated systems and document the rationale
+    - Validate the scope with your auditor before starting — redefining scope mid-audit is expensive
+
+---
+
+### 4.3 Trust Services Criteria selection
+
+The five criteria are:
+
+|Criterion                      |What it covers                                                 |Almost always required?                                      |
+|-------------------------------|---------------------------------------------------------------|-------------------------------------------------------------|
+|**Security (CC)**              |Protection against unauthorized access, Common Criteria        |Yes — all SOC 2 engagements include it                       |
+|**Availability (A)**           |Systems available as agreed (SLA)                              |Yes for SaaS with SLAs                                       |
+|**Processing Integrity (PI)**  |Processing is complete, accurate, timely, and authorized       |For fintech, payments, critical data                         |
+|**Confidentiality (C)**        |Protection of information designated as confidential           |For sensitive business data                                  |
+|**Privacy (P)**                |Collection, use, retention and disposal of PII per notices     |When processing personal data                                |
+
+A practical rule: all SOC 2 engagements include Security. Availability is nearly universal for SaaS. Include Privacy if your service processes PII in a meaningful 
+way — especially relevant alongside GDPR or LGPD obligations. The others depend on your business model.
+
+Avoid including unnecessary criteria — each one adds controls, evidence requirements, and audit cost.
+
+---
+
+### 4.4 Gap assessment and remediation
+
+Before entering the observation period, run a structured gap assessment:
+
+    1. Map existing controls against the requirements of each selected criterion
+    2. Classify each gap by severity and remediation effort
+    3. Prioritize: design gaps (the control does not exist) take precedence over evidence gaps (the control exists but is not documented)
+    4. Set the observation period start date only after critical gaps have been remediated
+
+GRC tools automate part of this mapping. But the judgment about what constitutes a sufficient control still requires human expertise.
+
+---
+
+### 4.5 Observation period and evidence collection
+
+For Type II, the auditor will select samples from the observation period and verify that controls operated consistently. This means:
+
+    - Access logs showing MFA being enforced
+    - Periodic access review tickets (user access reviews) with documented approvals
+    - Security training completion records
+    - Vulnerability scan results and remediation within defined SLAs
+    - Change management tickets for all production changes
+    - Backup and restore test results
+
+**Evidence that does not exist in the system does not count**. If the control exists but the log was deleted, or the process ran but was not recorded, the 
+auditor treats the control as having not operated.
+
+---
+
+### 4.6 Readiness assessment
+
+Two to three months before the formal audit, run a readiness assessment — an internal audit that simulates what the CPA will do. Identify:
+
+    - Missing or insufficient evidence
+    - Control exceptions (instances where the control failed)
+    - Controls that exist but are not adequately documented in the TSP (Trust Service Principles)
+
+Exceptions found internally during the readiness assessment are far better than findings in the final report.
+
+---
+
+### 4.7 The CPA audit
+
+The auditor will:
+
+    - Review the system description (written by the organization)
+    - Test the design effectiveness of controls
+    - For Type II: select samples and verify that controls operated throughout the period
+    - Issue an opinion: unqualified, qualified or adverse
+
+A qualified opinion (with exceptions) is not necessarily fatal — it depends on the nature and materiality of the findings. But repeated findings across 
+consecutives reports are a severe warning signal for clients and partners.
+
+---
+
+## 5. Minimal but realistic example 
+
+
+### Control: Quarterly User Access Review
+
+This is a high-impact control that auditors invariably test. Below is the minimum structure for implementing it in an auditable way.
+
+**Control definition (in GRC):**
+
+```yaml
+control_id: CC6.2-UAR-001
+title: Quarterly User Access Review
+description: >
+  Managers review and certify all user access to production systems quarterly.
+  Unauthorized or inappropriate access is revoked within 5 business days of review.
+frequency: quarterly
+owner: IT Security
+evidence_type:
+  - access_review_tickets
+  - revocation_records
+  - manager_sign_off
+soc2_criteria:
+  - CC6.2  # Restrict logical access to systems
+  - CC6.3  # Remove or modify access based on role changes
+```
+
+
+**Evidence automation script (C#):**
+
+```csharp
+using System.Globalization;
+using System.Security.Cryptography;
+using CsvHelper;
+using CsvHelper.Configuration;
+
+public record AccessReviewRecord(
+    string ReviewPeriod,
+    string Reviewer,
+    string System,
+    string User,
+    string AccessLevel,
+    string Decision,      // certified | revoked | modified
+    string DecisionDate,
+    string TicketId
+);
+
+public static class AccessReviewEvidenceExporter
+{
+    /// 
+    /// Exports access review records as a CSV evidence artifact.
+    /// File is archived and linked to the GRC control for auditor retrieval.
+    /// Returns the output path and SHA-256 hash for integrity verification.
+    /// 
+    public static (string FilePath, string Sha256Hash) Export(
+        IEnumerable records,
+        string outputPath)
+    {
+        var quarter = GetCurrentQuarter();
+        var filename = Path.Combine(outputPath, $"UAR-{quarter}-evidence.csv");
+
+        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+        {
+            HasHeaderRecord = true
+        };
+
+        using (var writer = new StreamWriter(filename))
+        using (var csv = new CsvWriter(writer, config))
+        {
+            csv.WriteRecords(records);
+        }
+
+        // Compute SHA-256 for evidence integrity — store alongside the file
+        // and link both to the GRC control entry for the auditor.
+        var hash = ComputeSha256(filename);
+        return (filename, hash);
+    }
+
+    private static string GetCurrentQuarter()
+    {
+        var now = DateTime.UtcNow;
+        var quarter = (now.Month - 1) / 3 + 1;
+        return $"{now.Year}-Q{quarter}";
+    }
+
+    private static string ComputeSha256(string filePath)
+    {
+        using var sha = SHA256.Create();
+        using var stream = File.OpenRead(filePath);
+        var hashBytes = sha.ComputeHash(stream);
+        return Convert.ToHexString(hashBytes).ToLowerInvariant();
+    }
+}
+```
+
+**How this maps to the concept:**
+
+    - The exported record proves that the review took place (CC6.2)
+    - The `DecisionDate` column and `TicketId` field prove when the revocation action was taken (CC6.3)
+    - The auditor will select N samples from the period and verify that: the review was executed, decisions were documented, and revocations occurred within the SLA
+
+Without automation, this process is manual, prone to gaps, and difficult to scale as the number of users and in-scopesystems grows.
+
+---
+
+## 6. Design trade-offs
+
+### Type I vs. Type II
+
+|Dimension                 |Type I                                             |Type II                                                             |
+|--------------------------|---------------------------------------------------|--------------------------------------------------------------------|
+|Time to obtain            |2-4 months after controls are implemented          |9-18 months (implementation + observation + audit)                  |
+|Value to clients          |Low — demonstrates design, not effectiveness       |High — what enterprise clients actually require                     |
+|Audit cost                |Lower (no sample testing)                          |Significantly higher                                                |
+|Legitimate use            |First audit to enter the market quickly            |Mature program, annual renewal                                      |
+
+**Decision:** Type I only makes sense as a transitional step while accumulating the observation period needed for Type II. Sophisticated clients know the difference.
+
+---
+
+### Broad vs. narrow scope
+
+|Approach                            |Advantage                                                |Disadvantage                                                            |
+|------------------------------------|---------------------------------------------------------|------------------------------------------------------------------------|
+|Broad scope (entire company)        |More comprehensive report, covers more client questions  |Higher audit cost, more controls to maintain, more exposure to findings |
+|Narrow scope (specific service)     |Faster, cheaper, focosed                                 |Clients may ask about what is outside scope                             |
+
+**Decision:** Start with a scope focused on the primary service. Expand iteratively as the program matures.
+
+---
+
+### Build vs. Buy (GRC tooling)
+
+|Approach                                                  |When it makes sense                                                       |Risks                                                          |
+|----------------------------------------------------------|--------------------------------------------------------------------------|---------------------------------------------------------------|
+|GRC platform (vanta, Drata, Secureframe, Tugboat Logic)   |Startups and mid-size companies; accelerates time-to-audit                |Vendor lock-in; limits customization for complex controls      |
+|Enterprise GRC (ServiceNow GRC, RSA Archer, MetricStream) |Organizations with mandatory multi-framework compliance (SOX + SOC + ISO) |High cost, long implementation, over-engineering for SOC alone |
+|Spreadsheets + internal scripts                           |MVP or initial assessment                                                 |Does not scale; evidence is not reliably auditable             |
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### "We passed SOC 2, so we're secure"
+
+The SOC 2 report certifies that specific controls operated during a specific period. It is not a holistic security assessment. It does not cover emerging threats. 
+It does not replace penetration testing, threat modeling, or a vulnerability management program. Many companies with SOC 2 Type II suffer breaches because the 
+report's scope did not cover the attack vector used.
+
+### Confusing evidence with the control
+
+The control is the process. The evidence is the record that the process was executed. Auditors test evidence, not intentions. A patch management control that 
+"everyone knows works" but generates no structured logs or traceable tickets will produce a finding.
+
+### Starting the observation period with immature controls
+
+If you begin the observation period before controls are stable, you will accumulate exceptions throughout the period — and they will appear in the report. It is 
+better to delay the start and enter the observation period with internally tested controls.
+
+### Understimating the people and process scope
+
+SOC 2 is not just IT. HR controls (background checks, offboarding), vendor contract management, physical office access policies — all of these can fall within 
+scope. Companies that treat SOC 2 as "an engineering project" invariably arrive at the audit with gaps in business process controls.
+
+### Ignoring subservice organizations
+
+If you use AWS, Azure, GCP, or another provider that falls within your service's scope, you need to understand how control responsibility is divided (the shared 
+responsibility model). The auditor will ask. You need evidence that you evaluated your subservice providers' controls — typically through their own SOC 2 reports.
+
+### Treating the report as a static document
+
+SOC 2 is a program, not a project. Many organizations push hard through the first audit and then allow controls to degrade until three months before the renewal. 
+The auditor will find the gaps in the observation period.
+
+---
+
+## 8. Operational and production considerations
+
+### What to monitor continuously
+
+A mature SOC program does not wait for the audit to find out whether controls are working. Monitor:
+
+**Access controls:**
+
+    - MFA coverage rate per in-scope system (target: 100%)
+    - Active accounts belonging to former employees (target: zero after offboarding)
+    - Accounts with excessive privileges (detected by RBAC drift against current role)
+
+**Vulnerability management:**
+
+    - Mean time to remediation by severity vs. the SLA defined in the control
+    - Percentage of in-scope assets with a recent scan (scanner coverage)
+
+**Change management:**
+
+    - Percentage of production changes with an approved ticket (unauthorized changes are a frequent finding)
+
+**Backup and continuity:**
+
+    - Restore test results (pass / fail)
+    - Time since last successful execution per critical system
+
+**Logical access:**
+
+    - Completeness and timeliness of quarterly User Access Reviews
+
+### What degrades first
+
+The most fragile control in any SOC program is **offboarding**. When someone leaves the company, the process involves multiple systems (central IAM, individual 
+SaaS tools, VPN, repositories) and multiple teams. One forgotten account in an in-scope system is an immediate finding.
+
+The second most fragile is **change management**. In agile environments with frequent CI/CD deployments, without specific automation to capture approvals in the 
+deploy pipeline, it is difficult to evidence that every production change was authorized.
+
+
+### Ongoing operational costs
+
+    - External auditor (CPA): $20,000 - $100,000+ depending on scope and auditor
+    - GRC platform: $15,000 - $80,000/year depending on organization size
+    - Internal time: 0.5 - 2 FTEs dedicated during preparation + ongoing
+    - Finding remediation: variable; potentially high if infrastructure requires redesign
+
+### Program observability
+
+Metric that should appear on executive and security dashboards:
+
+```
+- Control effectiveness rate: % of controls with no exceptions in the period
+- Evidence coverage rate: % of evidence collected vs. required
+- Finding age: days from identification to remediation per finding
+- Audit readiness score: composite readiness index (useful pre-audit)
+```
+
+---
+
+## 9. When NOT to use this
+
+### Very small organization with no enterprise clients
+
+If you have 10 people and all your clients are SMBs that never ask for SOC 2, the cost in time, money, and distraction is not justified. A well-answered 
+security questionnaire may be sufficient. Invest in real security before investing in security certification.
+
+---
+
+### Product in pivot or pre-product-market-fit
+
+A SOC 2 scope is defined around a reasonably stable service. If the architecture changes radically every quarter, you will spend more time redefining scope and 
+controls than building product. Wait for architectural stability before committing to an observation period.
+
+---
+
+### When the client actually needs something different
+
+SOC 2 is not ISO 27001, is not a HIPAA BAA, and is not a PCI-DSS SAQ. Clients operating in specific sectors may require different certifications. Confirm what 
+the client actually needs before starting a SOC program.
+
+---
+
+### Substitute for a real security program
+
+SOC 2 certifies specific controls. It is not a substitute for threat modeling, regular penetration testing, a bug bounty program, or proactive vulnerability 
+management. Organizations that achieve SOC 2 and treat the security work as "done" are creating real risk.
+
+---
+
+### Substitute for vendor due diligence
+
+Receiving a vendor's SOC 2 report does not eliminate the need for your own risk assessment. The report covers what the auditor tested, within the scope the vendor 
+defined, during the audited period. Your specific integrations, configurations, and data may fall outside that scope.
+
+---
+
+## 10. Key Takeaways
+
+- **SOC 2 Type II is the effective market standard for B2B enterprise SaaS.** Type I is only useful as a transitional step. Planning directly for Type II from the start saves time and effort.
+
+- **The observation period starts when controls are operating, not when you decided to pursue SOC.** Unstable or immature controls during the period become findings in the final report. Invest in remediation before starting the clock.
+
+- **Evidence that was never collected is a non-existent control in the auditor's view.** Automating evidence collection is not a nice-to-have — it is what makes the program sustainable long-term without consuming disproportionate resources.
+
+- **Offboarding and change management are the controls most frequently found deficient.** Both involve multiple teams, are prone to exceptions in agile environments, and are invariably tested by auditors. Automate these two first.
+
+- **Scope defines the cost, timeline, and credibility of the report.** Scope that is too broad increases cost without proportionally increasing client confidence; scope that is too narrow raises questions. Align scope with what your clients actually need to see covered.
+
+- **SOC 2 and ISO 27001 are complementary, not redundant.** ISO 27001 certifies that you have an ISMS (Information Security Management System) with a broader scope. SOC 2 demonstrates operational effectiveness of specific controls to clients. Organizations that need both should map common controls to avoid duplicated effort.
+
+- **The program is only mature when it runs without a crisis before each audit.** If the team spends the two months prior to the audit in emergency mode collecting evidence and fixing gaps, the program is not mature — it is being managed as a point-to-point project. The goal is continuous monitoring and collection that turns the audit into a review, not a sprint.
+
+---
+
+## Appendix: Technical References
+
+### Related frameworks and mapping
+
+| Framework              | Relationship to SOC 2 |
+|------------------------|-----------------------|
+| ISO 27001              | Significant overlaps in CC (Common Criteria). Controls can be mapped bidirectionally. |
+| NIST CSF               | Used as a reference to structure the underlying security program. SOC 2 can be viewed as an audit lens applied over the CSF. |
+| CIS Controls           | CIS v8 maps directly to many SOC 2 CC controls. Useful for remediation prioritization. |
+| LGPD / GDPR            | SOC 2 Privacy criteria overlaps with the requirements of both. Joint documentation reduces duplication. |
+| SOX (ITGC)             | SOC 1 is the mechanism by which financial service providers demonstrate that their ITGCs are adequate for their clients' SOX auditors. |
+
+### Key documents the auditor will request
+
+- System Description (narrative of the environment and controls — written by the organization)
+- Information Security Policy and sub-policies (access, change management, incident response)
+- Documented and current Risk Assessment
+- Vendor management register with risk assessments of subservice organizations
+- Business Continuity and Disaster Recovery Plan with test evidence
+- Logs and tickets from control executions during the observation period
+- Org chart and responsibility matrix for in-scope controls
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end SOC 2 program lifecycle, highlighting scope definition, Trust Services Criteria selection, control implementation, continuous evidence collection, Type I/II observation period, CPA audit execution, and report issuance with GRC integration and ongoing control monitoring.
+
+import Light from './_assets/soc2-control-light.svg';
+import Dark from './_assets/soc2-control-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="SOC 2 Control"
+  height={800}
+/>
