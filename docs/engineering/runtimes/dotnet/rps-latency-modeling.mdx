@@ -1,0 +1,631 @@
+---
+id: rps-latency-modeling
+title: RPS Latency Modeling
+slug: /engineering/runtimes/dotnet/rps-latency-modeling
+description: Quantitative RPS vs latency modeling in ASP.NET Core under GC pressure, thread pool limits, connection pools, and p95/p99 SLO constraints.
+sidebar_label: RPS Latency Modeling
+keywords: [rps modeling, latency slos, aspnet core performance, thread pool starvation, gc pressure]
+sidebar_position: 20
+---
+
+## 1. What this document is about
+
+This document addresses the problem of **predicting and controlling the relationship between request throughput (RPS) and tail latency (p95/p99) in production 
+.NET microservices.** Specifically, it covers:
+
+    - The quantitative models that explain why latency degrades non-linearly as load increases
+    - How to identify the true throughput ceiling of a .NET service before latency SLOs break
+    - How to design capacity and autoscaling policies that prevent latency cliffs
+    - How to attribute latency increases to specific system layers (.NET runtime, thread pool, connection pools, downstream dependencies)
+
+**Where it applies:**
+
+  - IO-bound ASP.NET Core services handling sustained, high-concurrency workloads
+  - Multi-tenant SaaS systems where noisy neighbors cause unpredictable contention
+  - Services with external dependencies (databases, cache, third-party APIs) whose latency variability compounds
+  - Autoscaled deployments on AKS or Azure App Service where cold starts and scaling lag are real constraints
+
+**Where it does not apply:**
+
+  - CPU-bound batch processing workloads where throughput-latency differ fundamentally
+  - Services with trivially low traffic where queuing effects never manifest
+  - Single-tenant, isolated environments where resource contention is absent
+  - Latency optimization at the algorithm level (this is a systems-level, not algorithmic, document)
+
+---
+
+## 2. Why this matters in real systems
+
+### The cliff that surpreses everyone
+
+The most common failure mode looks like this: a service runs at p99 &lt; 200ms during normal hours. Load doubles during a peak event. p99 jumps to 1.8 seconds. 
+The service didn't crash — it just fell off a latency cliff
+
+This happens because the relationship between RPS and latency is **not linear**. Below a service's saturation point, latency is roughly flat. Above it, latency 
+degrades rapidly — often exponentially. Engineers who only load-test at "expected peak" miss this because they never probe the saturation boundary.
+
+### Why simpler approaches stop working at scale
+
+**"Just add more instances"** — works until autoscaling lag means you're adding instances after the latency SLO is already broken. AKS pod scale-out typically 
+takes 60-120 seconds. A 30-second traffic spike from a viral event is already over.
+
+**"Monitor average latency"** — averages mask tail behavior. A service can have a 50ms average and a 2-second p99 simultaneously if a small fraction of requests 
+GC pauses, lock contention, or slow database queries.
+
+**"Set thread pool size high"** — unbounded thread pools cause context-switch storms. The .NET thread pool's hill-climbing algorithm was designed to find the 
+optimal concurrency level, but it can be misconfigured or overwhelmed in services with mixed IO/CPU work.
+
+### Concrete scenarios where this bites
+
+  - **EF Core + SQL Server under multi-tenant load:** Connection pool exhaustion (`Max Pool Size` default is 100 per connection string) causes requests to 
+  queue. p99 spikes because 1% of requests waited 800ms for a connection.
+
+  - **Redis cache stampede:** Cache invalidation triggers simultaneous DB queries. Latency spikes during the 200ms window where nothing is cached.
+
+  - **Kafka consumer lag under burst load:** Processing stalls while the consumer group rebalances. Downstream services waiting on results see p99 blow out.
+
+  - **GC pressure from high-allocation request paths:** Gen2 GCs on a 16-core machine can pause the process for 50-200ms. At high RPS, these pauses hit more requests.
+
+  - **Cold starts in AKS:** A new pod takes 5-15 seconds to warm up (JIT compilation, connection pool establishment, cache warming). Any request hitting an 
+  unwarmed pod sees 5-10x higher latency.
+
+---
+
+## 3. Core concept (mental model)
+
+### Queueing theory as the foundation
+
+Every web service is a **queuing system**. Requests arrive, wait if a server is busy, get processed, and leave. The math that describes this was worked out in 
+the 1950s by Agner Erlang and later formalized as queueing theory.
+
+The most useful mental model is **Little's Law** and its implications under the **M/M/1 queue** (or more accurately M/M/c for multi-threaded servers):
+
+```
+L = λW
+```
+
+Where:
+
+  - `L` = average number of requests in the system (in-flight + queued)
+  - `λ` = arrival rate (RPS)
+  - `W` = average time a request spends in the system (latency)
+
+This is trivially obvious — if you process 100 req/s and each takes 10ms, there are on avergage 1 in-glight at any moment. The non-obvious implication 
+comes from **utilization**:
+
+```
+ρ = λ / μ
+```
+
+Where `μ` is the service rate (max RPS when fully busy). As `ρ → 1` (utilization approaches 100%), mean waiting time approaches infinity:
+
+```
+W_queue = ρ / (μ(1 - ρ))
+```
+
+This is the cliff. At 70% utilization, queue wait is manageable. At 90%, it's 4x higher. At 95%, it's 19x higher. You cannot run a latency-sensitive service at 
+high utilization without accepting tail latency degradation.
+
+### The Universal Scalability Law (USL)
+
+For multi-instance services, Neil Gunther's **Universal Stalability Law** models how throughput scales with concurrency (N instances or threads):
+
+```
+C(N) = N / (1 + α(N-1) + βN(N-1))
+```
+
+Where:
+
+  - `α` = contention coefficient (serialization on shared resources) 
+  - `β` = coherency coefficient (coordination overhead)
+
+When `β > 0`, adding more instances eventually _decreases_ throughput. This models real behavior: adding pods doesn't scale linearly because of shared database 
+connections, distributed locks, or inter-service coordination.
+
+### Latency percentiles are not averages
+
+The p99 latency is determined by the **worst-case request in 100**. In a high-RPS system:
+
+  - At 1,000 RPS, your p99 is exceeded 10 times per second
+  - At 10,000 RPS, it's exceeded 100 times per second
+
+A 500ms p99 at 10,000 RPS means 100 requests/second are experiencing 500ms+. SLO definition like "p99 &lt; 200ms" are not just about user experience — at scale, 
+they translate directly to a quantifiable number of degraded requests per second.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Request arrives at Kestrel
+
+ASP.NET Core's Kestrel accepts connection using a socket-per-thread model with completion ports (Windows) or epoll (Linux). Kestrel itself ir rarely the bottleneck — 
+it can handle hundreds of thousands of connections. What matters is what happens next.
+
+**Key invariant:** Kestrel queues accepted connections when all request processing threads are busy. This queue is bounded by `KestrelServerOptions.Limits.MaxConcurrentConnections` 
+(default: unlimited). An unbounded queue means latency grows without backpressure signaling to the client.
+
+---
+
+### Step 2 — Thread pool dispatch
+
+.NET dispatches request processing to the thread pool. The thread pool's **hill-climbing algorithm** adjusts thread count based on throughput measurements. Under 
+IO-bound workloads with `async/await`, threads are released during IO and reused — this is the core mechanism that allows .NET to handle far more concurrent 
+requests than threads.
+
+**What breaks this:** Synchronous blocking calls inside async handlers. A single `Task.Result`, `.GetAwaiter().GetResult()`, or blocking DB call holds a thread captive. 
+Under load, this exhausts the thread pool and causes queuing at the thread pool level — before the request even reaches your business logic.
+
+**Detection:** Thread pool starvation is visible in Application Insights as `ThreadPool Queue Length` increasing, or via `dotnet-counters` watching 
+`System.Runtime / ThreadPool Queue Length`.
+
+---
+
+### Step 3 — Middleware pipeline execution
+
+The request traverses the ASP.NET Core middleware pipeline synchronously. Every middleware that allocates (e.g., reading request body into a `MemoryStream`, 
+constructing DTOs, logging with string interpolation) contributes to GC pressure.
+
+**Key invariant:** Middleware overhead is fixed per-request. At 10,000 RPS, a midlleware that allocates 10kb  per request generates 100 MB/s of allocation pressure. 
+Gen0 GC collections will occur every few hundred milliseconds. Gen2 collections — triggered by long-lived objects surviving multiple Gen0/Gen1 collections — cause 
+stop-the-world pauses.
+
+---
+
+### Step 4 — Downstream IO (database, cache, external APIs)
+
+This is where most real-world latency variance originates. Every external call has a latency distribution, not a fixed value. The p99 of a composed call chain is 
+**not** the sum of p99s of individual calls — it's worse, because you take the worst case of each independently.
+
+For N sequential calls each with latency CDF F(t):
+
+```
+P(total < t) =  ∏ F_i(t_i)  where Σt_i = t
+```
+
+For N _parallel_ calls:
+
+```
+P(max < t) = ∏ F_i(t)
+```
+
+In practice: if your handler makes 3 sequential DB queries each with p99=50ms, your handler's p99 will be ~150 plus any coordination overhead. If one of those queries 
+occasionally hits lock contention and has a p99.9 of 500ms, your handler's p99.9 will reflect that.
+
+**Connection pool exhaustion:** EF Core uses `SqlConnection` pooled by ADO.NET. Default `Max Pool Size=100`. At 500 concurrent requests each making a DB call, 400 requests 
+queue waiting for a connection. Queue wait time is directly added to observed latency.
+
+---
+
+### Step 5 — Response serialization and return
+
+`System.Text.Json` in .NET 8+ is fast, but non-trivial for large payloads. Serializing a 50KB JSON response at 10,000 RPS generate 500MB/s of throughput pressure on the 
+response path and significant CPU time.
+
+**Key consideration:** Use `Utf8JsonWriter` directly or `IAsyncEnumerable` streaming for large payloads to avoid buffering entire responses in memory before sending.
+
+---
+
+## 5. Minimal, realistic example
+
+**Load test configuration (k6)**
+
+```javascript
+// k6 load test: find the saturation point
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '2m', target: 100 },   // ramp to 100 VUs
+    { duration: '5m', target: 100 },   // hold
+    { duration: '2m', target: 300 },   // ramp to 300 VUs
+    { duration: '5m', target: 300 },   // hold and observe cliff
+    { duration: '2m', target: 500 },
+    { duration: '5m', target: 500 },
+    { duration: '2m', target: 0 },     // ramp down
+  ],
+  thresholds: {
+    http_req_duration: ['p(95)<200', 'p(99)<500'],
+    http_req_failed: ['rate<0.001'],
+  },
+};
+
+export default function () {
+  const res = http.get('https://api.internal/v1/tenants/42/items', {
+    headers: { 'X-Tenant-Id': '42' },
+    timeout: '5s',
+  });
+  check(res, { 'status 200': (r) => r.status === 200 });
+  sleep(0.1); // 100ms think time → realistic open workload
+}
+```
+
+This uses a **staged ramp** to find the saturation point. The moment p99 crosses 500ms while RPS is still increasing, you've found the cliff.
+
+---
+
+**ASP.NET Core: connection pool and concurrency limits**
+
+```csharp
+// Program.cs — production-aware Kestrel + EF Core configuration
+builder.Services.AddDbContextPool<AppDbContext>(options =>
+{
+    options.UseSqlServer(connectionString, sql =>
+    {
+        sql.CommandTimeout(30);
+        sql.EnableRetryOnFailure(3, TimeSpan.FromSeconds(1), null);
+    });
+    // Pool size matches max expected concurrent DB operations, not VUs
+}, poolSize: 128); // DbContext pool, separate from ADO.NET connection pool
+
+builder.WebHost.ConfigureKestrel(options =>
+{
+    // Bound the queue explicitly — better to reject than to queue indefinitely
+    options.Limits.MaxConcurrentConnections = 10_000;
+    options.Limits.MaxConcurrentUpgradedConnections = 1_000;
+    options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(120);
+    options.Limits.RequestHeadersTimeout = TimeSpan.FromSeconds(15);
+});
+
+// Connection string with explicit pool sizing
+// "Server=...;Max Pool Size=200;Min Pool Size=10;Connection Timeout=5"
+// Min Pool Size keeps connections warm during low traffic
+```
+
+---
+
+**OpenTelemetry: instrument what actually matterns**
+
+```csharp
+// Custom histogram for business-level latency bucketing
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics =>
+    {
+        metrics.AddAspNetCoreInstrumentation();
+        metrics.AddRuntimeInstrumentation(); // thread pool, GC, etc.
+        metrics.AddMeter("MyApp.Performance");
+    });
+
+// In your service
+public class ItemService
+{
+    private static readonly Histogram<double> _dbLatency =
+        Metrics.CreateHistogram<double>(
+            "myapp.db.query.duration",
+            unit: "ms",
+            description: "EF Core query latency by operation");
+
+    public async Task<Item[]> GetItemsAsync(int tenantId)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            return await _db.Items
+                .Where(i => i.TenantId == tenantId)
+                .AsNoTracking()
+                .ToArrayAsync();
+        }
+        finally
+        {
+            _dbLatency.Record(sw.Elapsed.TotalMilliseconds,
+                new KeyValuePair<string, object?>("operation", "GetItems"),
+                new KeyValuePair<string, object?>("tenant_id", tenantId));
+        }
+    }
+}
+```
+
+**Why this matters:** Application Insights' default request duration metric aggregates across all requests. You cannot identify which DB queries are causing 
+p99 degradation without per-operation histrograms with explicit percentile tracking.
+
+--- 
+
+**Identifying the saturation point programmatically**
+
+```csharp
+// Middleware to emit saturation signals
+public class SaturationMetricsMiddleware
+{
+    private static readonly Gauge<int> _threadPoolQueueLength =
+        Metrics.CreateGauge<int>("myapp.threadpool.queue_length");
+    private static readonly Gauge<int> _dbPoolWaiting =
+        Metrics.CreateGauge<int>("myapp.dbpool.waiting_count");
+
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        ThreadPool.GetAvailableThreads(out int workerThreads, out _);
+        ThreadPool.GetMaxThreads(out int maxWorker, out _);
+        _threadPoolQueueLength.Record(maxWorker - workerThreads);
+
+        await next(context);
+    }
+}
+```
+
+---
+
+## 6. Design trade-offs
+
+### Throughput vs. Latency SLO
+
+The fundamental tension: maximizing throughput means operating at high utilization which increases queuing delay and tail latency. There is not free lunch.
+
+|Strategy                             |Max Throughput           |p99 Latency                   |Complexity      |Cost                      |
+|-------------------------------------|-------------------------|------------------------------|----------------|--------------------------|
+|High utilization (ρ  > 0.85)         |High                     |Unpredictable; cliff risk     |Low             |Low                       |
+|Target utilization cap (ρ &lt; 0.70) |Moderate                 |Predictable                   |Low             |Higher (over-provisioned) |
+|Autoscaling on RPS                   |High                     |Good during steady state      |Moderate        |Moderate                  |
+|Autoscaling on latency percentile    |High                     |Controlled                    |High            |Moderate                  |
+|Circuit breakers + load shedding     |Bounded                  |Predictable under overload    |High            |Low                       |
+
+
+**The correct choice for latency-sensitive, multi-tenant SaaS:** Target utilization ≤ 70% under normal peak load, autoscale on p95 latency rather than CPU, 
+and implement load shedding as a safety valve.
+
+### Horizontal scaling vs. vertical scaling
+
+**Horizontal (more pods):** Reduces per-instance load but increases distributed coordination costs (shared DB connection limits, distributed caches, service mesh 
+overhead). The USL's `β` coefficient grows.
+
+**Vertical (larger instance):** More threads, more memory for connection pools, better GC performance (more Gen0 heap → fewer collections). But single-instance 
+limits apply and failure blast radius is larger.
+
+**Practical guidance for AKS:** Default to horizontal scaling with small-to-medium pods (4-8 vCPUs, 8-16 GB RAM). Scale up instance size only when profilling shows the 
+bottleneck is intra-process (GC, CPU, memory bandwidth), not inter-service.
+
+### Synchronous vs. asynchronous request processing
+
+|Pattern                          |Thread Efficiency         |Latency Overhead                       |Failure Isolation     |
+|---------------------------------|--------------------------|---------------------------------------|----------------------|
+|Full async (`async/await`)       |Excellent                 |Minimal (task scheduling)              |Good                  |
+|Sync-over-async (`.Result`)      |Poor (thread held)        |High under load                        |Poor                  |
+|Actor model (e.g., Orleans)      |Good                      |Moderate (message passing)             |Excellent             |
+|Queue-bases async (Service Bus)  |Excellent                 |High (minutes vs ms)                   |Excellent             |
+
+---
+
+### Backpressure: reject vs. queue
+
+Under overload, you have two options:
+
+  - **Queue:** Requests accumulate. Memory grows. Latency grows. Eventually the system crashes or the queue is drained. The client has no signal that the system is overloaded.
+  - **Reject (503/429):** The client receives an immediate signal and can retry later or route elsewhere. The service remains stable. Tail latency stays bounded.
+
+**Recommendation:** Implement explicit capacity limits (`MaxConcurrentConnections`, thread pool limits, Polly's `BulkheadPolicy`) and return 429 or 503 with `Retry-After` 
+headers when exceeded. This is operationally transparent and keeps latency SLOs instact at the cost of throughput during overload.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Testing with closed workloads, deploying to open workloads
+
+**What happens:** k6 with fixed VU counts creates a **closed workload** — the next request doesn't start until the previous one finishes. Production traffic is an 
+**open workload** — requests arrive regardless of whether previous ones finished. At high latency, a closed workload model shows artificially low RPS (VUs are waiting), 
+masking the actual load the system would face.
+
+**Fix:** Use k6's `arrival-rate` executor, not VU counts. Configure `constantArrivalRate` or `rampingArrivalRate` scenarios that produce a fixed RPS regardless of response time.
+
+```javascript
+export const options = {
+  scenarios: {
+    constant_rps: {
+      executor: 'constant-arrival-rate',
+      rate: 500,           // 500 RPS
+      timeUnit: '1s',
+      duration: '5m',
+      preAllocatedVUs: 100,
+      maxVUs: 1000,        // burst capacity
+    },
+  },
+};
+```
+
+---
+
+### Treating connection pool exhaustion as a capacity problem
+
+**What happens:** Engineers see `Connection pool exhausted` errors and increase `Max Pool Size`. This delays the problem but doesn't fix it. The root cause is usually 
+requests taking too long — either slow queries, network latency, or missing indexes.
+
+**Fix:** Instrument per-query latency. A p99 of 50ms per query means 100 concurrency requests need 100 connections. A p99 of 500ms means you need 10x as many connections 
+for the same RPS. Fix the query, not the pool size.
+
+---
+
+### Ignoring GC impact on p99
+
+**What happens:** GC pauses are dismissed as "background noise". In reality, a Gen2 GC pause of 100ms at 5,000 RPS affects every request in-flight during that pause — 
+potentially 500 requests simultaneously experiencing 100ms+ additional latency.
+
+**Fix:** Monitor `dotnet-counters` for `GC Heap Size`, `Gen 0/1/2 GC Count`, and `% Time in GC`. Use `System.Runtime` metrics via OpenTelemetry. Profile allocation hotspots 
+with `dotnet-trace` + JetBrains dotMemory. Common high-allocation patterns in ASP.NET Core: LINQ-to-objects on large collections, string concatenation in logging, 
+`ToListAsync()` on large result sets, and `JsonSerializer.Serialize()` of large objects.
+
+---
+
+### Autoscaling on CPU for IO-bound services
+
+**What happens:** An IO-bound ASP.NET Core service at 10,000 RPS may show only 20% CPU utilization while p99 is at 800ms. CPU-based autoscaling never trigger. 
+The bottlenect is DB connection wait time, not CPU.
+
+**Fix:** Autoscale on **p95 request duration** (from Application Insights or Prometheus) or on **thread pool queue length**. For AKS, use KEDA with Application Insights 
+as the scaler or custom metrics from Prometheus.
+
+---
+
+### Not accounting for noisy neighbor effects in multi-tenant systems
+
+**What happens:** Tenant A generate a burst of heavy queries. DB connection pool is exhausted. Tenant B's lightweight requests start queuing for connections. 
+Tenant B's p99 spikes despite generating minimal load themselves.
+
+**Fix:** Per-tenant connection limits via separate connection string or schemas. Per-tenant request rate-limiting. Bulkhead patterns (separate thread pools or 
+task queues per tenant tier). At minimum, monitor per-tenant latency percentiles, not just aggregate.
+
+---
+
+### Assuming linear scalability past the USL inflection point
+
+**What happens:** A service scales linearly from 2 to 8 pods. Engineers assume 16 pods will give 2x more throughput. Instead, throughput plateaus or decreases because 
+the database or shared cache becomes the bottleneck — adding more application pods just increases contention.
+
+**Fix:** Run USL curve fitting on your load test data. Tools like `usl4j` or manual curve fitting in Python can extract the `α` and `β` coefficients from 
+empirical data. This predicts the optimal instance count beyound which scaling yields diminishing returns.
+
+---
+
+## 8. Operational and production considerations
+
+### What to monitor:
+
+  **Service-level:**
+
+    - `http.server.request.duration` histogram (p50, p95, p99, p99.9) — by endpoint and tenant
+    - `http.server.active_requests` — in-flight request count
+    - `kestrel.connection.queue_length` — connection backlog
+    - `aspnetcore.routing.match_attempts` — routing overhead at scale
+
+  **Runtime-level:**
+
+    - `dotnet.thread_pool.queue.lenght` — thread pool backlog (saturation signal)
+    - `dotnet.thread_pool.thread.count` — active thread count
+    - `dotnet.gc.collections` by generation — GC frequency
+    - `dotnet.gc.heap.total_allocated` — allocation rate
+    - `dotnet.process.cpu.time` — CPU utilization per process
+
+  **Infrastructure-level:**
+
+    - DB connection pool active vs. available per connection string
+    - Redis connection count and command latency percentiles
+    - Kafka consumer lag per partition
+    - Azure Service Bus message processing time
+
+### What degrades first
+
+  1. **Thread pool queue length increases** — first sign of saturation. Latency begins rising.
+  2. **DB connection pool wait time increases** — requests queue for connections. P99 spikes before p95;
+  3. **GC pressure increases** — allocation rate climbs. Gen0 GC frequency rises. Pause times increase.
+  4. **External dependency latency compounds** — at high concurrency, downstream services also saturate. Retry storms can amplify this.
+  5. **Memory pressure / OOM** — if queueing is unbounded, in-flight request state accumulates. Pods restart.
+
+### Autoscaling recommendations for AKS
+
+```yaml
+# HPA targeting p95 latency via KEDA + Prometheus
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: api-scaledobject
+spec:
+  scaleTargetRef:
+    name: api-deployment
+  minReplicaCount: 3    # never below 3 for HA
+  maxReplicaCount: 20
+  cooldownPeriod: 60    # seconds — prevent thrashing
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      metricName: http_request_duration_p95
+      query: |
+        histogram_quantile(0.95,
+          sum(rate(http_server_request_duration_seconds_bucket
+            {service="api"}[2m])) by (le))
+      threshold: "0.2"  # scale out if p95 > 200ms
+```
+
+**Cold start mitigation:** Use `minReadySeconds: 30` and liveness/readiness probes that only pass after JIT warmup. Pre-warm connection pool in `IHostedService.StartAsync`.
+Consider `R2R` (ReadyToRun)  compilation in your Dockerfile to reduce startup JIT time.
+
+### Operational risks
+
+  - **Scale-in during traffic:** If scale-in terminates pods while they're processing requests, in flight requests fail.Use `terminationGracePeriodSeconds` ≥ 30 and 
+  `PreStop` hooks to drain gracefully.
+
+  - **Connection pool fragmentation across pods:** 20 pods × 100 connections = 2,000 DB connections. This can exceed database max connection limits. Use PgBouncer or 
+  a connection proxy between application and DB.
+
+  - **Metrics lag:** Application Insights default aggregation interval is 1 minute. You cannot detect a 30-second latency spike from standard metrics. Use 
+  `TelemetryClient` with custom flush intervals or Prometheus with 15-second scrape intervals for reactive autoscaling.
+
+---
+
+## 9. When NOT to use this
+
+### When your traffic is too low to exhibit queuing effects
+
+If your service handles &lt; 10 RPS sustained, queuing theory effects don't manifest in practice. Latency at this scale is dominated by individual operation 
+costs (DB query time, serialization, network RTT), not system-level queuing. Optimize operations individually.
+
+---
+
+### When your bottleneck is CPU-bound
+
+All of the IO-centric analysis here assumes that work is mostly waiting. A CPU-bound service (e.g., real-time ML inference, image processing, cryptography) has 
+different characteristics — the thread pool is always busy with actual work, not waiting. Amdahl's Law and CPU profilling apply; queueing models are secondary.
+
+---
+
+### When you're pre-launch with no production traffic data
+
+Building elaborate capacity models before you have real traffic patterns leads to over-engineered autoscaling policies based on guesses. Run your service, collect 
+real data for 4-8 weeks across different load patterns, then build the model. Premature optimization at the infrastructure level wastes engineering time and 
+produces incorrect assumptions.
+
+---
+
+### When the latency SLO is loose (e.g., p99 &lt; 5seconds)
+
+For interval batch-adjacent APIs with very relaxed latency requirements, the operational overhead of tight capacity modeling exceeds the benefit. Apply simpler 
+rules: provision to 50% utilization, scale on CPU, move on.
+
+---
+
+### When the cost ceiling prevents sensible provisioning
+
+If cost constraints force operating at ρ > 0.85 utilization, the architecture needs to change — not the tuning parameters. Load shedding, async queue-based 
+processing, or tier-based SLOs (different latency guarantees for different tenant tiers) are structural fixes. Fine-tuning connection pool sizes and autoscaling 
+policies at high utilization is rearranging deck chairs.
+
+---
+
+## 10. Key takeaways
+
+  - **Latency degrades non-linearly with utilization.** At 70% utilization, queue wait is ~2x the service time. At 90%, it's ~9x. Design your capacity targets around 
+  this curve, not around linear extrapoloation from your average-case measurements.
+
+  - **p99 latency is not a property of individual requests — it's a property of the system under load.** The same code that returns in 20ms under low concurrency can 
+  take 400ms under high concurrency due to queuing, connection contention, and GC pressure. Measure latency under realistic load, not in isolation.
+
+  - **Thread pool starvation is the most common .NET-specific latency killer.** Any synchronous blocking call (`.Result`, `.Wait()`, blocking IO, long-running CPU 
+  work without `Task.Run`) inside an async path holds a thread captive. At scale, this exhausts the pool. Audit every external call path for blocking operations before 
+  performance testing.
+
+  - **The saturation point is not the peak throughput your service can sustain — it's the RPSat which latency SLOs begin to break.** These are different numbers. Find 
+  the second one through staged load testing with latency thresholds, not by finding the maximum RPS before requests fail.
+
+  - **Autoscale on latency, not CPU.** IO-bound .NET services can be at 100% effective saturation with 20% CPU utilization. CPU-based autoscaling will not trigger 
+  in time. Autoscale on p95 request duration or thread pool queue length for meaningful proactive response.
+
+  - **Connection pool limits are a capacity ceilling, not a tuning knob.** High DB connection wait times mean request are too slow, not that you need more connections. 
+  Fix query performance, add read replicas, or reduce lock contention. The pool size is a safety limit, not a performance lever.
+
+  - **Noisy neighbor effects in multi-tenant systems require per-tenant observability.** Aggregate latency metrics hide the distribution across tenants. Instrument 
+  per-tenant latency percentiles and connection pool usage. Implement bulkheads (separate resource pools per tenant tier) before the first major incident, not after.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of RPS vs tail latency dynamics in ASP.NET Core, highlighting queueing behavior, utilization (ρ), thread pool saturation, connection pool contention, GC pressure, and the non-linear latency cliff under high concurrency.
+
+import Light from './_assets/rps-latency-modeling-light.svg';
+import Dark from './_assets/rps-latency-modeling-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="RPS latency modeling"
+  height={460}
+/>
