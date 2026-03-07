@@ -1,0 +1,115 @@
+---
+id: dotnet-threadpool-starvation-analysis
+title: .NET ThreadPool Starvation
+slug: /engineering/runtimes/dotnet/dotnet-threadpool-starvation-analysis
+description: Deep production analysis of .NET ThreadPool starvation diagnostics, ETW, async blocking, IOCP, tuning, mitigation patterns, load validation.
+sidebar_label: ThreadPool Starvation
+keywords: [dotnet threadpool, threadpool starvation, async blocking, etw diagnostics, kestrel performance]
+sidebar_position: 30
+---
+
+## 1. What this document is about
+
+Thread pool starvation is a condition where the .NET `ThreadPool` cannot schedule queued work items in a timely manner because all available threads are occupied — 
+typically blocked waiting on synchronous I/O, locks, or continuations that depend on other blocked threads. The result is latency collapse: p95/p99 spikes, request
+queuing, and apparent deadlock-like behavior under load, even when CPU utilization is low.
+
+This document covers:
+
+    - The CRL `ThreadPool` and IOCP thread mechanics in .NET 7/8/9+
+    - How starvation manifests in ASP.NET Core (Kestrel) and worker services
+    - Diagnostic method: `dotnet-counters`, `dotnet-trace`, `dotnet-dump`, PerfView, ETW, eBPF
+    - Controlled reproduction in a lab environment
+    - Mitigation strategies applicable in production without downtime
+    - Alerting, SLO-correlation, and prevention via CI gates
+
+**Where this applies:** Any .NET server-side process that relies on the `ThreadPool` for I/O completion or task continuation scheduling — ASP.NET Core, gRPC services, 
+background workers, message consumers (Service Bus, RabbitMQ, Kafka).
+
+**Where it does not apply:** Fully CPU-bound single-threaded workloads, system using dedicated `Thread` instances exclusively, or greenfield services where 
+async discipline is already enforced from day one.
+
+---
+
+## 2. Why this matters in real systems
+
+Starvation rarely starts as a design decision. It accumulates through:
+
+**Incremental blocking introduction.** A team adds a call to a legacy library that internally calls `.Result` or `.GetAwaiter().GetResult()` on an async 
+operation. Works fine in development (low concurrency, pool has headroom). In production under loak, threads accumulate waiting for I/O. The pool's hill-climbing 
+algorithm injects new threads slowly (one per ~500ms), lagging behind demand.
+
+**Dependecy version upgrades.** A Nuget update silently changes an async path to synchronous. Or an ORM method that was CPU-light now does synchronous schema 
+introspection at startup or on first-use.
+
+**Timer and continuation starvation.** `System.Timers.Time` and `System.Threading.Time` callbacks execute on `ThreadPool`. A timer callback that blocks or takes 
+200ms under load cascades into delays for all other work items.
+
+**Third-party SDKs.** Azure SDK older versions, Redis `StackExchange.Redis` in sync mode, older `HttpClient` usage patterns, or any SKD that wraps async over sync internally.
+
+**Container resource limits.** A pod with a 2-CPU limit still starts with `ThreadPool` min threads calibrated to logical processor count at process start — which 
+may have been 32 or 64 cores on the node. Or the inverse: a container with `DOTNET_PROCESSOR_COUNT` not set, causing `ThreadPool` to underallocate relative to 
+workload expectations.
+
+**What breaks when ignored:**
+
+    - Latency degrades non-linearly. At 60% of the starvation threshold, p99 may be acceptable. At 70%, p99 doubles. At 80%, timeouts cascade.
+    - Health checks timeout, triggering Kubernetes readiness probe failures and pod restarts — which accelerates starvation on the remaining pods.
+    - Connection pools (SQL, Redis, HTTP) exhaust because threads holding connections cannot complete, preventing pool recycling.
+    - Downstream circuit breakers open, creating a broader incident from started as a thread leak in one service.
+
+---
+
+## 3. Core concept (mental model)
+
+
+---
+
+## 4. How it works (step-by-step)
+
+
+---
+
+## 5. Minimal, realistic example
+
+
+---
+
+## 6. Design trade-offs
+
+---
+
+## 7. Common mistakes and misconceptions
+
+
+---
+
+## 8. Operational and production considerations
+
+
+---
+
+## 9. When NOT to use this
+
+
+---
+
+## 10. Key takeaways
+
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of .NET memory management, highlighting stack-scoped execution, heap allocation, GC root discovery, survivorship, and pressure-driven reclamation.
+
+import Light from './_assets/advanced-memory-management-light.svg';
+import Dark from './_assets/advanced-memory-management-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Advanced memory management"
+  height={360}
+/>

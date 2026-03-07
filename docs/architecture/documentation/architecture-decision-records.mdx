@@ -1,0 +1,431 @@
+---
+id: architecture-decision-records
+title: Architecture Decision Records
+slug: /architecture/documentation/architecture-decision-records
+description: Practical ADR framework for documenting architectural decisions, trade-offs, context, and consequences in distributed systems.
+sidebar_label: Architecture Decision Records
+keywords: [architecture decision records, adr pattern, architecture governance, decision traceability, architectural tradeoffs]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+Architecture Decision Records (ADRs) are structured documents that capture a single architectural decision: the context that prompted it, the 
+options considered, the chosen direction, and reasoning behind the choice.
+
+This document covers:
+
+    - What an ADR is and how it fits into architectural governance
+    - How to structure, create, and maintain ADRs in long-lived distributed systems
+    - How ADR workflows integrate with team processes in multi-team environments
+    - Patterns for keeping ADR repositories coherent over time
+
+**Where this applies:** Greenfield and brownfield distributed systems with more than one team, long system lifecycles (3+ years), or compliance requirements 
+that demand decision traceability.
+
+**Where this does not apply:** Tactical implementation decisions (which library method to use, internal algorithm choices), decisions that are trivially 
+reversible with no downstream impact, or solo projects with no organizational continuity requirement.
+
+---
+
+## 2. Why this matters in real systems
+
+
+Architectural decisions accumulate faster than institutional memory does.
+
+In practice, the pain usually appears in one of these forms:
+
+**"Why is this service synchronous when everything else is event-driven?" Nobody knows. The original engineers left. The decision was made three years ago in a 
+Slack thread. The thread is gone. A new team is now inheriting a pattern they don't understand and can't safely change because they don't know what it was 
+protecting against.
+
+**"We keep revisiting the same decisions."** A team proposes migrating from REST to gRPC for internal service communication. It sounds familiar. That's because 
+it was proposed — and rejected — 18 months ago. The reasons for rejection weren't recorded. The discussion restarts from zero, consumes the same two weeks of 
+engineering time, and may reach the same conclusion or a different one, with no organizational learning either way.
+
+**What was the original intent of this boundary?** A service grows beyond its original scope. Nobody knows if the boundary was a deliberate Domain-Driven Design 
+choice, a deployment constraint, or just how someone happened to cut it at the time. Refactoring becomes archaeology.
+
+**What tends to break without ADRs:**
+
+    - Teams make locally rational decisions that conflict with system-wide constraints they were never told about
+    - Compliance and security audits require justifying architectural choices; without documentation, this becomes expensive reconstruction work
+    - New engineers spend weeks reverse-engineering intent from code that was written to safisfy constraints that no longer exist
+    - "Never touch that" folklore replaces documented reasoning; components become untouchable because nobody understands them
+
+ADRs exist specifically because architectural knowledge degrades faster than architectural system do.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of an ADR as a **forensic record of a decision-making moment.**
+
+It doesn't document the architecture as it is. It documents a specific moment when the architecture could have gone one way or another — the forces that shaped 
+the choice, the alternatives that were genuinely considered, and the reasoning that tilted the balance. It also captures the conditions under which the decision 
+might be revisited.
+
+The lifecycle looks like this:
+
+```
+System pressure / requirement emerges
+        │
+        ▼
+Options are identified and evaluated
+        │
+        ▼
+Decision is made (sometimes under constraints)
+        │
+        ▼
+ADR is written and merged into the repository
+        │
+        ▼
+Architecture evolves; ADR status updates over time
+        │
+  ┌─────┴──────┐
+  │            │
+Superseded   Deprecated
+  │
+  ▼
+New ADR references original
+```
+
+The key insight: an ADR's value is not just in its creation. It compounds over time because each new decision can reference prior ones. The ADR repository 
+becomes a directed graph of decisions — superseding relationships, dependency relationships, constraint relationships. That graph is the organization's 
+architectural memory.
+
+A single ADR is a document. A maintained ADR repository is a governance artifact.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Recognize that a decision is architectural
+
+Not every decision warrants an ADR. An architectural decision is one that:
+
+    - Affects multiple teams or system components
+    - Is difficult or expensive to reverse
+    - Establishes a pattern that will be replicated
+    - Has meaningful alternatives that were legitimately considered
+
+If a decision doesn't meet a least two of these criteria, it probably belongs in a code comment or an inline doc, not an ADR.
+
+---
+
+### Step 2 — Draft the ADR before the decision is finalized
+
+This is the most important timing constraint. An ADR written after the decision is typically a rationalization, not a record. It will omit the real 
+trade-offs, underrepresent the rejected alternatives, and reflect the outcome rather than the reasoning.
+
+Draft the ADR during the evaluation phase. This forces the team to articulate options clearly enough to write them down — which frequently exposes 
+assumptions and gaps in the analysis.
+
+---
+
+### Step 3 — Assign a number and a status
+
+ADRs are numbered sequentially and never renumbered. Use a consistent format:
+
+```
+ADR-0047: Use event sourcing for order lifecycle management
+```
+
+Initial status is typically `Proposed` or `Draft`. After review and acceptance, it becomes `Accepted`. If later superseded, it is marked `Superseded by ADR-0083` 
+— **Never deleted**.
+
+---
+
+### Step 4 — Circulate for review
+
+ADRs should go through a lightweight review process — not a design committee, but enough cross-team visibility to surface conflicts with decisions made 
+elsewhere. Pull request reviews work well. The review should focus on:
+
+    - Are the alternatives genuinely complete?
+    - Is the stated reasoning accurate?
+    - Does this conflict with any existing ADR?
+
+---
+
+### Step 5 — Merge and index
+
+Once accepted, the ADR is merged into the repository and indexed. The repository must be discoverable — co-located with the codebase it governs, or 
+linked from the team's engineering handbook with a stable URL.
+
+---
+
+### Step 6 — Maintain status over time
+
+ADRs age. A decision made under specific constraints may no longer apply. Engineers are resposible for:
+
+    - Marking ADRs `Deprecated` when the rationale no longer applies but no replacement has been made
+    - Creating a new ADR that supersedes an old one when a reversal or major change occurs
+    - Referencing relevant prior ADRs in new decisions
+
+The ADR is immutable in substance; only its status field changes.
+
+---
+
+## 5. Minimal but realistic example 
+
+**Scenario:** A team in a .NET / Kubernetes / Azure environment needs to decide how internal services communicate. The options are synchronous HTTP/gRPC vs. 
+asynchronous messaging via Azure Service Bus.
+
+```markdown
+# ADR-0031: Asynchronous messaging for cross-domain service communication
+
+**Date:** 2024-11-14  
+**Status:** Accepted  
+**Deciders:** Platform Team, Order Domain, Fulfillment Domain  
+**Supersedes:** —  
+**Superseded by:** —
+
+---
+
+## Context
+
+As of Q4 2024, the platform has 14 independently deployed services across 4 bounded contexts. 
+Several inter-domain workflows (order placement → inventory reservation → fulfillment initiation) 
+currently use synchronous HTTP calls. This creates tight temporal coupling: if Fulfillment is 
+degraded, order placement is also degraded. SLA requirements for order placement are stricter 
+than for fulfillment.
+
+Additionally, fulfillment logic is being extracted into a separate team boundary. Synchronous 
+coupling across team boundaries creates deployment coordination overhead.
+
+---
+
+## Decision
+
+Cross-domain service communication will use asynchronous messaging via Azure Service Bus 
+(Standard tier). Intra-domain communication may remain synchronous where latency requirements 
+justify it.
+
+---
+
+## Alternatives Considered
+
+**1. Keep synchronous HTTP (status quo)**  
+- Pro: Simple, easy to trace  
+- Con: Tight availability coupling across domain boundaries. Does not meet SLA requirements 
+  under partial failure.
+
+**2. gRPC with circuit breakers**  
+- Pro: Strong contracts, efficient transport  
+- Con: Still synchronous. Circuit breaker patterns add complexity without eliminating 
+  temporal coupling. Retry storms under load remain a risk.
+
+**3. Azure Service Bus (chosen)**  
+- Pro: Temporal decoupling, natural retry with dead-letter queues, fits existing Azure footprint  
+- Con: Eventual consistency model requires teams to handle out-of-order and duplicate messages. 
+  Observability more complex than HTTP traces.
+
+**4. Kafka**  
+- Pro: High throughput, replayable log  
+- Con: Operational overhead is unjustified at current scale. Requires dedicated platform 
+  engineering support we do not currently have.
+
+---
+
+## Consequences
+
+- Positive: Order placement SLA isolated from fulfillment availability
+- Positive: Teams can deploy independently
+- Negative: Engineers must design for idempotency and out-of-order delivery in all consumers
+- Negative: End-to-end trace correlation requires distributed tracing with correlation IDs 
+  propagated through message headers (see ADR-0028)
+
+---
+
+## Revisit Conditions
+
+Reconsider if message volume exceeds 10k/min sustained or if operational tooling for 
+Service Bus becomes a bottleneck. At that point, evaluate Kafka or Event Hubs migration.
+```
+
+**How this maps to the concept:**
+
+    - The _Context_ section is honest about the real constraint (SLA + team boundaries), not just technical theory
+    - The _Alternatives_ section includes the status quo and reasons it fails — not just the losing options
+    - The _Consequences_ section explicitly names the costs accepted, not just the benefits gained
+    - The _Revisit Conditions_ section makes the decision self-aware: it knows when it may no longer apply
+
+---
+
+## 6. Design trade-offs
+
+|Approach                                                |What you gain                                          |What you give up                                              |Implicit acceptance                             |
+|--------------------------------------------------------|-------------------------------------------------------|--------------------------------------------------------------|------------------------------------------------|
+|**Lightweight ADRs (Markdown files in repo)**           |Low friction, version-controlled, co-located with code |No enforcement, can drift, hard to query at scale             |Relies on engineering discipline                |
+|**ADRs in a wiki (Confluence, Notion)**                 |Discoverable, rich formatting, cross-linking           |Decoupled from code changes, tends to become stale            |Documentation drift is likely                   |
+|**Formal RFC/ADR tooling (e.g., adr-tool, Log4brains)** |Structure, numbering, indexing enforced                |Tooling dependency, onboarding friction                       |Teams must adopt tooling consistently           |
+|**No ADRs, desicion in PR descriptions**                |Zero additional process overhead                       |No durable index, search degrades rapidly, no status tracking |Institutional memory is ephemeral               |
+|**Architecture decision committee**                     |Cross-team consistency, authority                      |Bottleneck, slows teams, can become political                 |Requires sustained organizational investment    |
+
+**The core tension** is between completeness and adoption. An ADR process that requires a six-section formal document before any decision can be merged will be 
+circumbented. One that has no minimum structure produces inconsistent records that are hard to use later.
+
+The production-viable middle ground: a mandatory short form (context, decision, conssequences) with optional extended sections. Make compliance low-friction; 
+make non-compliance visible.
+
+---
+
+
+## 7. Common mistakes and misconceptions
+
+### Writing the ADR after the decision is already implemented
+
+**Why it happends:** Teams treat ADRs as documentation overhead rather than a decision tool.
+
+**What it causes:** The document rationalizes the outcome rather than records the reasoning. Alternatives are underrepresented. The real constraints (time 
+pressure, team preference, political factors) are invisible.
+
+**How to avoid:** Make ADR creation a pre-condition of the implementation PR being merged, not a follow-up task.
+
+---
+
+### Treating "Accepted" as permanent
+
+**Why it happens:** Engineers file an ADR and forget it. There's no mechanism to revisit.
+
+**What it causes:** Accepted ADRs describe architectural intent that the system no longer follows. New engineers read them and are confused by the delta between 
+documentation and reality.
+
+**How to avoid:** Include explicit revisit conditions in every ADR. Build a lightweight review process into major planning cycles (quarterly or per large initiative).
+
+---
+
+### Documenting only the winning option
+
+**Why it happens:** It feels redundant to write down things you didn't choose.
+
+**What it causes:** The rejected alternatives look like they were never considered. The same alternatives get re-proposed repeatedly. Teams relitigate settled questions.
+
+**How to avoid:** Require al teast two alternatives with explicit pros/cons for every ADR. If only one option was genuinely viable, say so and explain why — 
+that's important context.
+
+---
+
+### One ADR per architectural domain instead of per decision
+
+**Why it happens:** Teams write "ADR: Service Communication Strategy" that covers REST, gRPC, messaging, and event streaming in one document.
+
+**What it causes:** The ADR becomes a living document that gets continuously edited, loses its point-in-time value, and can't be superseded cleanly.
+
+**How to avoid:** One ADR per decision point. If a decision is compound, split it into multiple ADRs that reference each other.
+
+---
+
+### Placing ADRs in a wiki disconnected from the codebase
+
+**Why it happens:** Wikes are familiar and searchable.
+
+**What it causes:** ADRs in wikis drift from the codebase. When a service is deprecated, its ADR remain in the wiki indefinitely, undated and unmarked. 
+Nobody updates them.
+
+**How to avoid:** Co-locate ADR in the repository they govern (`/docs/adr` is conventional). Use git history as the authoritative timeline. Link from the 
+wiki to the repo, not the other way.
+
+---
+
+### Confusing an ADR with a design document
+
+**Why it happens:** Design docs and ADRs look similar.
+
+**What it causes:** ADR that contain full system designs become unwieldy, are never updated, and collapse under the weight of their own scope.
+
+**How to avoid:** An ADR answers: _why did we choose X over Y in this context?_ A design doc answers: _how does X work?_ They can cross-reference each other but 
+are different artificts with different update lifecycles.
+
+---
+
+## 8. Operational and production considerations
+
+**Repository hygiene degrades over time.** The most common failure mode is not missing ADRs — it's ADR repositories where half the records have status `Proposed` 
+and have been sitting there for two years. Nobody rejected them, nobody accepted them. The status field is meaningless.
+
+**What to monitor:**
+
+  - Count of ADRs in `Proposed` status older than 30 days — this indicates the review process has broken down
+  - Count of ADRs with no `Revisit Conditions` section — these are orphans with no mechanism for lifecycle management
+  - Ratio of `Superseded` ADRs to `Accepted` ADRs — a healthy repository shows evolution; a static one suggests decisions aren't being updated as architecture changes
+
+**What degrades first:**
+
+The _Consequences_ section. Engineers tend to document intended consequences at write time. Actual consequences — especially negative ones — are rarely backfilled. 
+Over time, the ADR says "this may increase latency slightly" but production data shows a 40% latency increase that was ultimately accepted. The ADR record is technically 
+accurate but operationally misleading.
+
+**Compliance contexts:**
+
+In regulated environments (SOC 2, ISO 27001, financial services), ADRs serve as evidence of architectural review for audit purposes. In these contexts, immutability 
+matters: the ADR must reflect what was known and decided at the time, not a retroactively sanitized version. Store them in version control with signed commits 
+if the compliance requirement is strict.
+
+**Organizational risk:**
+
+In large organizations, ADR repositories can become politically sensitive. Decisions that were made poorly, under pressure, or by people who have since left 
+the organization are permanently recorded. The solution is not to exclude these records but to write Consequences sections honestly and create superseding 
+ADRs that acknowledge what was learned. The goal is traceability, not a clean historical record.
+
+**Knowledge transfer:**
+
+ADRs are among the most effective onboarding artifacts for engineers joining an existing system. A new engineer reading through ADRs in chronological order gets 
+a compressed view of how the architecture evolved, what was tried, what failed, and what the current constraints are. This only works if the ADR repository is 
+complete and current. Partial repositories can be more confusing than no repository — the engineer can't tell what's documented versus what was simply never recorded.
+
+---
+
+## 9. When NOT to use this
+
+**Small, single-team projects with short lifespans.**
+If the codebase has one team, will be maintained for less than two years, and has no compliance requirements, ADRs add process overhead with limited return. Inline documentation and PR descriptions are sufficient.
+
+**Highly experimental phases (pre-product-market-fit).**
+During rapid prototyping where the entire architecture may be thrown away, ADRs create false permanence. The effort should go into building and learning, not documenting choices that may be irrelevant in six weeks.
+
+**Trivially reversible decisions.**
+If a decision can be changed in a single PR with no downstream coordination required, it doesn't warrant an ADR. Reserve the process for decisions that create lock-in or require multi-team coordination to undo.
+
+**As a substitute for synchronous alignment.**
+ADRs record decisions; they do not replace the conversations that should precede them. An ADR written in isolation by one engineer and merged without review does not produce organizational alignment — it produces documentation of a unilateral decision. If the team hasn't had the conversation, the ADR doesn't substitute for it.
+
+**Retroactive full documentation of an existing system.**
+Attempting to write ADRs for every historical decision in a legacy system is an expensive and often counterproductive exercise. The context is gone, the people are gone, and the reconstructed reasoning is often wrong. A better approach: write ADRs from this point forward, and write a small number of high-value historical ADRs for the decisions that still actively constrain the system today.
+
+---
+
+## 10. Key takeaways
+
+- **An ADR's value compounds over time.** A single ADR is marginally useful. A maintained, indexed repository of 50+ ADRs is an architectural governance artifact that meaningfully reduces decision latency, onboarding time, and redundant deliberation.
+
+- **Write ADRs before the decision is implemented, not after.** Post-hoc documentation is rationalization. The decision-making process itself is the most important thing to capture.
+
+- **Rejected alternatives are as important as the accepted decision.** Documenting why options were not chosen prevents the same ground from being re-covered. The organizational cost of relitigating settled decisions is high and often invisible.
+
+- **Status management is not optional.** An ADR repository where every record has status `Accepted` indefinitely is a liability. Superseded, Deprecated, and Revisited states are what keep the repository truthful over time.
+
+- **Co-location with code is strongly preferred over wikis.** ADRs that live in the repository they govern stay coupled to the lifecycle of that system. Wiki-based ADRs drift and become orphaned.
+
+- **Explicit revisit conditions make decisions self-aware.** Every decision is made under specific constraints. Stating when those constraints may no longer apply gives the organization a mechanism for intentional revision rather than accidental drift.
+
+- **Process overhead is the primary adoption risk.** The ADR format should be as lightweight as the organization can sustain while still capturing the minimum viable record: context, decision, alternatives considered, and consequences accepted. Add structure only where it provides value, not uniformity.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the ADR lifecycle, highlighting decision pressure, evaluation of alternatives, review and acceptance, repository indexing, and long-term architectural evolution through superseding decisions.
+
+import Light from './_assets/architecture-decision-records-light.svg';
+import Dark from './_assets/architecture-decision-records-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Architecture Decision Records"
+  height={1400}
+/>
