@@ -1,0 +1,600 @@
+---
+id: azure-access-governance
+title: Azure Access Governance
+slug: /security/identity/authorization/azure-access-governance
+description: Secure Azure access architecture using RBAC, managed identities, PIM, conditional access, and zero trust for enterprise-scale identity governance.
+sidebar_label: Azure Access Governance
+keywords: [azure rbac, managed identities, privileged identity management, conditional access, zero trust]
+sidebar_position: 20
+---
+
+
+## 1. What this document is about
+
+This document defines an architecture and operating model for managing access to Azure resources in a production enterprise environment. It addresses the full 
+identity lifecycle — from how a developer gets read access to a staging subscription, to how a CI/CD pipeline authenticates against Key Vault, to how a 
+vendor gets temporary elevated access to diagnose a production incident.
+
+**In scope:**
+
+    - Human identity access: engineers, operators, platform teams, vendors, auditors
+    - Workload identity access: managed identities, service principals, CI/CD pipelines, microservices
+    - Control-plane vs. data-plane authorization boundaries
+    - Role assignment governance across management groups, subscriptions, and resource groups
+    - Privileged access elevation patterns using PIM
+    - Adaptive access enforcement via Conditional Access
+    - Audit traceability for compliance (LGPD, ISO 27001, SOC 2)
+    - Secret elimination strategies for application authentication
+
+**Out of scope**:
+
+    - Application-layer authorization (e.g., what a logged-in can do inside your app's business logic)
+    - Network-level segmentation and private endpoint topology (though referenced where relevant)
+    - Identity federation with external IdPs beyond what integrates with Entra ID
+    - Cost optimization for compute, storage, or networking resources
+
+This document does not prescribe a single deployment topology. It describes the reasoning behind access management decisions so you can adapt them to your 
+organizational structure.
+
+---
+
+## 2. Why this matters in real systems
+
+Access management debt is invisible until it becomes catastrophic. Unlike performance issues, which surface under load, access governance failures surface 
+during audits, incidents, or breaches — often long after the root cause was introduced.
+
+### The common failure modes
+
+**Role sprawl**. In a fast-growing engineering org, roles accumulate without a deprecation path. A team that needed `Contributor` on one subscription six months 
+ago still has it — plus whatever was granted later. Over time, the effective permission set of any individual becomes nearly impossible to audit manually. 
+Multiply this by 40 teams across 12 subscriptions and you have no mental model of who can do what.
+
+**Shared credentials in code**. The path of least resistance for connecting a service to another service is a client secret or connection string in an 
+environment variable. It works immediately. It also sits in deployment logs, gets committed to repos, and never rotates. When a secret leaks, the blast radius is 
+proporcional to the permissions it carries and inversely proportional to how well it was scoped.
+
+**Control-plane and data-plane conflation**. `Contributor` on a Storage Account gives you ARM-level control: you can modify settings, regenerate keys, delete 
+the resource. It does not give you access to the data blobs themselves — unless you generate an access key and use that separately. Many teams don't understand 
+this distinction and either over-grant (`Owner` instead of `Storage Blob Data Reader`) or under-grant and then work around it with storage keys, defeating the purpose.
+
+**Permanent standing access**. Global Administrators and Subscription Owners with permanently active roles are attack surface. The argument for keeping them 
+permanently active is operational convenience — "we might need to fix something at 3am." The argument against it is that a compromised account with a 
+standing privileged role ca cause irreversible damage before detection.
+
+**Inconsistency across environments**. Access policies in dev are loose ("just give everyone Contributor so we can move fast"). When the same team moves to 
+production, they carry the same mental model. Over time, production access looks like dev access, except the blast radius is real.
+
+**Audit gaps**. Compliance frameworks require demonstrating that access was appropriate at  a given point in time, that privilege escalation was reviewed, 
+and that terminated employees' access was revoked promptly. Without tooling, this requires manual evidence collection — screenshots, spreadsheets, email threads — 
+that is expensive to produce and easy to challenge.
+
+### Why simpler approaches stop working
+
+Early-stage teams can manage access with a shared spreadsheet and a weekly review. At 5 engineers and 2 subscriptions, this is fine. At 50 engineers across 8 
+subscriptions with 3 environments each, it fails structurally. The rate of access change outpaces the review cadence, and the cost of getting it wrong is 
+higher because the systems are more critical.
+
+Azure's native tooling is specifically designed for this scale transition. The difficulty is not in using the tools — it's in designing the governance model 
+before you need it.
+
+---
+
+## 3. Core concept (mental model)
+
+Think of Azure access management as a **layered authorization pipeline with a lifecycle**.
+
+```
+[Identity] → [Authentication] → [Authorization] → [Enforcement] → [Audit]
+```
+
+### The four identity types you're governing
+
+**1. Human identities (Entra ID users)**
+
+Engineers, operators, audtors, vendors. They authenticate interactively via MFA, are subject to Conditional Access policies, and should never have standing 
+privileged access to production resources.
+
+---
+
+**2. Workload identities (Managed Identities)**
+
+Azure resources that need to call other Azure resources. A Function App reading from a Service Bus, and AKS pod writing to Azure SQL. These identities 
+are managed by Azure, don't have passwords, and their credentials rotate automatically. This is the target state for any greenfield service-to-service authentication.
+
+---
+
+**3. Automation identities (Service Principals)**
+
+External processes that need Azure access — CI/CD pipelines in Azure DevOps or GitHub Actions, Terraform runs, external tooling. These require careful 
+credentials management: certificate-based auth or, where supported, federated workload identity (OIDC), not client secrets.
+
+---
+
+**4. Guest and vendor identities (B2B)**
+
+External collaborators with time-limited access to specific resources. Should be governed through the same RBAC model as internal users, never through 
+shared accounts.
+
+---
+
+### The authorization hierarchy
+
+Azure RBAC evaluates permissions at **scope**. The scope hierarchy is:
+
+```
+Management Group
+  └── Subscription
+        └── Resource Group
+              └── Resource
+```
+
+A role assignment at a higher scope is inherited by all child scopes. This is the primary mechanism for both scalable access delegation and for accidentally 
+granting too much.
+
+**Control plane vs. data plane** is the second axis of authorization:
+
+    - **Control plane** (Azure Resource Manager): Who can create, modify, configure, or delete resources. Governed by RBAC with ARM roles.
+    - **Data plane**: Who can read or write the actual data within a resource. Storage blobs, Key Vault secrets, Service Bus messages, SQL rows. These require 
+separate data-plane role assignments, even for an identity that owns the resource at the ARM level.
+
+Understanding this distiction is non-negotiable. An identity can have `Owner` on a Key Vault and still be unauthorized to read secrets — because `Owner` is an 
+ARM role, and secret access requires `Key Vault Secrets User`, a data-plane role.
+
+### The access lifecycle
+
+```
+Request → Approval → Assignment → Enforcement → Review → Expiration/Revocation
+```
+
+At enterprise scale, every one of these steps needs to be automated or at minimum auditable. Manual assignment without approval workflows creates 
+ungovernable state. Assignments without review accumulate into privilge creep. Assignments without expiration become permanent.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Identity resolution
+
+When a principal (human, workload, or automation) initiates a request against an Azure resource, Entra ID resolves the identity token. For human identities, 
+this is the result of an interactive login evaluated against Conditional Access policies. For managed identities, Azure provides a token from the 
+Instance Metadata Service (IMDS) endpoint, transparently and without any credential management on the application side.
+
+The token carries the principal's object ID and group memberships. This is what RBAC evaluates against.
+
+--- 
+
+### Step 2 — Conditional access evaluation (human identities only)
+
+Before granting a token for human identities, Entra ID evaluates Conditional Access policies. Thse are if-then rules that assess signals — user location, 
+device compliance state, risk score from Identity Protection, application being accessed — and enforce controls: require MFA, block access, require a compliant 
+device, enforce sessions limits.
+
+Conditional Access runs before the token is issued, not after. This distinction matters: it means you can block access to production subscription from unmanaged 
+devices at the authentication layer, before RBAC is even consulted.
+
+---
+
+### Step 3 — RBAC evaluation
+
+Azure Resource Manager receives the request and evaluates the caller's effective permissions by collecting all role assignments that apply at the target scope — 
+from the resource itself, up throught the resource group, subscription, and management group chain.
+
+RBAC is **deny-by-default**: if no role assignment explicitly grants an action, the action is denied. Explicit `deny` assignments take precedence over `allow` 
+assignments and are used sparingly — primarily via Azure Policy deny Actions effects.
+
+The evaluation produces a binary result: allowed or denied. There is no partial evaluation path.
+
+---
+
+### Step 4 — Data-plane authorizatioin (resource-specific)
+
+If the operartion touches data rather than the resource's configuration, a second authorization layer is evaluated, specific to the resource type:
+
+    - **Key Vault**: Access Policies (legacy) or RBAC (recommended). The `Key Vault Secrets User` role grants `get` and `list` on secrets.
+    - **Storage**: `Storage Blob Data Reader / Contributor / Owner` roles for blob data. `Storage Queue Data` roles for queues. Key-based access bypasses this 
+    entirely, which is why key generation should be restricted.
+    - **Service Bus**: `Azure Service Bus Data Receiver` / `Data Sender` roles.
+    - **Azure SQL**: RBAC controls ARM-level operations. Row-level access within SQL requires database-level permissions granted via SQL syntax, not Azure RBAC.
+
+For each of these, the identity needs both a control-plane role assignment (to see the resource in Azure) and a data-plane role assignment (to access its contents). 
+In practice, many workloads need only data-plane assignments — the application doesn't need to modify Key Vault configuration, it just needs to read secrets.
+
+---
+
+### Step 5 — PIM elevation (privileged operations)
+
+For operations requiring elevated roles — `Owner`, `User Access Administrator`, `Contributor` on production subscriptions, `Global Administrator` — Privileged 
+Identity Management enforces just-in-time access.
+
+The principal is configured as **eligible** (not active) for the role. When they need to perform a privileged operation, they activate the role through PIM, 
+providing a business justification. PIM evaluates any activation rules: whether approval is required, what the maximum activation duration is, whether MFA 
+must be re-confirmed. The role becomes active for a defined window — typically 1-4 hours — then expires automatically.
+
+This eliminates permanent standing access without eliminating the ability to act quickly when needed. Activation typically takes under 5 minutes for pre-approved roles.
+
+---
+
+### Step 6 — Audit log emission
+
+Every RBAC evaluation, role assignment change PIM activation, and Conditional Access evaluation generates events in the Azure Activity Log and Entra ID audit logs. 
+These events flow into Log Analytics and, from there, into Microsoft Sentinel or SIEM tooling.
+
+The audit trail answers three questions: who had access, when they used it, and what they changed. For compliance frameworks, you need to demonstrate this 
+retroactively — meaning the logging infrastructure must be operational and retained before an audit, not set up in response to one.
+
+---
+
+## 5. Minimal but realistic example, 
+
+### Managed Identity accessing Key Vault from App Service
+
+```bicep
+// App Service with system-assigned managed identity
+resource appService 'Microsoft.Web/sites@2022-09-01' = {
+  name: appServiceName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    serverFarmId: appServicePlan.id
+  }
+}
+
+// Key Vault with RBAC authorization model (not access policies)
+resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' = {
+  name: keyVaultName
+  location: location
+  properties: {
+    sku: { family: 'A', name: 'standard' }
+    tenantId: subscription().tenantId
+    enableRbacAuthorization: true  // Enables data-plane RBAC; disables legacy access policies
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 90
+  }
+}
+
+// Data-plane role assignment: App Service reads secrets only
+resource kvSecretUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, appService.id, 'Key Vault Secrets User')
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '4633458b-17de-408a-b874-0445c86b69e6'  // Key Vault Secrets User
+    )
+    principalId: appService.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+```
+
+The application code reads the secret using the managed identity token without any secrets in configuration:
+
+```csharp
+var client = new SecretClient(
+    new Uri($"https://{keyVaultName}.vault.azure.net/"),
+    new DefaultAzureCredential()  // Uses managed identity automatically when running in Azure
+);
+
+KeyVaultSecret secret = await client.GetSecretAsync("ConnectionString");
+```
+
+`DefaultAzureCredential` walks a credential chain — managed identity, environment variables, developer CLI — and uses the managed identity token when running 
+in App Service. No connection strings, no client secrets, no rotation logic in application code.
+
+---
+
+### Federated Identity for GitHub Actions (no secrets in CI/CD)
+
+```bicep
+resource ghActionsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: 'id-github-actions-deploy'
+  location: location
+}
+
+// Federated credential: trust tokens issued by GitHub for this specific repo + branch
+resource federatedCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: ghActionsIdentity
+  name: 'github-main-branch'
+  properties: {
+    audiences: ['api://AzureADTokenExchange']
+    issuer: 'https://token.actions.githubusercontent.com'
+    subject: 'repo:myorg/myrepo:ref:refs/heads/main'  // Scope to specific branch
+  }
+}
+
+// Contributor on the target resource group only (not subscription)
+resource deployRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, ghActionsIdentity.id, 'Contributor')
+  scope: resourceGroup()
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      'b24988ac-6180-42a0-ab88-20f7382dd24c'  // Contributor
+    )
+    principalId: ghActionsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+```
+
+GitHub Actions workflow:
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # Required for OIDC
+      contents: read
+    steps:
+      - uses: azure/login@v1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: az deployment group create ...
+```
+
+No `AZURE_CLIENT_SECRET` in repository secrets. GitHub mints a short-lived OIDC token; Azure exchanges it for an access token. The credential cannot be exfiltrated 
+because it never exists as a static value.
+
+### PIM eligible assignment via Bicep
+
+PIM assignments can and should be codified:
+
+```bicep
+// Eligible (not active) assignment for a subscription Owner role via PIM
+resource pimEligibleAssignment 'Microsoft.Authorization/roleEligibilityScheduleRequests@2022-04-01-preview' = {
+  name: guid(subscription().id, principalId, 'Owner', 'eligible')
+  scope: subscription()
+  properties: {
+    principalId: principalId
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'  // Owner
+    )
+    requestType: 'AdminAssign'
+    scheduleInfo: {
+      expiration: {
+        type: 'AfterDuration'
+        duration: 'P180D'  // Eligible for 180 days; must be renewed
+      }
+    }
+    justification: 'Platform engineering break-glass access'
+  }
+}
+```
+
+---
+
+## 6. Design trade-offs
+
+|Approach                                             |Gains                                                                   |Give up                                                                   |Implicit Acceptance                                      |
+|-----------------------------------------------------|------------------------------------------------------------------------|--------------------------------------------------------------------------|---------------------------------------------------------|
+|Managed Identity (system-assigned)                   |No credential management; autoamatic rotation; native Azure integration |Tied to resource lifecycle; can't be shared                               |Resource must support managed identity                   |
+|Managed Identity (user-assigned)                     |Reusable across resources; services resource replacement                |Slightly more complex lifecycle management                                |Identity sprawl if over-provisioned                      |
+|Service Principal + client secret                    |Works anywhere; compartible with legacy tooling                         |Must rotate secrets; secrets can leak; no IMDS support                    |Secret management burden; rotation gaps are risk windows |
+|Service Principal + OIDC federation                  |No static secrets; works with GitHub Actions, Terraform Cloud           |Requires issuer support slightly more setup                               |Trust boundary is the OIDC provider's security           |
+|Built-in roles only                                  |Simpler governance; no custom role maintenance                          |May require over-granting to cover permission gaps                        |Some actions are boundled that shouldn't be together     |
+|Custom roles                                         |Precise least-privilege enforcement                                     |Maintenance overhead; max 5,000 custom roles per tenant; hard to document |Role catalog must be actively curated                    |
+|PIM for all privileged roles                         |Eliminates standing access; full activation audit trail                 |Adds 2-5 min latency to privilege elevation; requries process change      |Operational teams must adapt workflows                   |
+|Conditional Access with compliant device requirement |Strong posture enforcement                                              |Blocks access from personal or emergency devices                          |Emergency access paths must be explicitly designed       |
+|Scope at Management Group                            |Efficient; single assignment covers all children                        |One misconfiguration has wide blast radius                                |Requires well-structured Management Group hierarchy      |
+|Scope at Resource Group                              |Contained blast radius; easier to audit                                 |More assignments to manage; harder to enforce consistency                 |Role assignment proliferation at scale                   |
+
+
+The right answer for most enterprise estates is: managed identities for all workloads, federated credentials for CI/CD, PIM for privileged human access, built-in 
+roles wherever possible with custom roles for genuine gaps, role assignments scoped as low as the operational model allows.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Assigning `Contributor` as a default for developers
+
+**Why it happens**: It's the path of least resistance. Contributor lets you do nearly everything without giving away role management.
+
+**What it causes**: Contributor allows creating resources outside approved SKUs, modifying network configurations, generating storage keys, and triggering 
+operations with cost and security implications. It also tends to become parmanent.
+
+**How to avoid it**: Define environment-specific roles. In dev, a scoped Contributor at the resource group level with Azure Policy guardrails is acceptable. 
+In staging and production, least-privilege data-plane roles plus read access at the control plane is the baseline.
+
+---
+
+### Using storage account keys instead of RBAC
+
+**Why it happens**: Developers unfamiliar with Azure RBAC data-plane roles fall back to connection strings because they're familiar and work immediately.
+
+**What it causes**: Storage keys grant full access to all data in the account, bypass RBAC entirely, don't carry identity context in audit logs (operations 
+appear as "key-authenticated"), and can be accidentally committed to source control.
+
+**How to avoid it**: Enable `allowSharedKeyAccess: false` on storage accounts in non-legacy environments. This forces all access through identity-based auth. 
+Assign `Storage Blob Data COntributor` or scoped equivalents to the workload's managed identity.
+
+---
+
+### Conflating Entra ID roles with Azure RBAC roles
+
+**Why it happens**: Both are "roles" int the same portal
+
+**What it causes**: Entra ID roles (Global Adminsitrator, User Administrator, etc.) govern the identity plane — who can manage users, groups, and applications 
+in the directory. Azure RBAC roles govern Azure Resources. They are independent systems. A Global Administrator has no Azure resource permissions by default. 
+An Azure Owner has no Entra ID permissions by default. Granting the wrong one achieves nothing and creates confusion during audits.
+
+**How to avoid it**: Document explicitly which governance layer a role operates at. Treat Entra ID roles as even more sensitive than Azure Owner — a Global 
+Administrator can escalate to own any subscription in the tenant.
+
+---
+
+### Not scoping managed identity permissions
+
+**Why it happens**: It's technically easier to assign `Storage Blob Data Contributor` at the subscription level than to figure out which storage account 
+the application actually needs.
+
+**What it causes**: If the workload is compromised, it can access all storage in the subscription. This is an unnecessary blast radius.
+
+**How to avoid it**: Assign data-plane roles at the resource scope. For user-assigned managed identities that serve multiple resources, scope to the 
+resource group, not the subscription.
+
+---
+
+### Treating PIM activation as equivalent to having the role
+
+**Why it happens**: Teams implement PIM but keep activation approval-free with a 24-hours window, removing any practical barrier to privilege use.
+
+**What it causes**: PIM provides the audit trail but not the access control. If all engineers can activate Owner on production without approval and stay elevated 
+for 24 hours, you've added logging without adding governance.
+
+**How to avoid it**: Require approval for Owner and User Access Administrator on production. Set maximum activation duration to 4 hours. Require MFA re-confirmation 
+at activation. For break-glass scenarios, closely monitored account with an alerting rule on any activation.
+
+---
+
+### Not separating environments in the management group hierarchy
+
+**Why it happens**: Easier initial setup; organizations add subscriptions without thinking about MG structure.
+
+**What it causes**: Azure Policy and role assignments at the management group level apply to all child subscriptions. If dev and prod are under the same MG with 
+the same policies, it's impossible to have a looser policy for dev without creating exceptions. More critically, a role assignment at the top MG cascades to production.
+
+**How to avoid it**: Structure management groups by environment or by platform layer before assigning policies or roles at that level. A common pattern: 
+`Root MG → Platform MG → (Connectivity, Identity, Management subscriptions)` and `Root MG → Landing Zones MG → (Corp MG, Online MG) → (Prod sub, Non-prod sub)`.
+
+---
+
+### Legacy applications with application-wide service principal credentials
+
+**Why it happens**: Applicatons pre-date managed identity support or were built on-premises and lifted-and-shifted.
+
+**What it causes**: Shared client secrets that may have been distributed across teams, may not rotate, and generate no per-workload audit trail. If the secret is 
+shared, any audit log entry is atributed to the service principal, not the specific workload or team member who used it.
+
+**How to avoid it**: Audit all service principals with active secrets. For legacy applications that can't adopt managed identity, enforce certificate-based 
+authentication over client secrets. Create a rotation schedule enforced by Azure Policy. Plan migration to managed identity as part of platform modernization work.
+
+---
+
+## 8. Operational and production considerations
+
+### What to monitored
+
+**Entra ID Sign-in logs and Audit logs** are the primary source of truth for identity events. Route these to Log Analytics with at minimum a 90-day hot retention 
+and 1-year archive. These events capture authentication failures, MFA challenges, Conditional Access blocks, and directory changes.
+
+**Azure Activity Log** captures all control-plane operations — role assignments created or deleted, resource creation/deletion, policy assignments. Every 
+subscription's Activity Log should flow to a central Log Analytics workspace in the platform management subscription. Activity Logs have a 90-day retention in 
+Azure natively; anything beyond that requires explicit export.
+
+**PIM audit log** records every eligible assignment change and activation request. This is the primary evidence source for privilege escalation audit trails. 
+Export this to the same Log Analytics workspace.
+
+### Key Sentinel detection rules to activate:
+
+    - Role assignment to sensitive scope (Owner, User Access Administrator at subscription or above)
+    - PIM activation for high-privilege roles
+    - Service principal credential added (new secret or certificate)
+    - Bulk role assignment changes
+    - Global Administrator elevation from PIM
+    - Conditional Access policy modification
+
+### What degrades first
+
+**Access reviews get skipped**. Access reviews in Entra ID require someone to review and act. Under operational pressure, reviews get marked "approved" in bulk 
+without scrutiny, defeating their purpose. Automate reviewer notifications, enforce escalation when reviewers don't respond, and configure "remove access on 
+non-response" for privileged roles.
+
+**Custom role definition drift from intent**. A custom role created to solve a specific problem gets expanded over time as teams discover edge cases. Without 
+a formal change management process for role definition, custom roles accumulate permissions until they're nearly equivalent to Contributor. Version-control 
+all custom role definitions in Bicep or Terraform and require pull request review for changes.
+
+**Managed identity sprawl**. User-assigned managed identities created for specific workloads accumulate. When workloads are retired, the identities and their 
+role assignments are not cleaned up. Implement resource tagging that identifies the owning workload and team, and include managed identity cleanup in workload 
+decommission checklists.
+
+### Operational risks
+
+**Break-glass account management**. Every enterprise estate needs 2-3 break-glass Global Administrator accounts that bypass Conditional Access (specifically 
+the device compliance requirement) to recover from tenant lockout. These accounts must be: cloud-only (no sync from on-premise), monitored with immediate alerting on 
+any sign-in, stored with credentials in physical offline storage, and tested on a scheduled basis. Without them, a Conditional Access misconfiguration can 
+lock out all administrators.
+
+**Token caching**. Managed identity and service principal tokens are cached by the Azure SDK. A role revocation takes effect for new token requests, but 
+existing cahed tokens remain valid until expiration (typically 1 hour). In incident response scenarios, token revocation does not provide immediate access 
+cutoff. For privileged escalation, use PIM's revoke functionality, but understand the cache window.
+
+**Subscription transfer and management group movement**. Moving a subscritpion between management groups change which Azure Policies and role assignments apply 
+to it. This can silently break workloads that depended on inherited permissions. Always test management group transitions in a non-production environment first.
+
+--- 
+
+## 9. When NOT use this
+
+**Single-subscription, small-team environments**. If you have one subscription, two environments, and team of eight engineers, PIM, management group hierachies, 
+and custom roles add operational overhead without proportional risk reduction. Use Conditional Access, require MFA, assign least-privilege built-in roles, and 
+invest the rest of the time building the product.
+
+**Short-lived, isolated environments**. Ephemeral environments created for feature development and destroyed within days don't need the same governance rigor as 
+persistent production environments. Automate creation and destruction, apply baseline policies, but skip access reviews and PIM eligibility for these.
+
+**When the bottleneck is access speed, not access security**. In incident response under active attack, PIM activation adds latency. Pre-activate break-glass 
+roles before the incident window if the threat is known, or accept that break-glass accounts bypass PIM entirely.
+
+**When it would replace application-layer authorization**. Azure RBAC governs who can interact with Azure resources. It is not a substitute for authorization 
+logic inside your application. A user who has `Reader` on a storage account can still be authorized or unauthorized to see specific data depending on your 
+application's own identity model. Don't confuse the infrastructure authorization layer with the application authorization layer.
+
+**When audit requirements don't the overhead**. Some internal tooling and experimental platforms are not in scope for LGPD, ISO 27001, or SOC 2. Applying 
+the full governance model to these increases operational burden without compliance benefit. Maintain a risk register that explicitly categorizes which 
+subscritpions and workloads fall under which compliance scope, and calibrate governance accordingly.
+
+---
+
+## 10. Key takeaways
+
+    - **Managed Identity is the default for all Azure-native workloads**. If a service runs in Azure and needs to call another Azure service, there is no 
+    justification for a client secret. The question is system-assigned (sufficient for single-resource workloads) vs. user-assigned (necessary when the identity 
+    must persist across resource replacement or be shared across multiple resources).
+
+    - **Control-plane and data-plane permissions are independent**. An identity with `Owner` on a Key Vault cannot read secrets without also having 
+    `Key Vault Secret User`. Designing access for a workload requires explicitly assigning both layers. Missing either one is a support ticket waiting to happen.
+
+    - **Scope assignments as low as they can go while remaining operationally feasible**. The management group scope is not a shortcut — it's a mechanism for 
+    policies and cross-subscription governance, not for granting workload access. Most workload role assignments should be at the resource group or resource scope.
+
+    - **PIM without approval workflows is logging, not governance**. Configuring a role as eligible but allowing self-activation without approval eliminates standing 
+    access but not unchecked privilege use. Define which roles require approval what the maximum activation duration is, and who the approvers are before rolling out 
+    PIM to production.
+
+    - **The federated workload identity (OIDC) pattern eliminates CI/CD secrets entirely. GitHub Actions, Azure DevOps (with Workload Identity Federation), and 
+    Terraform Cloud all support OIDC-based authentication. There is no reason for a `AZURE_CLIENT_SECRET` in a modern CI/CD pipeline deploying to Azure. The 
+    migration cost is low and the risk reduction is signinficant.
+
+    - **Access governance must be designed before scale, not after**. The management group hierarchy, the role assignment model, the PIM eligibility structure, 
+    and the Conditional Access baseline are expensive to retrofit into an estate that has grown without them. Invest in the governance model at the point where 
+    you add the second production subscritpion, not the twelfth.
+
+    - **The audit trail is only valuable if it's retained, queryable, and monitored**. Exporting Entra ID audit logs, Activity Logs, and PIM logs to Log Analytics 
+    is table stakes. The operational value comes from detection rules in Sentinel, scheduled access reviews, and the ability to reconstruct who had what access on 
+    a specific date — not from the raw log export itself.
+
+---
+
+
+## 11. High-Level Overview
+
+> Visual representation of the end-to-end Azure access governance flow, highlighting Entra ID authentication, Conditional Access evaluation, RBAC scope inheritance, control-plane and data-plane authorization boundaries, PIM-based privilege elevation, workload identity usage, and centralized audit traceability with explainable access decisions.
+
+import Light from './_assets/azure-access-governance-light.svg';
+import Dark from './_assets/azure-access-governance-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Azure Access Governance"
+  height={560}
+/>
