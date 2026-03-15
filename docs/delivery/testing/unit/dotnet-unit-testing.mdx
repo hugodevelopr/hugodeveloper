@@ -1,0 +1,1002 @@
+---
+id: dotnet-unit-testing
+title: .NET Unit Testing
+slug: /delivery/testing/unit/dotnet-unit-testing
+description: Deep dive into .NET unit testing covering xUnit, mocking strategies, deterministic tests, EF Core isolation, and maintainable test architecture.
+sidebar_label: .NET Unit Testing
+keywords: [dotnet unit testing, xunit testing, mocking strategies, ef core testing, deterministic tests]
+sidebar_position: 10
+---
+
+
+## 1. What this document is about
+
+This document addresses the design, implementation, and long-term maintenance of **unit tests in production-grade .NET systems**. It covers how to structure 
+a test suite that remains reliable, fast, and maintainable as a codebase grows — not just how to write indivudal test methods.
+
+**Applies to:**
+
+    - Applications following Clean Architecture, DDD, or Ports & Adapters
+    - Modular monoliths and microservices with non-trivial business logic
+    - Systems where test quality degrades over time due to coupling, flakiness, or poor isolation
+    - CI/CD pipelines where test speed and determinism are operational constraints
+
+**Does not cover:**
+
+    - End-to-end browser or UI testing (e.g., Selenium, Playwright)
+    - Load and performance testing (e.g., JMeter, k6)
+    - Contract testing between services (e.g., Pact)
+    - Integration tests in depth — though boundaries between unit and integration testing are discussed explicitly
+
+The line between a unit test and an integration test is architectural, not syntactic. This document treats that boundary as a deliberate design decision, 
+not an accident of tooling.
+
+---
+
+## 2. Why this matters in real systems
+
+### The accretion problem
+
+In most long-lived codebases, test quality degrades in proportion to the speed of feature delivery — not due to malice, but due to accumulated shortcuts. 
+Tests get written under time pressure, coupling to implementation details instead of behavior. Over time the suite becomes:
+
+    - **Slow** — hundreds of milliseconds per test due to unnecessary I/O, EF Core startup, or container spin-up
+    - **Fragile** — a single internal refactor breaks dozens of tests that weren't testing externally visible behavior
+    - **Misleading** — green builds that don't catch real regressions, or red builds caused by test infrastructure failures rather than code defects
+
+### When simpler approaches stop working
+
+**The "just mock everything" approach**. Mocking every dependency produces tests that are strongly coupled to method signatures rather than behavior. A 
+refactor that preserves all behavior but changes an internal method call breaks the test. The test was testing the implementation, not the system.
+
+**The "no tests at all" risk**. In high-scale systems, the cost of regression is measured in SLA violations and incident response, not in development time. 
+The question isn't whether to test, but how to test in a way that provides signal without becoming a maintenance burden.
+
+**EF Core and data layer pain**. Teams often write unit tests that spin up `InMemoryDatabase` or real SQLLite instances per-test. This is neither pure unit 
+testing nor reliable integration testing. It's the worst: slow, with different semantics from SQL Server in edge cases.
+
+### System pressures that force this conversation
+
+    - A suite that takes 8 minutes to run locally and 30 minutes in CI because half the tests start real databases or containers
+    - Flaky tests that fail 1-2% of the time due to non-deterministic data generation or timing
+    - Domain logic buried in service classes that are impossible to test without standing up an HTTP server
+    - Test code that has no owner and is treated as second-class — leading to copy-past test factories, stale test data, and zero assertions on failure paths
+---
+
+## 3. Core concept (mental model)
+
+### Tests as specifications, not verifications
+
+The most userful mental model for unit testing is the **specification model**: a test is not primarily a tool for catching bugs. It is a machine-readable 
+specification of how a unit of behavior is supposed to work under defined conditions.
+
+This reframing has concrete consequences:
+
+    - You write tests before or alongside code, not after
+    - You name tests in terms of behavior, not implementation
+    - You treat a failing test as a specificatoion violation, not just a "bug"
+    - You keep tests stable through refactoring because they describe _what_, not _how_
+
+### The three zones of a test
+
+Every well-structured test occupies exactly three zones:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  ARRANGE   │  Set up preconditions and dependencies             │
+│            │  What state is the world in before the action?     │
+├─────────────────────────────────────────────────────────────────┤
+│  ACT       │  Execute the unit under test                       │
+│            │  Exactly one call, one observable effect           │
+├─────────────────────────────────────────────────────────────────┤
+│  ASSERT    │  Verify the outcome                                │
+│            │  Observable behavior only, not internal state      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+If the Arrange section grows beyond ~10 lines, the unit under test has too many dependencies, or the test is attempting to cover too many behaviors in one case.
+
+If the Assert section is verifying internal method calls rather than outputs or state transitions, the test is coupled to the implementation.
+
+### The isolation spectrum
+
+Unit tests exist on a spectrum of isolation, not at a single fixed point:
+
+```
+Pure unit test                                        Integration test
+     │                                                      │
+     ▼                                                      ▼
+[domain logic]──[service + mocks]──[service + fakes]──[full stack]
+ No I/O           Moq/NSubstitute     In-process          HTTP +
+ Pure functions   boundary tests      implementations      real DB
+```
+
+The correct position on this spectrum depends on **what you're testing**, not on a team policy. Domain logic belongs at the far left. HTTP pipelines behavior 
+belongs at the right. Most tests for application services belong in the middle — with real domain objects and mocked infrastructure ports.
+
+---
+
+## 4. How it works (step-by-step)
+
+### Step 1 — Identity the unit
+
+The work "unit" is the source of most confusion in testing discussions. A unit is not a class. It is **a cohesive piece of observable behavior**. In a 
+DDD-style codebase, a unit is typically:
+
+    - An aggregate operation (e.g., Order `.AddItem(product, quantity)`)
+    - A domain service computation (e.g., `ShippingCostCalculator.Calculate(order)`)
+    - An application service workflow, isolated at infrastructure boundaries (e.g., `PlaceOrderHandler.Handle(command)` with all dependencies mocked)
+
+The unit test boundary is drawn at **the public interface of the behavior**, not at the class boundary. Testing every private method is testing internals — 
+it produces fragile tests with no value.
+
+---
+
+### Step 2 — Identity dependencies
+
+For each unit, classify its dependencies:
+
+|Dependency Type                                            |Strategy                                             |
+|-----------------------------------------------------------|-----------------------------------------------------|
+|Pure domain objects (entities, value objects)              |Instantiate directly, no mocking                     |
+|In-process services with stable contracts                  |Real implementations with controlled state           |
+|External services (email, payment gateways, queues)        |Stub or mock at the port interface                   |
+|Time, randomness, system clock                             |Inject abstractions (`ISystemClock`, `TimeProvider`) |
+|Database and file systems                                  |Use in-memory fakes or mocks, avoid real I/O         |
+
+**Never mock what you own directly**. Mock the boundaries between your system and external systems. Domain models, value objects, and aggregate roots should 
+never be mocked.
+
+---
+
+### Step 3 — Design the test data
+
+Test data is not an afterthought. Poor test data is the leading cause of:
+
+    - Tests that don't cover edge cases or failure paths
+    - Tests that fail for unrelated reasons (null reference, invalid state)
+    - Tests with meaningless names because the inputs have no semantic meaning 
+
+Good test data strategies:
+
+    - Use **builders** for domain objects with complex construction requirements
+    - Use **AutoFixture** or similar libraries for filling in irrelevant fields
+    - Use **Bogus** for generating realistic but deterministic fake data
+    - Seed randomness with a fixed value when randomness is needed
+
+---
+
+### Step 4 — Structure the test project
+
+A test project layout that scales:
+
+```
+src/
+  MyApp.Domain/
+  MyApp.Application/
+  MyApp.Infrastructure/
+  MyApp.Api/
+tests/
+  MyApp.Domain.Tests/           # Pure domain logic
+  MyApp.Application.Tests/      # Application services, mocked infra
+  MyApp.Integration.Tests/      # Real I/O, Testcontainers, scoped per run
+  MyApp.Architecture.Tests/     # NetArchTest rules
+  MyApp.TestCommon/             # Shared builders, fakes, fixtures
+```
+
+The `TestCommon` project is not optional in a large codebase. It prevents copy-paste of test infrastructure across projects and establishes a consistent 
+object-creation vocabulary.
+
+---
+
+### Step 5 — Write the test
+
+Apply the following invariants to every test:
+
+    1. **One assertion per test** is a guideline, not a law. It means: one _logical assertion_. Multiple `Assert.That` calls that all verify the same outcome are fine.
+    2. **Test names describe behavior**, not implementation. `PlaceOrder_WhenProductIsOutOfStock_ShouldThrowDomainException` not `PlaceOrderTest3`.
+    3. **No logic in tests** — no `if`, no `for`, no `try/catch` in the test method body. If you need logic, you need more test cases.
+    4. **Deterministic inputs** — no `DateTime.Now`, no `Guid.NewGuid()` without injection, no random data without a seed.
+    5. **Isolated** — no shared mutable state between tests, Each test builds its own world.
+
+---
+
+### Step 6 — Run in CI with coverage gates
+
+Configure Coverlet with a minimum coverage threshold per project, not a global threshold. Global thresholds hide gaps:
+
+```xml
+<!-- In .csproj or Directory.Build.props -->
+<PropertyGroup>
+  <CollectCoverage>true</CollectCoverage>
+  <CoverletOutputFormat>cobertura</CoverletOutputFormat>
+  <Threshold>80</Threshold>
+  <ThresholdType>branch</ThresholdType>
+  <ThresholdStat>minimum</ThresholdStat>
+</PropertyGroup>
+```
+
+Branch coverage is more meaningful than line coverage. A line with `if` can be 100% line-covered but 50% branch-covered if the test only covers one path.
+
+---
+
+## 5. Minimal but realistic example (.NET)
+
+### 5.1 Domain Logic — No mocks required
+
+```csharp
+// Domain aggregate
+public class Order
+{
+    private readonly List<OrderLine> _lines = new();
+    public IReadOnlyList<OrderLine> Lines => _lines.AsReadOnly();
+    public OrderStatus Status { get; private set; } = OrderStatus.Draft;
+
+    public void AddItem(Product product, int quantity)
+    {
+        if (Status != OrderStatus.Draft)
+            throw new DomainException("Cannot modify a confirmed order.");
+
+        if (quantity <= 0)
+            throw new DomainException("Quantity must be positive.");
+
+        var existing = _lines.FirstOrDefault(l => l.ProductId == product.Id);
+        if (existing is not null)
+            existing.IncreaseQuantity(quantity);
+        else
+            _lines.Add(new OrderLine(product.Id, product.Price, quantity));
+    }
+}
+
+// Tests — no framework, no mocks, no containers
+public class OrderTests
+{
+    [Fact]
+    public void AddItem_WhenOrderIsDraft_ShouldAppendLine()
+    {
+        var order = new Order();
+        var product = ProductBuilder.AProduct().WithPrice(Money.Of(10m, "USD")).Build();
+
+        order.AddItem(product, 2);
+
+        order.Lines.Should().ContainSingle(l =>
+            l.ProductId == product.Id && l.Quantity == 2);
+    }
+
+    [Fact]
+    public void AddItem_WhenProductAlreadyExists_ShouldAccumulateQuantity()
+    {
+        var order = new Order();
+        var product = ProductBuilder.AProduct().Build();
+
+        order.AddItem(product, 1);
+        order.AddItem(product, 3);
+
+        order.Lines.Should().ContainSingle(l => l.Quantity == 4);
+    }
+
+    [Fact]
+    public void AddItem_WhenOrderIsConfirmed_ShouldThrowDomainException()
+    {
+        var order = OrderBuilder.AConfirmedOrder().Build();
+        var product = ProductBuilder.AProduct().Build();
+
+        var act = () => order.AddItem(product, 1);
+
+        act.Should().Throw<DomainException>()
+           .WithMessage("*confirmed order*");
+    }
+}
+```
+
+**What to observe**: No framework setup. No mocks. Fast enough that 10,000 tests like this run in under 2 seconds. The builder pattern keeps construction 
+readable and change-tolerant.
+
+---
+
+### 5.2 Application Service — Mocking infrastructure ports
+
+```csharp
+// Application service
+public class PlaceOrderHandler
+{
+    private readonly IOrderRepository _orders;
+    private readonly IProductRepository _products;
+    private readonly IEventBus _events;
+
+    public PlaceOrderHandler(
+        IOrderRepository orders,
+        IProductRepository products,
+        IEventBus events)
+    {
+        _orders = orders;
+        _products = products;
+        _events = events;
+    }
+
+    public async Task<OrderId> Handle(PlaceOrderCommand command, CancellationToken ct)
+    {
+        var product = await _products.GetByIdAsync(command.ProductId, ct)
+            ?? throw new NotFoundException($"Product {command.ProductId} not found.");
+
+        var order = new Order();
+        order.AddItem(product, command.Quantity);
+
+        await _orders.SaveAsync(order, ct);
+        await _events.PublishAsync(new OrderPlacedEvent(order.Id), ct);
+
+        return order.Id;
+    }
+}
+
+// Test — NSubstitute for infrastructure, real domain objects
+public class PlaceOrderHandlerTests
+{
+    private readonly IOrderRepository _orders = Substitute.For<IOrderRepository>();
+    private readonly IProductRepository _products = Substitute.For<IProductRepository>();
+    private readonly IEventBus _events = Substitute.For<IEventBus>();
+    private readonly PlaceOrderHandler _sut;
+
+    public PlaceOrderHandlerTests()
+    {
+        _sut = new PlaceOrderHandler(_orders, _products, _events);
+    }
+
+    [Fact]
+    public async Task Handle_WhenProductExists_ShouldPersistOrderAndPublishEvent()
+    {
+        var product = ProductBuilder.AProduct().WithStock(10).Build();
+        var command = new PlaceOrderCommand(product.Id, Quantity: 2);
+
+        _products.GetByIdAsync(product.Id, Arg.Any<CancellationToken>())
+                 .Returns(product);
+
+        var orderId = await _sut.Handle(command, CancellationToken.None);
+
+        await _orders.Received(1).SaveAsync(
+            Arg.Is<Order>(o => o.Id == orderId), Arg.Any<CancellationToken>());
+
+        await _events.Received(1).PublishAsync(
+            Arg.Is<OrderPlacedEvent>(e => e.OrderId == orderId), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task Handle_WhenProductNotFound_ShouldThrowNotFoundException()
+    {
+        _products.GetByIdAsync(Arg.Any<ProductId>(), Arg.Any<CancellationToken>())
+                 .Returns((Product?)null);
+
+        var act = async () => await _sut.Handle(
+            new PlaceOrderCommand(ProductId.New(), Quantity: 1), CancellationToken.None);
+
+        await act.Should().ThrowAsync<NotFoundException>();
+        await _orders.DidNotReceive().SaveAsync(Arg.Any<Order>(), Arg.Any<CancellationToken>());
+    }
+}
+```
+
+**What to observe**: Infrastructure is mocked at the interface boundary. Domain objects are real. The test verifies behavior (what was saved, 
+what was published) not implementation details. The test is fast and deterministic, with no external dependencies.
+
+---
+
+### 5.3 Builder Pattern for Test Data
+
+```csharp
+public class OrderBuilder
+{
+    private OrderStatus _status = OrderStatus.Draft;
+    private List<(Product product, int quantity)> _items = new();
+
+    public static OrderBuilder AnOrder() => new();
+
+    public static OrderBuilder AConfirmedOrder() =>
+        new OrderBuilder().WithStatus(OrderStatus.Confirmed);
+
+    public OrderBuilder WithStatus(OrderStatus status)
+    {
+        _status = status;
+        return this;
+    }
+
+    public OrderBuilder WithItem(Product product, int quantity = 1)
+    {
+        _items.Add((product, quantity));
+        return this;
+    }
+
+    public Order Build()
+    {
+        var order = new Order();
+        foreach (var (product, qty) in _items)
+            order.AddItem(product, qty);
+
+        if (_status == OrderStatus.Confirmed)
+            order.Confirm();
+
+        return order;
+    }
+}
+```
+
+Builder are the single most impactful pattern for test maintainability at scale. When the `Order` constructor changes, you update one place — not 200 tests methods.
+
+---
+
+### 5.4 Deterministic Time
+
+```csharp
+// Production code uses injected TimeProvider (.NET 8+)
+public class SubscriptionService
+{
+    private readonly TimeProvider _time;
+
+    public SubscriptionService(TimeProvider time) => _time = time;
+
+    public bool IsActive(Subscription sub) =>
+        sub.ExpiresAt > _time.GetUtcNow();
+}
+
+// Tests use FakeTimeProvider from Microsoft.Extensions.TimeProvider.Testing
+[Fact]
+public void IsActive_WhenSubscriptionHasExpired_ShouldReturnFalse()
+{
+    var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+    var sut = new SubscriptionService(clock);
+    var sub = new Subscription(ExpiresAt: clock.GetUtcNow().AddDays(-1));
+
+    sut.IsActive(sub).Should().BeFalse();
+}
+
+[Fact]
+public void IsActive_WhenSubscriptionIsValid_ShouldReturnTrue()
+{
+    var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+    var sut = new SubscriptionService(clock);
+    var sub = new Subscription(ExpiresAt: clock.GetUtcNow().AddDays(30));
+
+    sut.IsActive(sub).Should().BeTrue();
+}
+```
+---
+
+### 5.5 AutoFixture for Irrelevant Properties
+
+```csharp
+// When you need a fully populated object but don't care about most fields
+public class CustomerRegistrationHandlerTests
+{
+    private readonly IFixture _fixture = new Fixture()
+        .Customize(new AutoNSubstituteCustomization());
+
+    [Fact]
+    public async Task Handle_WhenEmailIsAlreadyTaken_ShouldThrowConflictException()
+    {
+        var command = _fixture.Build<RegisterCustomerCommand>()
+            .With(c => c.Email, "taken@example.com")  // control what matters
+            .Create();                                 // generate rest randomly
+
+        var repo = _fixture.Freeze<ICustomerRepository>();
+        repo.ExistsByEmailAsync("taken@example.com", Arg.Any<CancellationToken>())
+            .Returns(true);
+
+        var sut = _fixture.Create<CustomerRegistrationHandler>();
+
+        await FluentActions.Awaiting(() => sut.Handle(command, CancellationToken.None))
+            .Should().ThrowAsync<ConflictException>();
+    }
+}
+```
+
+AutoFixture removes the boilerplate of building irrelevant data. The test communicates clearly which fields are semantically meaningful by explicitly 
+specifying only those.
+
+---
+
+### 5.6 Theory-Based Tests with xUnit
+
+```csharp
+public class MoneyTests
+{
+    [Theory]
+    [InlineData(100, 0.1, 110)]
+    [InlineData(200, 0.5, 300)]
+    [InlineData(0,   0.25, 0)]
+    public void Add_WithTax_ShouldReturnCorrectTotal(
+        decimal base_, decimal taxRate, decimal expected)
+    {
+        var money = Money.Of(base_, "USD");
+        var result = money.AddTax(taxRate);
+        result.Amount.Should().Be(expected);
+    }
+
+    public static IEnumerable<object[]> InvalidAmounts => new[]
+    {
+        new object[] { -1m },
+        new object[] { decimal.MinValue },
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidAmounts))]
+    public void Of_WithNegativeAmount_ShouldThrow(decimal amount)
+    {
+        var act = () => Money.Of(amount, "USD");
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
+}
+```
+
+---
+
+### 5.7 Testing EF Core with SQLite (In-Memory Integration Tests)
+
+```csharp
+// Use this for integration-level repository tests, not unit tests
+public class OrderRepositoryTests : IAsyncLifetime
+{
+    private AppDbContext _context = null!;
+    private OrderRepository _sut = null!;
+
+    public async Task InitializeAsync()
+    {
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseSqlite("DataSource=:memory:")
+            .Options;
+
+        _context = new AppDbContext(options);
+        await _context.Database.EnsureCreatedAsync();
+        _sut = new OrderRepository(_context);
+    }
+
+    public async Task DisposeAsync() => await _context.DisposeAsync();
+
+    [Fact]
+    public async Task SaveAsync_ShouldPersistOrderWithLines()
+    {
+        var order = OrderBuilder.AnOrder()
+            .WithItem(ProductBuilder.AProduct().Build(), 2)
+            .Build();
+
+        await _sut.SaveAsync(order, CancellationToken.None);
+        await _context.SaveChangesAsync();
+
+        var loaded = await _sut.GetByIdAsync(order.Id, CancellationToken.None);
+        loaded.Should().NotBeNull();
+        loaded!.Lines.Should().HaveCount(1);
+    }
+}
+```
+
+This is an integration test wearing unit test clothes. It belongs in `MyApp.Integration.Tests`, not `MyApp.Application.Tests`. 
+The distinction matters because integration tests should be allowed to run slower and require infrastructure setup.
+
+---
+
+## 6. Design trade-offs
+
+### Mocking strategies
+
+|Aproach                             |Gains                                    |Gives up                                    |Implicit acceptance                        |
+|------------------------------------|-----------------------------------------|--------------------------------------------|-------------------------------------------|
+|Mock everything (Moq/NSubstitute)   |Fast, islated, no I/O                    |Tests coupled to method signatures          |You trust the mock matches real behavior   |
+|Fakes (hand-codes in memory implis) |Stable interfaces, realistic behavior    |Upfront investment, maintenance             |You own the fake's correctness             |
+|Real infra (SQLite, Testcontainers) |High confidence, real semantics          |Slow, infra dependencies in CI              |Your CI can provision infrastructure       |
+|No mocking (pure domain)            |Zero coupling, maximum speed             |Only works for logic without side effects   |Domain logic is properly isolated          |
+
+The correct answer is **all of the above in their proper zoner**, not a single strategy applied uniformly.
+
+---
+
+### Test pyramid vs honeycomb
+
+The classic pyramid (many unit, some integration, few E2E) is sound for applications with rich domain logic. It breaks down for systems that are primarily 
+data-flow orchestration (e.g., CRUD services wrapping a database) where there is little domain logic to unit test.
+
+```
+Classic pyramid              Integration-heavy
+(DDD / rich domain)          (thin CRUD services)
+
+       /\                          /\
+      /E2E\                       /E2E\
+     /──────\                    /──────\
+    /Integr. \                  /Integr. \
+   /────────── \               /────────── \
+  /  Unit tests  \            /  Unit tests  \
+ /________________\          /________________\
+  Many unit tests             Fewer unit tests
+  (domain logic)              (not much to test)
+```
+
+For microservices with thin orchestration layers and most complexity at integration points, an integration-first test strategy with Testcontainers is often 
+more honest than forcing unit tests that mock away everything meaningful.
+
+---
+
+### Test doubles taxonomy
+
+|Dobule type          |Definition                                         |When to use                                        |
+|---------------------|---------------------------------------------------|---------------------------------------------------|
+|Stub                 |Returns fixed values, no behavior verification     |You only need controlled input from a dependency   |
+|Mock                 |Verifies interactions (call count,args)            |You need to assert side effect                     |
+|Fake                 |Simplified real implementation (in memory repo)    |You want realistic behavior without infrastructure |
+|Spy                  |Records calls for later verification               |Post-hoc verification of complex interactions      |
+|Dummy                |Placeholder satisfying a constructor, never called |Required by signature but irrelavant to this test  |
+
+Using `Moq` ir `NSubstitute` for everything produces implicit mocks when you only need stubs — which makes test intent harder to read.
+
+---
+
+## 7. Common mistakes and misconceptions
+
+### Mocking domain objects
+
+**Why it happens**: Teams apply mocking uniformly across all types.
+
+**What it causes**: Domain behavior is bypassed entirely. Tests pass because the mock says the order is valid, not because the real domain logic is correct.
+
+**How to avoid**: Never mock types you own at the domain layer. Instantiate them. If instantiation is painful, the problem is the domain model's design, not the test.
+
+---
+
+### One test class per production class
+
+**Why it happens**: This is the default template behavior in most IDE plugins.
+
+**What it causes**: A 500-line  `OrderServiceTests.cs` that has no coherent structure. Tests become disorganized rapidly.
+
+**How to avoid**: Organize tests by **behavior and scenario**, not by class. `PlaceOrderTests`, `CancelOrderTests`, `ApplyDiscountTests` — each 
+can span multiple classes internally.
+
+---
+
+### Asserting return values from void methods
+
+**Why it happens**: Engineers want to verify side effects but use the wrong assertion strategy.
+
+**What it causes**: Tests verify mock interaction counts that are meaningless (veryfying `_repo.SaveAsync()` was called once tells you nothing about weather 
+the right data was saved).
+
+**How to avoid**: Use Argument Captors or In-Memory fakes to assert on what was passed, not just _that_ it was called.
+
+```csharp
+// Weak — verifies call count only
+_repository.Received(1).SaveAsync(Arg.Any<Order>(), Arg.Any<CancellationToken>());
+
+// Better — verifies the content of what was saved
+await _repository.Received(1).SaveAsync(
+    Arg.Is<Order>(o => o.Status == OrderStatus.Confirmed && o.Lines.Count == 2),
+    Arg.Any<CancellationToken>());
+```
+
+---
+
+### Non-deterministic test data
+
+**Why it happens**: `DateTime.Now`, `Guid.NewGuid()`, and random generators are called inline.
+
+**What it causes**: Flaky tests that fail on specific dates, specific GUIDs, that don't parse, or random data that violates domain invariants 0.1% of the time.
+
+**How to avoid**:
+
+    - Inject `TimeProvider` everywhere time is needed
+    - Use fixed GUIDs in tests or deterministic ID generation
+    - Seed Bogus `Faker` with a fixed seed in test context
+
+```csharp
+// Bogus with deterministic seed
+var faker = new Faker("en") { Random = new Randomizer(seed: 42) };
+```
+
+---
+
+### Testing infrastructure in unit tests
+
+**Why it happens**: EF Core's `UseInMemoryDatabase` looks convenient for testing repositories, so teams use it in unit tests.
+
+**What it causes**: Slow test runs, tests that pass with in-memory semantics but fail against real SQL Server (no FK constraints, LINQ translation differences, 
+no transactions).
+
+**How to avoid**: Mock at the repository for unit tests. Use real SQLite or Testcontainers for integration tests. Never use `InMemoryDatabase` for production-relevant 
+schema testing.
+
+---
+
+### Shared state in test classes
+
+**Why it happens**: Static shared fixtures for performance, or `[ClassFixture]` misused.
+
+**What it causes**: Test isolation breaks. Test A leaves state that causes Test B to fail. Failures become order-dependent and non-reproducible locally.
+
+**How to avoid**: Each test its own instance of all mocks. Use `IClassFixture` only for expensive infrastructure (containers, HTTP clients) that is truly 
+read-only from the test's perpective. Use `Respawn` to reset database state between integration tests.
+
+---
+
+### Over-reliance on `[Fact]` for parametric behavior
+
+**Why it happens**: `[Theory]` with `[InlineData]` is unfamilar to some engineers.
+
+**What it causes**: 15 near-identical test methods that differ only in input values, maintained separately.
+
+**How to avoid**: Use `[Theory]` with `[InlineData]`, `[MemberData]`, or `[ClassData]` for any behavior that should hold across a range of inputs. Reserve 
+`[Fact]` for scenarios where context cannot be expressed as simple parameters.
+
+---
+
+### Treating 100% coverage as a quality signal
+
+**Why it happens**: Coverage metrics are visible in CI, and executives like percentages.
+
+**What it causes**: Engineers write trivial tests to hit a coverage number. Tests that execute code without asserting anything. High coverage with zero 
+bug-catching value.
+
+**How to avoid**: Require branch coverage thresholds at the _domain_ project only. Accept lower coverage in infrastructure adapters and API controllers. 
+Coverage measures what was executed, not what was verified.
+
+---
+
+### Giant test method with multiple ACT phases
+
+**Why it happens**: Engineers write "scenario tests" that simulate a full workflow.
+
+**What it causes**: When the test fails, you don't know which of the three Act phases causes it. The failure message is ambiguous. The test is effectively an 
+integration test with no infrastructure isolation.
+
+**How to avoid**: One Act per test method. If you need to test a workflow, test each step's outcome independently, then write a higher-level integration 
+test for the end-to-end scenario.
+
+---
+
+## 8. Operational and production considerations
+
+### Test execution time in CI
+
+In a medium-to-large codebase (500+ tests), execution time becomes an operational concern. Targets worth enforcing:
+
+|Test category                                   |Target per test  |Total budget for project  |
+|------------------------------------------------|-----------------|--------------------------|
+|Domain unit tests                               |&lt; 5ms         |&lt; 2s                   |
+|Application service tests (with mocks)          |&lt; 20ms        |&lt; 10s                  |
+|SQLite integration tests                        |&lt; 200ms       |&lt; 60s                  |
+|Testcontainers integration tests                |&lt; 500ms       |&lt; 3 min (parallel)     |
+
+Enforce these with `[assembly: Parallelize(Workers = Environment.ProcessorCount, Scope = ParallelScope.All)]` in xUnit and separate pipeline stages 
+for integration tests.
+
+---
+
+### Parallelism hazards
+
+xUnit runs test classes in parallel by default. This is safe for unit tests with no shared state. It is dangerous for:
+
+    - Tests that write to static state
+    - Tests that modify the working directory
+    - Tests that share a database connection without isolation
+
+```csharp
+// Disable parallelism for a specific test class that shares state
+[Collection("DatabaseCollection")]
+public class MyIntegrationTests { ... }
+
+[CollectionDefinition("DatabaseCollection", DisableParallelization = true)]
+public class DatabaseCollectionDefinition { }
+```
+
+For integration tests sharing a Testcontainer, use `ICollectionFixture<T>` to start the container once and `Respawn` to reset state between tests.
+
+---
+
+### Flaky test detection and management
+
+Flaky tests — tests that fail intermittently — are more damaing than no tests. They erode trust in the suite and cause engineers to re-run pipelines rather than 
+investigate failures.
+
+Common sources of flakiness in .NET test suites:
+
+|Source                                 |Symptom                                                           |Fix                                                         |
+|---------------------------------------|------------------------------------------------------------------|------------------------------------------------------------|
+|`DateTime.Now`                         |Fails at midnight, month-end                                      |Inject `TimeProvider`                                       |
+|Unordered collections                  |`Should().Contain()` passes but `ContainInOrder()` is incosistent |Use `BeEquivalentTo()` with correct ordering options        |
+|Async races                            |`Task.Delay`, polling in tests                                    |Use `WaitAndRetry` with Polly in integration tests only     |
+|Port conflicts in Testcontainers       |`SocketException` on container start                              |Use dynamic port allocation                                 |
+|In-memory database shared across tests |Second test sees first test's data                                |Reset with `EnsureDeleted` / `EnsureCreated` or Respawn     |
+
+Track flaky trests explicitly, A test that fails once in 50 runs is a ticking time bomb.
+
+---
+
+### Coverage reporting in CI
+
+Configure Coverlet + ReportGenerator in the pipeline to produce HML reports and cobertura format for SonarCloud or Azure DevOps:
+
+```yaml
+# GitHub Actions snippet
+- name: Run tests with coverage
+  run: dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
+
+- name: Generate coverage report
+  run: |
+    dotnet tool install -g dotnet-reportgenerator-globaltool
+    reportgenerator \
+      -reports:coverage/**/coverage.cobertura.xml \
+      -targetdir:coverage/report \
+      -reporttypes:Html;Cobertura
+```
+
+Set branch-level thresholds per project, not a single global threshold. The domain project should be high (>85% branch coverage). The infrastructure adapters 
+may legitimately be lower.
+
+---
+
+### Architecture test enforcement
+
+Use `NetArchTest` to enforce architectural invariants automatically:
+
+```csharp
+[Fact]
+public void DomainLayer_ShouldNotDependOnInfrastructure()
+{
+    var result = Types.InAssembly(typeof(Order).Assembly)
+        .ShouldNot()
+        .HaveDependencyOn("MyApp.Infrastructure")
+        .GetResult();
+
+    result.IsSuccessful.Should().BeTrue(
+        because: "domain layer must not depend on infrastructure");
+}
+
+[Fact]
+public void ApplicationServices_ShouldNotDependOnEfCore()
+{
+    var result = Types.InAssembly(typeof(PlaceOrderHandler).Assembly)
+        .ShouldNot()
+        .HaveDependencyOn("Microsoft.EntityFrameworkCore")
+        .GetResult();
+
+    result.IsSuccessful.Should().BeTrue();
+}
+```
+
+Architecture test catch violations at the PR level, before they accumulate into structural debt.
+
+---
+
+### Mutation testing
+
+Coverage metrtics tell you what code was executed. Mutation testing tells you whether your tests would catch a change. `Stryker .NET` is the .NET standard:
+
+```bash
+dotnet tool install -g dotnet-stryker
+cd tests/MyApp.Domain.Tests
+dotnet stryker --project "../../src/MyApp.Domain/MyApp.Domain.csproj"
+```
+
+A mutation score of &lt;60% in domain code is a strong signal that tests are executing code without asserting meaningful outcomes. Run mutation testing on 
+the domain project at minimum, ideally in a weekly CI job rather than per-commit (mutation testing is slow).
+
+---
+
+## 9. When NOT to use this
+
+### CRUD services with no domain logic
+
+If a class literaly reads from a repository and returns the result, there is nothing to unit test. A unit test would just verify that `_repo.GetById()` was 
+called — which tests the mock, not the system. Write an integration test against a real database instead.
+
+---
+
+### Thin adapters and mappers
+
+AutoMapper configuration and EF Core mapping fluent APIs are best verified through integration tests. Unit tests that mock EF Core to verify a mapping 
+configuration are circular and provide no value.
+
+---
+
+### Generated code
+
+Do not test code generated by source generators, scaffolding, or T4 templates. Test the generator's logic, or test the generated code's behavior through 
+integration tests.
+
+---
+
+### Configuration validation
+
+Startup configuration validation (`IOptions<T>` with `[Required]` attributes) should be tested via `WebApplicationFactory` in an integration test, not 
+mocked in unit tests. The registration pipeline is what matters.
+
+---
+
+### Infrastructure-heavy pipelines
+
+ASP.NET Core middleware, authentication handlers, and request pipeline behavior require the full HTTP pipeline to test meaningfully. Use 
+`WebApplicationFactory<TProgra>` with an in-memory server. Attempting to unit test middleware logic by mocking `HttpContext` produces brittle, low-confidence tests.
+
+---
+
+### Frameworks and libraries themselves
+
+Do not write tests that verify that `JsonSerializer.Deserialize<T>()` returns the correct type, or that `List<T>.Add()` increases count by one. Test your 
+code's behavior, not the framework.
+
+---
+
+## 10. Key takeaways
+
+    - **A unit test is a specification of behavior, not a verification of implementation.** Write tests that survive refactoring. If your tests break when 
+    you rename an internal method they are testing the wrong thing.
+
+    - **Draw the mock boundary at infrastructure ports, not at class boundaries**. Domain objects are instantiated directly. Repositories, event buses, and 
+    external service clients are mocked or faked. Never mock what you own at the domain layer.
+
+    - **Non-deterministic tests are a production risk**. Inject `TimeProvider`, seed all fake data generators, and never use `DateTime.Now` or `Guid.NewGuid()` 
+    inline in tests. Flaky tests erode trust and accumulate into ignored CI failures.
+
+    - **The test builder pattern is non-negotiable at scale**. One change to a constructor or factory method should require updating one builder, not 200 test 
+    files. `TestCommon` is a first-class library.
+
+    - **Separate unit tests from integration tests structurally**. Different projects, different CI stages, different execution time budgets. Mixing them 
+    produces a suite that is both slow and provides false isolation guarantees.
+
+    - **Coverage measures execution, not verification**. A test with no assertions can achieve 100% coverage. Use branch coverage as a minimum bar, mutation 
+    testing as a quality signal, and neither as a proxy for test quality.
+
+    - **Architecture tests are tests too**. `NetArchTest` rules that enforce layer boundaries, naming coverntions, and dependency directions prevent structural 
+    regressions that no amount of feature tests will catch.
+
+---
+
+## 11. High-Level Overview
+
+> Visual representation of the unit testing model, highlighting behavioral boundaries, dependency isolation, deterministic execution, and quality enforcement across domain, application, and test infrastructure layers.
+
+import Light from './_assets/dotnet-unit-testing-light.svg';
+import Dark from './_assets/dotnet-unit-testing-dark.svg';
+import ThemeDiagram from "@site/src/components/ThemeDiagram";
+
+
+<ThemeDiagram
+  Light={Light}
+  Dark={Dark}
+  label="Dotnet Unit Testing"
+  height={900}
+/>
+
+---
+
+## Appendix: Tooling Reference
+
+|Tool                                         |Purpose                          |Notes                                                   |
+|---------------------------------------------|---------------------------------|--------------------------------------------------------|
+|`xUnit`                                      |Test runner                      |Default for .NET; parallel by default                   |
+|`FluentAssertions`                           |Assertion library                |Readable failures, extensive DSL                        |
+|`Shouldly`                                   |Alternative assertion library    |More concise for simple cases                           |
+|`NSubstitute`                                |Mocking                          |Simpler API than Moq for most use cases                 |
+|`Moq`                                        |Mocking                          |More explicit setup, wider adoption                     |
+|`AutoFixture`                                |Test data generation             |Combine with `AutoNSubstituteCustomization`             |
+|`Bogus`                                      |Realistic fake data              |Deterministic with fixed seed                           |
+|`Coverlet`                                   |Coverage collection              |Integrates with `dotnet test` and CI pipelines          |
+|`ReportGenerator`                            |Coverage reports                 |HTML + Cobertura for CI                                 |
+|`Testcontainers`                             |Real infra in tests              |Docker-based, scoped per fixture                        |
+|`Respawn`                                    |Database state reset             |Faster than drop/recreate                               |
+|`NetArchTest`                                |Architecture enforcement         |Dependency and naming rules                             |
+|`Stryker.NET`                                |Mutation testing                 |Validates test assertion quality                        |
+|`Microsoft.Extensions.TimeProvider.Testing`  |Deterministic time               |`FakeTimeProvider` for deterministic time               |
+|`Microsoft.AspNetCore.Mvc.Testing`           |HTTP integration tests           |`WebApplicationFactory<T>` for in-memory server testing |
+
+---
+
+## Appendix: xUnit Lifecycle Quick Reference
+
+```
+IClassFixture<T>    — Shared fixture for all tests in a class (one instance)
+ICollectionFixture  — Shared fixture across multiple test classes
+IAsyncLifetime      — Async Init/Dispose per test class or collection
+
+[Fact]              — Single test case
+[Theory]            — Parametric test
+[InlineData]        — Inline parameters for Theory
+[MemberData]        — External data source for Theory
+[ClassData]         — Class-based data source for Theory
+[Collection("X")]   — Assign class to a named collection (controls parallelism)
+[Trait("Category")] — Filter by trait in CI (e.g., "Slow", "Integration")
+```
